@@ -1,0 +1,54 @@
+[package]
+name = "bonsai-rs"
+version = "0.0.1"
+edition = "2024"
+authors = ["Gregor Lueg <gregorlueg@me.com>"]
+license = "MIT"
+description = "Tree representations of high-dimensional data under Brownian motion. A clean-room Rust implementation of the Bonsai algorithm for single cell and computational biology applications."
+repository = "https://github.com/GregorLueg/bonsai-rs"
+keywords = ["bioinformatics", "single-cell", "phylogenetics", "tree", "visualisation"]
+categories = [
+    "algorithms",
+    "science::bioinformatics",
+    "science::computational-biology",
+]
+
+[lib]
+name = "bonsai_rs"
+path = "src/lib.rs"
+
+[dependencies]
+num-traits = "0.2.19"
+rayon = "1.11.0"
+rustc-hash = "2.1.1"
+thiserror = "2.0.18"
+wide = "1.4.0"
+
+[dev-dependencies]
+approx = "0.5.1"
+rand = "0.9.2"
+rand_distr = "0.5.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+[profile.test]
+opt-level = 2
+
+###########
+# Benches #
+###########
+
+## Pruning sweep timings and the numerical cross-check against the numpy
+## reference. Plain `main`, no criterion.
+[[bench]]
+name = "prune_sweep"
+harness = false
+
+## One full round of candidate-pair scoring, which is what decides whether the
+## tree search is viable. Plain `main`, no criterion.
+[[bench]]
+name = "merge_scan"
+harness = false

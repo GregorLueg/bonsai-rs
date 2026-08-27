@@ -85,7 +85,7 @@ pub fn prune_binary_scalar<T: BonsaiFloat>(
         // The argument is the pair's reduced precision, bounded above by
         // min(wdk, wdl), so it is as well scaled as the inputs are and cannot
         // manufacture an overflow the separate logs would have avoided.
-        let reduced = wdk * wdl * inv;
+        let reduced = (wdk * inv) * wdl;
         let diff = ml - mk;
         acc += reduced.ln() - reduced * diff * diff;
 

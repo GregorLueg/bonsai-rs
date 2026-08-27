@@ -557,6 +557,44 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs>(
         });
     }
 
+    // Reject a star the arithmetic cannot score, rather than discovering it one
+    // pair at a time. A non-finite mean or precision makes every candidate gain
+    // non-finite; those map to `Candidate::NONE`, the round finds no best pair,
+    // and the loop exits normally. The caller then gets `Ok` with an unresolved
+    // star and no indication that anything went wrong, which for a single `NaN`
+    // in a large input matrix is the worst possible failure mode.
+    for (i, &value) in star.means.iter().enumerate() {
+        if !wide(value).is_finite() {
+            return Err(BonsaiErrors::MalformedTree {
+                reason: format!(
+                    "member {} has a non-finite mean at feature {}",
+                    i / p,
+                    i % p
+                ),
+            });
+        }
+    }
+    for (i, &value) in star.precisions.iter().enumerate() {
+        let value = wide(value);
+        if !value.is_finite() || value <= 0.0 {
+            return Err(BonsaiErrors::NonPositiveSd {
+                value,
+                cell: i / p,
+                feature: i % p,
+            });
+        }
+    }
+    for (i, &len) in star.branch.iter().enumerate() {
+        if !len.is_finite() || len < 0.0 {
+            return Err(BonsaiErrors::MalformedTree {
+                reason: format!(
+                    "member {i} has branch length {len} to the centre: branch lengths are \
+                     diffusion times and must be finite and non-negative"
+                ),
+            });
+        }
+    }
+
     // At most `n - MIN_CENTRE_MEMBERS` merges, each shrinking the star by one.
     let max_merges = n.saturating_sub(MIN_CENTRE_MEMBERS);
     let mut m: Vec<T> = Vec::with_capacity((n + max_merges) * p);
@@ -852,6 +890,67 @@ mod tests {
             sets[node as usize] = here;
         }
         sets
+    }
+
+    #[test]
+    fn test_degenerate_input_errors_rather_than_returning_an_unresolved_star() {
+        // Regression, adversarial review 2026-08-27. A single non-finite value
+        // anywhere made every candidate gain non-finite, so the round found no
+        // best pair, the loop exited normally, and the caller got `Ok` with
+        // zero merges and no diagnostic. On a 10k by 20k input matrix one stray
+        // NaN would have produced a star tree and reported success.
+        let (n, p) = (12usize, 8usize);
+        let base_means = vec![0.0f64; n * p];
+        let base_precisions = vec![1.0f64; n * p];
+        let base_branch = vec![0.5f64; n];
+
+        let run = |m: &[f64], w: &[f64], b: &[f64]| {
+            resolve_star::<f64>(
+                Star {
+                    means: m,
+                    precisions: w,
+                    branch: b,
+                    n_features: p,
+                },
+                None,
+            )
+        };
+
+        for bad in [f64::NAN, f64::INFINITY] {
+            let mut means = base_means.clone();
+            means[5] = bad;
+            assert!(
+                run(&means, &base_precisions, &base_branch).is_err(),
+                "a {bad} mean was accepted"
+            );
+
+            let mut branch = base_branch.clone();
+            branch[2] = bad;
+            assert!(
+                run(&base_means, &base_precisions, &branch).is_err(),
+                "a {bad} branch was accepted"
+            );
+        }
+
+        // Zero precision is infinite variance, which the peel turns into an
+        // infinity rather than a large number.
+        let mut precisions = base_precisions.clone();
+        precisions[3] = 0.0;
+        assert!(
+            run(&base_means, &precisions, &base_branch).is_err(),
+            "a zero precision was accepted"
+        );
+
+        // A negative branch was previously accepted and merged, unvalidated.
+        let mut branch = base_branch.clone();
+        branch[4] = -0.4;
+        assert!(
+            run(&base_means, &base_precisions, &branch).is_err(),
+            "a negative branch was accepted"
+        );
+
+        // The well-formed star still works, so the checks are not over-eager.
+        assert!(run(&base_means, &base_precisions, &base_branch).is_ok());
     }
 
     #[test]

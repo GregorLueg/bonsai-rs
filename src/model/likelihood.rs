@@ -62,6 +62,19 @@ impl<T: BonsaiFloat> NodeState<T> {
                 sd_features: p,
             });
         }
+        // A leaf block that is not a whole number of rows, or that does not fit
+        // the arena, is a caller error rather than a broken invariant. Before
+        // this check the over-long case panicked inside `copy_from_slice` and
+        // the short case under-filled silently, leaving zero-precision rows
+        // that turn the loglikelihood into `NaN` at the first logarithm.
+        if p == 0 || !leaf_means.len().is_multiple_of(p) || leaf_means.len() > n_nodes * p {
+            return Err(BonsaiErrors::ShapeMismatch {
+                mean_cells: leaf_means.len() / p.max(1),
+                mean_features: p,
+                sd_cells: n_nodes,
+                sd_features: p,
+            });
+        }
         let mut m = vec![T::zero(); n_nodes * p];
         let mut w = vec![T::zero(); n_nodes * p];
         m[..leaf_means.len()].copy_from_slice(leaf_means);
@@ -227,6 +240,39 @@ mod tests {
             w.push(0.25 + next() * 3.0);
         }
         (m, w)
+    }
+
+    #[test]
+    fn test_rejects_leaf_blocks_that_do_not_fit_the_arena() {
+        // Regression, adversarial review 2026-08-27. An over-long leaf block
+        // panicked inside `copy_from_slice`, in library code, on the crate's
+        // most-used type. A block that was not a whole number of rows was
+        // accepted and under-filled, leaving zero-precision rows that make the
+        // loglikelihood NaN at the first logarithm.
+        let p = 8usize;
+
+        let too_long = vec![1.0f64; 32];
+        assert!(
+            matches!(
+                NodeState::new(3, p, &too_long, &too_long),
+                Err(BonsaiErrors::ShapeMismatch { .. })
+            ),
+            "a leaf block larger than the arena was accepted"
+        );
+
+        let ragged = vec![1.0f64; 13];
+        assert!(
+            matches!(
+                NodeState::new(9, p, &ragged, &ragged),
+                Err(BonsaiErrors::ShapeMismatch { .. })
+            ),
+            "a leaf block that is not a whole number of rows was accepted"
+        );
+
+        // Exactly filling the arena is legal, as is leaving room for the
+        // internal rows the sweep will write.
+        assert!(NodeState::new(3, p, &vec![1.0f64; 24], &vec![1.0f64; 24]).is_ok());
+        assert!(NodeState::new(9, p, &vec![1.0f64; 40], &vec![1.0f64; 40]).is_ok());
     }
 
     #[test]

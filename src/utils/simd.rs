@@ -191,7 +191,14 @@ impl BonsaiSimd for f32 {
             let wa = wdk + wdl;
             let inv = one / wa;
 
-            let reduced = wdk * wdl * inv;
+            // Associate as `(wdk * inv) * wdl`, never `wdk * wdl * inv`. The
+            // first factor is a weight in [0, 1], so nothing can leave range.
+            // Forming the bare product first overflows f32 above 1.8e19 per
+            // factor and goes subnormal below 1.1e-19, and `ln` of the result
+            // is then a signed infinity. The scalar tier is saved from this
+            // only by widening to f64 first, which is not a guarantee, so it
+            // associates the same way.
+            let reduced = (wdk * inv) * wdl;
             let diff = ml - mk;
             lanes += reduced.ln() - reduced * diff * diff;
 
@@ -315,6 +322,50 @@ mod tests {
         for g in 0..p {
             assert_relative_eq!(m_v[g] as f64, m_s[g], max_relative = 1e-4);
             assert_relative_eq!(w_v[g] as f64, w_s[g], max_relative = 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_extreme_precisions_do_not_leave_f32_range() {
+        // Regression, adversarial review 2026-08-27. Forming `wdk * wdl` before
+        // dividing overflowed f32 above 1.8e19 per factor and went subnormal
+        // below 1.1e-19, so `reduced.ln()` came back as a signed infinity while
+        // the scalar tier, which widens to f64 first, was fine.
+        //
+        // The lane count is part of the bug, not incidental to it: `p % 8`
+        // decides which features take the vector path and which fall to the
+        // scalar tail, so the same per-element data gave different answers at
+        // different feature counts, and through `BlockedState` the block size
+        // decided it too. Hence the p = 7 against p = 8 comparison.
+        for (precision, branch) in [(1e-25f32, 1.0f64), (1e30f32, 1e-30f64)] {
+            let mut previous: Option<f64> = None;
+            for p in [7usize, 8, 15, 16, 64] {
+                let m_k = vec![0.5f32; p];
+                let m_l = vec![-0.25f32; p];
+                let w = vec![precision; p];
+                let mut m_out = vec![0.0f32; p];
+                let mut w_out = vec![0.0f32; p];
+
+                let vector = f32::prune_binary_simd(
+                    &m_k, &w, branch, &m_l, &w, branch, &mut m_out, &mut w_out,
+                );
+                assert!(
+                    vector.is_finite(),
+                    "precision {precision:e}, p = {p}: vector tier gave {vector}"
+                );
+
+                let scalar = prune_binary_scalar(
+                    &m_k, &w, branch, &m_l, &w, branch, &mut m_out, &mut w_out,
+                );
+                assert_relative_eq!(vector, scalar, max_relative = 1e-4);
+
+                // Per-feature, so feature counts are comparable to each other.
+                let per_feature = vector / p as f64;
+                if let Some(want) = previous {
+                    assert_relative_eq!(per_feature, want, max_relative = 1e-4);
+                }
+                previous = Some(per_feature);
+            }
         }
     }
 

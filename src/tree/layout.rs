@@ -244,12 +244,22 @@ impl Layout {
     /// r -> r / (1 + sqrt(1 + r^2))
     /// ```
     ///
-    /// which sends `0` to `0` and infinity to `1`, so everything finite lands
-    /// strictly inside the unit disk. The map is strictly increasing in `r`
-    /// (its derivative is `1 / (s * (1 + s))` with `s = sqrt(1 + r^2)`), so
-    /// radial order survives and nothing turns inside out. This is a
-    /// post-processing step rather than a fourth layout: apply it to whichever
-    /// of the three is being drawn.
+    /// which sends `0` to `0` and infinity to `1`. The map is strictly
+    /// increasing in `r` (its derivative is `1 / (s * (1 + s))` with
+    /// `s = sqrt(1 + r^2)`), so radial order survives and nothing turns inside
+    /// out. This is a post-processing step rather than a fourth layout: apply
+    /// it to whichever of the three is being drawn.
+    ///
+    /// ### In floating point
+    ///
+    /// Mathematically every finite radius lands strictly inside the disk. In
+    /// `f64` it does not: past about `1e16` the `1 +` is lost to rounding and
+    /// the result is exactly `1`, on the rim. That saturation is harmless and
+    /// unavoidable, and radial order is still non-decreasing through it. What
+    /// is *not* acceptable is order inversion, which is what an earlier form of
+    /// this computation did by squaring `r` before the square root: that
+    /// overflowed above `1.3e154`, collapsed the scale to zero and sent the
+    /// furthest points to the origin. Hence `hypot`.
     ///
     /// ### Params
     ///
@@ -258,7 +268,8 @@ impl Layout {
     ///
     /// ### Returns
     ///
-    /// A new layout with every node inside the open unit disk.
+    /// A new layout with every node inside the closed unit disk, and strictly
+    /// inside it for any radius a real tree produces.
     pub fn hyperbolic(&self, params: Option<LayoutParams>) -> Layout {
         let p = params.unwrap_or_default();
         let (ox, oy) = p.hyperbolic_origin;
@@ -273,11 +284,13 @@ impl Layout {
             // trip. `atan2` followed by `sin_cos` would cost two transcendental
             // calls and perturb an angle the projection is supposed to leave
             // exactly alone.
-            let scale = if r > 0.0 {
-                1.0 / (1.0 + (1.0 + r * r).sqrt())
-            } else {
-                0.0
-            };
+            // `r.hypot(1.0)`, not `(1.0 + r * r).sqrt()`. Squaring first
+            // overflows above r = 1.3e154, at which point the scale collapses
+            // to zero and the point lands on the origin rather than near the
+            // rim, inverting radial order exactly where the doc above promises
+            // it survives. `hypot` is overflow-safe and gives 0.5 at r = 0, so
+            // the zero case needs no branch of its own.
+            let scale = 1.0 / (1.0 + r.hypot(1.0));
             x.push(u * scale);
             y.push(v * scale);
         }
@@ -1200,13 +1213,11 @@ pub fn has_edge_crossing(tree: &Tree, layout: &Layout) -> Result<bool, BonsaiErr
         .filter_map(|v| tree.parent(v).map(|p| (v, p)))
         .collect();
 
-    let scale = layout_scale(layout);
-    let eps = ORIENT_REL_EPS * scale * scale;
-
     for i in 0..edges.len() {
         let (a, b) = edges[i];
         let (ax, ay) = (layout.x[a as usize], layout.y[a as usize]);
         let (bx, by) = (layout.x[b as usize], layout.y[b as usize]);
+        let ab_len = (bx - ax).hypot(by - ay);
         for j in i + 1..edges.len() {
             let (c, d) = edges[j];
             if a == c || a == d || b == c || b == d {
@@ -1214,6 +1225,24 @@ pub fn has_edge_crossing(tree: &Tree, layout: &Layout) -> Result<bool, BonsaiErr
             }
             let (cx, cy) = (layout.x[c as usize], layout.y[c as usize]);
             let (dx, dy) = (layout.x[d as usize], layout.y[d as usize]);
+            let cd_len = (dx - cx).hypot(dy - cy);
+
+            // Scale the tolerance to the two segments actually being compared,
+            // not to the layout's global extent. An orientation determinant
+            // scales as |ab| * |cd|, so a global epsilon swamps any short edge
+            // sitting far from the origin and declares it collinear, after
+            // which the bounding-box fallback reports a crossing that is not
+            // there. Measured: 41 of 1000 random trees were false positives,
+            // and every tree with zero-length branches was, which includes
+            // every Newick string parsed without them.
+            let eps = ORIENT_REL_EPS * ab_len * cd_len;
+
+            // A degenerate segment is a point. It cannot cross anything, and
+            // sending it down the collinear branch is what made two siblings
+            // sitting exactly on their parent read as a crossing.
+            if ab_len == 0.0 || cd_len == 0.0 {
+                continue;
+            }
 
             let d1 = orient(cx, cy, dx, dy, ax, ay);
             let d2 = orient(cx, cy, dx, dy, bx, by);
@@ -1447,6 +1476,74 @@ mod tests {
             }
         }
         total
+    }
+
+    #[test]
+    fn test_zero_length_branches_are_not_reported_as_crossings() {
+        // Regression, adversarial review 2026-08-27. The crossing epsilon was
+        // scaled to the layout's global extent, so two siblings sitting exactly
+        // on their parent read as collinear and then as a crossing. That is
+        // every tree with zero-length branches, which includes every Newick
+        // string parsed without them, and it silently turned `equal_daylight`
+        // into a no-op because every candidate was rejected.
+        for n_leaves in [4usize, 8, 16] {
+            let tree = Tree::balanced_binary(n_leaves, 0.0).expect("balanced fixture");
+            let layout = equal_angle(&tree, None).expect("equal angle");
+            assert!(
+                !has_edge_crossing(&tree, &layout).expect("crossing check"),
+                "{n_leaves} leaves on zero-length branches reported a crossing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_short_edges_far_from_the_origin_are_not_false_positives() {
+        // The other half of the same bug: an orientation determinant scales as
+        // the product of the two segment lengths, so a global epsilon swamps a
+        // short edge sitting far out. Branch lengths spanning six orders of
+        // magnitude are what surfaced it.
+        let tree = Tree::from_parents(
+            vec![4, 4, 5, 5, 6, 6, NO_NODE],
+            vec![1e-3, 5.8e-3, 1e3, 0.24, 1e3, 1e-3, 0.0],
+            4,
+        )
+        .expect("mixed-scale fixture");
+        let layout = equal_angle(&tree, None).expect("equal angle");
+        assert!(
+            !has_edge_crossing(&tree, &layout).expect("crossing check"),
+            "mixed branch-length scales produced a false crossing"
+        );
+    }
+
+    #[test]
+    fn test_hyperbolic_keeps_radial_order_at_extreme_radii() {
+        // Regression, adversarial review 2026-08-27. Squaring the radius before
+        // the square root overflowed above 1.3e154, collapsing the scale to
+        // zero so the furthest points landed on the origin rather than near the
+        // rim. Radial order inverted exactly where the docs promise it holds.
+        let radii = [0.0f64, 1.0, 1e10, 1e100, 1e160, 1e300];
+        let layout = Layout {
+            x: radii.to_vec(),
+            y: vec![0.0; radii.len()],
+        };
+        let mapped = layout.hyperbolic(None);
+
+        let mut previous = -1.0f64;
+        for (i, &r) in radii.iter().enumerate() {
+            let out = mapped.x[i].hypot(mapped.y[i]);
+            assert!(out.is_finite(), "r = {r:e} mapped to {out}");
+            // `<=`, not `<`: past about 1e16 the `1 +` in the scale is lost to
+            // rounding and the result saturates at exactly 1. Harmless, and
+            // documented on `hyperbolic`. The property that matters is that the
+            // order never inverts, which is the next assertion.
+            assert!(out <= 1.0, "r = {r:e} landed outside the rim at {out}");
+            assert!(
+                out >= previous,
+                "r = {r:e} broke radial order: {out} after {previous}"
+            );
+            previous = out;
+        }
+        assert_eq!(mapped.x[0], 0.0, "the origin must map to itself");
     }
 
     #[test]

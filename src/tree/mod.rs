@@ -121,6 +121,25 @@ impl Tree {
             });
         }
 
+        // Branch lengths are diffusion times, so a negative or non-finite one is
+        // not a tree this crate can score. Rejecting here rather than at use is
+        // the difference between an error and `prune` quietly returning `NaN`:
+        // `1 + t * w` is exactly zero at `t = -1/w`, and every downstream
+        // kernel divides by it. The root's own entry is unused and not checked.
+        for (i, &len) in branch.iter().enumerate() {
+            if parent[i] == NO_NODE {
+                continue;
+            }
+            if !len.is_finite() || len < 0.0 {
+                return Err(BonsaiErrors::MalformedTree {
+                    reason: format!(
+                        "node {i} has branch length {len}: branch lengths are diffusion \
+                         times and must be finite and non-negative"
+                    ),
+                });
+            }
+        }
+
         // Height above the leaves. Ascending index order is already a valid
         // post-order at this point, so one forward scan settles every node.
         let mut height = vec![0u32; n_nodes];
@@ -477,6 +496,33 @@ mod tests {
         let parent = vec![2, 2, NO_NODE, 2];
         let err = Tree::from_parents(parent, vec![1.0; 4], 2);
         assert!(matches!(err, Err(BonsaiErrors::MalformedTree { .. })));
+    }
+
+    #[test]
+    fn test_rejects_non_finite_and_negative_branch_lengths() {
+        // Regression, adversarial review 2026-08-27. The arena validated the
+        // topology and nothing else, so a NaN or negative branch built a tree
+        // whose loglikelihood was silently NaN. `t = -1/w` is worse still: it
+        // makes `1 + t * w` exactly zero and every kernel divides by it.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.5] {
+            let err = Tree::from_parents(vec![2, 2, NO_NODE], vec![bad, 1.0, 0.0], 2);
+            assert!(
+                matches!(err, Err(BonsaiErrors::MalformedTree { .. })),
+                "branch length {bad} was accepted"
+            );
+        }
+        // Zero is legal and common: the search creates zero-length branches
+        // every time a merge is degenerate, which is how polytomies arise.
+        assert!(Tree::from_parents(vec![2, 2, NO_NODE], vec![0.0; 3], 2).is_ok());
+    }
+
+    #[test]
+    fn test_the_unused_root_branch_entry_is_not_validated() {
+        // The root has no upstream branch, so its slot carries nothing. Callers
+        // routinely leave it at whatever the array was filled with, and
+        // rejecting that would be a trap rather than a check.
+        let tree = Tree::from_parents(vec![2, 2, NO_NODE], vec![1.0, 1.0, f64::NAN], 2);
+        assert!(tree.is_ok());
     }
 
     #[test]

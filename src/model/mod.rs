@@ -3,5 +3,7 @@
 
 pub mod blocked;
 pub mod branch;
+pub mod global;
 pub mod likelihood;
 pub mod merge;
+pub mod place;

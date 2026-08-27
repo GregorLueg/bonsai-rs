@@ -36,5 +36,6 @@
 
 pub mod errors;
 pub mod model;
+pub mod search;
 pub mod tree;
 pub mod utils;

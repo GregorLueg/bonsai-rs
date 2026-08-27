@@ -52,3 +52,9 @@ harness = false
 [[bench]]
 name = "merge_scan"
 harness = false
+
+## Single-threaded throughput per kernel, for identifying which wall each one
+## hits. Plain `main`, no criterion.
+[[bench]]
+name = "kernels"
+harness = false

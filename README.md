@@ -1,0 +1,88 @@
+# bonsai-rs
+
+Tree representations of high-dimensional data under Brownian motion.
+
+A clean-room Rust implementation of the Bonsai algorithm: de Groot, Morillo
+Leonardo, Pachkov and van Nimwegen, *Bonsai reconstructs tree representations for
+distortion-free visualization and exploration of high-dimensional data*, Nature
+Biotechnology 2026, [doi 10.1038/s41587-026-03220-2](https://doi.org/10.1038/s41587-026-03220-2).
+
+**Status: early. The likelihood machinery works and is tested; the tree search
+is being built.**
+
+## What it does, and why you might want it
+
+Every node in the tree carries a latent position in feature space. An edge of
+length `t` says the child is drawn from a Gaussian centred on the parent with
+variance `t` per feature. Each observed cell contributes a Gaussian measurement
+likelihood with its own error bars. The objective is the marginal likelihood
+with every latent internal position integrated out, which stays tractable
+because it is all Gaussian and factorises over features. That integration is the
+continuous-trait form of Felsenstein's pruning algorithm.
+
+Three things follow, and they are the reason to reach for this over a manifold
+embedding:
+
+- **Distances hold at every scale.** Tree path distances match high-dimensional
+  distances globally, not just locally. That is a documented failure of UMAP and
+  tSNE, and PHATE only partly fixes it.
+- **It consumes uncertainty.** Per-cell per-feature error bars go in and are
+  marginalised over. Methods that take a matrix treat it as exact.
+- **Nothing to tune.** There are no parameters to turn until the picture matches
+  your prior.
+
+The honest caveat: it assumes the data is tree-like. Cells that diverged along a
+branching lineage are fine. Anything cyclic or reconverging, cell cycle or dose
+response, gets a tree anyway, and a confident-looking one. That is the
+UMAP-hallucinates-clusters critique relocated, not solved.
+
+## Input contract
+
+Means **and** standard deviations, per cell per feature, plus a per-feature
+variance. Not a matrix.
+
+That is not a detail. The model marginalises over measurement noise, so without
+real error bars it is a different and worse method; the paper's own supplementary
+material shows accuracy dropping hard on conventional preprocessing. For
+scRNA-seq the intended chain is Sanity from raw UMI counts, then this.
+
+## Licence
+
+MIT. See `LICENSE`.
+
+The reference implementation is CC-BY-NC-4.0, which cannot produce an MIT crate:
+a port is a translation, and translations are Adapted Material under section 1(a)
+of that licence. This crate is therefore built from the paper and its CC-BY-4.0
+Supplementary Information only, which are separately licensed from the code and
+free to implement. Copyright covers expression, not algorithms.
+
+`docs/SPEC.md` is the transcription and is the only thing the implementation
+reads. `PROVENANCE.md` records the position in full, including what was read,
+when, and by whom. Contributors: read it before opening the editor.
+
+## Performance
+
+The pruning sweep at 8192 cells by 2000 features, on one M1 Max:
+
+| | time |
+|---|---|
+| numpy reference, same equations | 468 ms |
+| Rust, single-threaded, `f64` | 67 ms |
+| Rust, feature-blocked parallel, `f64` | 9.3 ms |
+| Rust, feature-blocked parallel, `f32` | 5.2 ms |
+
+Loglikelihoods agree with the numpy reference to twelve significant figures. The
+baseline is `reference/bonsai_ref.py`, written independently from the same spec,
+not the published implementation, which has not been run.
+
+That is the likelihood kernel on a fixed topology, which is the thing everything
+else calls. It is not an end-to-end claim.
+
+The parallel axis is the feature axis, not the tree level, because the model
+factorises over features. That makes it indifferent to tree shape: a pathological
+ladder tree runs in 9.0 ms where level-parallelism takes 67.7 ms.
+
+## Citing
+
+Cite the paper. This crate is an independent implementation of their method and
+claims none of the science.

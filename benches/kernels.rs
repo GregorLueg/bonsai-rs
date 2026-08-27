@@ -15,6 +15,22 @@
 //! ```sh
 //! cargo bench --bench kernels
 //! ```
+//!
+//! **Run this on a quiet machine.** These kernels are short and the numbers are
+//! in nanoseconds per element, so anything else competing for the cores moves
+//! them by more than the effects being looked for. Check `uptime` first.
+//!
+//! ### Open question
+//!
+//! `edge_newton` is the hottest kernel in the crate and it is not obvious which
+//! wall it hits. At roughly three cycles per feature it sits close to both the
+//! two-chain FMA latency bound and the `f64` division throughput bound, and
+//! those want opposite fixes: more accumulator chains for the first, fewer
+//! divisions for the second. Splitting it into four independent chains was
+//! tried and appeared to change nothing, but that measurement was taken on a
+//! loaded machine and is worthless. Redo it, and settle the question by timing
+//! a variant with the division replaced by a multiply: if that is much faster,
+//! the division is the wall and extra chains will never help.
 
 use bonsai_rs::utils::kernels::{edge_loglik, edge_newton, prep_edge, prune_binary_scalar};
 use std::hint::black_box;

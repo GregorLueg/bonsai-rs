@@ -24,9 +24,28 @@
 //! the loads and stores cost more than the logarithm saved. It was removed. The
 //! `f32x8` tier is a genuine 2.07x on the dominant term and stays.
 //!
-//! If this crate ever targets x86-64 with AVX2, where `f64x4` maps to a real
-//! 256-bit register and glibc's scalar `log` is weaker, the `f64` experiment is
-//! worth redoing. The numbers to beat are in the table.
+//! ### What users on x86-64 actually get
+//!
+//! Those numbers are from Apple Silicon, where the NEON baseline is 128 bits
+//! and is always available. **On x86-64 the baseline is SSE2**, also 128 bits,
+//! because a crate shipped to crates.io cannot be built with
+//! `-C target-cpu=native` without handing an illegal-instruction crash to
+//! anyone whose machine is older than the build machine's. So `f32x8` there
+//! compiles to a pair of SSE2 registers rather than one AVX2 register, and the
+//! 2.07x above is an aarch64 measurement that has not been reproduced on x86.
+//!
+//! Do not quote it as an x86 number. When someone measures on x86-64, the
+//! options are, in order: runtime dispatch on `is_x86_feature_detected!` around
+//! an AVX2 arm; raising the baseline to `x86-64-v3` and documenting the
+//! requirement; or accepting SSE2 and saying so.
+//!
+//! Two other x86-only traps that do not reproduce on a Mac. Denormal floats can
+//! be an order of magnitude slower there, and log-transformed near-zero
+//! expression values drift straight into that range, so a kernel that is fine
+//! on synthetic data and inexplicably slow on real data wants flush-to-zero
+//! checked first. And glibc's scalar `log` is weaker than macOS libm's, so the
+//! `f64x4` experiment that failed here may well pay there; the numbers to beat
+//! are in the table.
 //!
 //! ### Accuracy
 //!

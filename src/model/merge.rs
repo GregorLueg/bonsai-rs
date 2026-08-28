@@ -546,9 +546,15 @@ mod tests {
                 mid + side * spread * (1.0 + 0.2 * (g as f64 * 0.07).sin())
             })
             .collect();
-        let w_k: Vec<f64> = (0..p).map(|g| 1.0 + 0.5 * (g as f64 * 0.19).cos()).collect();
-        let w_l: Vec<f64> = (0..p).map(|g| 1.2 + 0.4 * (g as f64 * 0.23).sin()).collect();
-        let w_r: Vec<f64> = (0..p).map(|g| 0.8 + 0.3 * (g as f64 * 0.31).cos()).collect();
+        let w_k: Vec<f64> = (0..p)
+            .map(|g| 1.0 + 0.5 * (g as f64 * 0.19).cos())
+            .collect();
+        let w_l: Vec<f64> = (0..p)
+            .map(|g| 1.2 + 0.4 * (g as f64 * 0.23).sin())
+            .collect();
+        let w_r: Vec<f64> = (0..p)
+            .map(|g| 0.8 + 0.3 * (g as f64 * 0.31).cos())
+            .collect();
         (m_k, w_k, m_l, w_l, m_r, w_r)
     }
 
@@ -571,8 +577,7 @@ mod tests {
 
         let (_, d_du, d_dtar) = scratch.gain_and_gradient(total, u, t_ar);
 
-        let fd_u = (gain_at(total, u + h, t_ar, &scratch)
-            - gain_at(total, u - h, t_ar, &scratch))
+        let fd_u = (gain_at(total, u + h, t_ar, &scratch) - gain_at(total, u - h, t_ar, &scratch))
             / (2.0 * h);
         let fd_tar = (gain_at(total, u, t_ar + h, &scratch)
             - gain_at(total, u, t_ar - h, &scratch))
@@ -585,7 +590,12 @@ mod tests {
         // it is the one the central differences above do not touch. It is
         // documented as the same arithmetic with the logarithms dropped, so it
         // must agree to the bit, not merely to a tolerance.
-        for &(u, t_ar) in [(0.3 * total, 0.7), (0.05 * total, 0.01), (0.95 * total, 5.0)].iter()
+        for &(u, t_ar) in [
+            (0.3 * total, 0.7),
+            (0.05 * total, 0.01),
+            (0.95 * total, 5.0),
+        ]
+        .iter()
         {
             assert_eq!(
                 scratch.split_derivative(total, u, t_ar),
@@ -673,9 +683,13 @@ mod tests {
         let p = 48usize;
         let (m_k, w_k, m_l, w_l, _, _) = three_leaves(p, 2.5, 6.0);
         let m_m: Vec<f64> = (0..p).map(|g| 5.0 + (g as f64 * 0.11).cos()).collect();
-        let w_m: Vec<f64> = (0..p).map(|g| 0.9 + 0.2 * (g as f64 * 0.17).sin()).collect();
+        let w_m: Vec<f64> = (0..p)
+            .map(|g| 0.9 + 0.2 * (g as f64 * 0.17).sin())
+            .collect();
         let m_n: Vec<f64> = (0..p).map(|g| 6.5 + (g as f64 * 0.07).sin()).collect();
-        let w_n: Vec<f64> = (0..p).map(|g| 1.1 + 0.3 * (g as f64 * 0.13).cos()).collect();
+        let w_n: Vec<f64> = (0..p)
+            .map(|g| 1.1 + 0.3 * (g as f64 * 0.13).cos())
+            .collect();
 
         let (t_rk, t_rl, t_m, t_n) = (0.8, 0.9, 1.3, 0.6);
 

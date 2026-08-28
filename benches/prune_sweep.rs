@@ -93,16 +93,17 @@ fn main() {
             let precisions32: Vec<f32> = precisions.iter().map(|&x| x as f32).collect();
 
             for (shape, tree) in [
-                ("balanced", Tree::balanced_binary(n_leaves, FIXTURE_BRANCH).unwrap()),
+                (
+                    "balanced",
+                    Tree::balanced_binary(n_leaves, FIXTURE_BRANCH).unwrap(),
+                ),
                 ("ladder", Tree::ladder(n_leaves, FIXTURE_BRANCH).unwrap()),
             ] {
                 let n = tree.n_nodes();
-                let mut flat =
-                    NodeState::new(n, n_features, &means, &precisions).unwrap();
+                let mut flat = NodeState::new(n, n_features, &means, &precisions).unwrap();
                 let (seq, loglik) = time(|| flat.prune(&tree));
                 let mut blk =
-                    BlockedState::new(n, n_features, &means, &precisions, DEFAULT_BLOCK)
-                        .unwrap();
+                    BlockedState::new(n, n_features, &means, &precisions, DEFAULT_BLOCK).unwrap();
                 let (blocked, blk_loglik) = time(|| blk.prune(&tree));
                 assert!((blk_loglik - loglik).abs() <= 1e-9 * loglik.abs());
 

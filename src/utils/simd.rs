@@ -315,8 +315,7 @@ mod tests {
         let (mk32, wk32, ml32, wl32) = (f32v(&m_k), f32v(&w_k), f32v(&m_l), f32v(&w_l));
         let mut m_v = vec![0.0f32; p];
         let mut w_v = vec![0.0f32; p];
-        let l_v =
-            f32::prune_binary_simd(&mk32, &wk32, t_k, &ml32, &wl32, t_l, &mut m_v, &mut w_v);
+        let l_v = f32::prune_binary_simd(&mk32, &wk32, t_k, &ml32, &wl32, t_l, &mut m_v, &mut w_v);
 
         assert_relative_eq!(l_v, l_s, max_relative = 1e-5);
         for g in 0..p {
@@ -354,9 +353,8 @@ mod tests {
                     "precision {precision:e}, p = {p}: vector tier gave {vector}"
                 );
 
-                let scalar = prune_binary_scalar(
-                    &m_k, &w, branch, &m_l, &w, branch, &mut m_out, &mut w_out,
-                );
+                let scalar =
+                    prune_binary_scalar(&m_k, &w, branch, &m_l, &w, branch, &mut m_out, &mut w_out);
                 assert_relative_eq!(vector, scalar, max_relative = 1e-4);
 
                 // Per-feature, so feature counts are comparable to each other.
@@ -390,13 +388,11 @@ mod tests {
 
         let mut m_s = vec![0.0f32; p];
         let mut w_s = vec![0.0f32; p];
-        let l_s =
-            prune_binary_scalar(&mk32, &wk32, t_k, &ml32, &wl32, t_l, &mut m_s, &mut w_s);
+        let l_s = prune_binary_scalar(&mk32, &wk32, t_k, &ml32, &wl32, t_l, &mut m_s, &mut w_s);
 
         let mut m_v = vec![0.0f32; p];
         let mut w_v = vec![0.0f32; p];
-        let l_v =
-            f32::prune_binary_simd(&mk32, &wk32, t_k, &ml32, &wl32, t_l, &mut m_v, &mut w_v);
+        let l_v = f32::prune_binary_simd(&mk32, &wk32, t_k, &ml32, &wl32, t_l, &mut m_v, &mut w_v);
 
         assert_relative_eq!(l_v, l_s, max_relative = 1e-5);
         for g in 0..p {

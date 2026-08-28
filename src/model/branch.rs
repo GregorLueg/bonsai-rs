@@ -109,11 +109,7 @@ pub fn optimise_edge(s: &[f64], d: &[f64], upper: f64) -> Result<f64, BonsaiErro
 /// ### Returns
 ///
 /// The optimal branch length and the edge loglikelihood there.
-pub fn optimise_edge_loglik(
-    s: &[f64],
-    d: &[f64],
-    upper: f64,
-) -> Result<(f64, f64), BonsaiErrors> {
+pub fn optimise_edge_loglik(s: &[f64], d: &[f64], upper: f64) -> Result<(f64, f64), BonsaiErrors> {
     let t = optimise_edge(s, d, upper)?;
     Ok((t, edge_loglik(s, d, t)))
 }
@@ -186,7 +182,10 @@ mod tests {
         for separation in [2.0f64, 4.0, 8.0] {
             let (s, d, upper) = edge(200, separation, 1.5);
             let (t, best) = optimise_edge_loglik(&s, &d, upper).unwrap();
-            assert!(t > 0.0, "expected a positive branch at separation {separation}");
+            assert!(
+                t > 0.0,
+                "expected a positive branch at separation {separation}"
+            );
             for delta in [-0.2f64, -0.01, 0.01, 0.2] {
                 let other = (t + delta).max(0.0);
                 assert!(
@@ -214,7 +213,10 @@ mod tests {
         for separation in [2.0f64, 3.0, 4.0, 6.0, 8.0] {
             let (s, d, upper) = edge(128, separation, 1.0);
             let t = optimise_edge(&s, &d, upper).unwrap();
-            assert!(t > previous, "branch shrank going to separation {separation}");
+            assert!(
+                t > previous,
+                "branch shrank going to separation {separation}"
+            );
             previous = t;
         }
     }
@@ -224,6 +226,9 @@ mod tests {
         let (s, d, upper) = edge(256, 2.5, 1.2);
         let t = optimise_edge(&s, &d, upper).unwrap();
         assert!(t <= upper, "root {t} escaped its bracket {upper}");
-        assert!(edge_newton(&s, &d, upper).0 >= 0.0, "bracket does not bracket");
+        assert!(
+            edge_newton(&s, &d, upper).0 >= 0.0,
+            "bracket does not bracket"
+        );
     }
 }

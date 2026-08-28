@@ -224,7 +224,10 @@ fn open_stream(
     }
     if params.n_leaves < 2 {
         return Err(BonsaiErrors::MalformedTree {
-            reason: format!("{} leaves is not enough to simulate a tree", params.n_leaves),
+            reason: format!(
+                "{} leaves is not enough to simulate a tree",
+                params.n_leaves
+            ),
         });
     }
     // `is_finite` first, so a NaN is rejected without a negated comparison.
@@ -827,10 +830,8 @@ mod tests {
         // Four leaves, so exactly one non-trivial split per binary tree.
         // ((0,1),(2,3)) against ((0,2),(1,3)): the split sets are {2,3} and
         // {1,3}, disjoint, so the symmetric difference has two elements.
-        let ab_cd =
-            Tree::from_parents(vec![4, 4, 5, 5, 6, 6, NO_NODE], vec![1.0; 7], 4).unwrap();
-        let ac_bd =
-            Tree::from_parents(vec![4, 5, 4, 5, 6, 6, NO_NODE], vec![1.0; 7], 4).unwrap();
+        let ab_cd = Tree::from_parents(vec![4, 4, 5, 5, 6, 6, NO_NODE], vec![1.0; 7], 4).unwrap();
+        let ac_bd = Tree::from_parents(vec![4, 5, 4, 5, 6, 6, NO_NODE], vec![1.0; 7], 4).unwrap();
         assert_eq!(robinson_foulds(&ab_cd, &ac_bd).unwrap(), 2);
 
         // Six leaves as ((0,1),(2,3),(4,5)) fully resolved one way, then with
@@ -884,8 +885,7 @@ mod tests {
         // indices; `from_parents` relabels either way.
         let straight =
             Tree::from_parents(vec![4, 4, 5, 5, 6, 6, NO_NODE], vec![1.0; 7], 4).unwrap();
-        let swapped =
-            Tree::from_parents(vec![5, 5, 4, 4, 6, 6, NO_NODE], vec![1.0; 7], 4).unwrap();
+        let swapped = Tree::from_parents(vec![5, 5, 4, 4, 6, 6, NO_NODE], vec![1.0; 7], 4).unwrap();
         assert_eq!(robinson_foulds(&straight, &swapped).unwrap(), 0);
 
         // Same unrooted tree, rooted on the branch leading to leaf 0 instead:
@@ -925,7 +925,8 @@ mod tests {
             .map(|node| big.parent(node).unwrap_or(NO_NODE))
             .collect();
         assert_ne!(parent, original, "the relabelling did not change anything");
-        let reversed = Tree::from_parents(parent, vec![1.0; big.n_nodes()], big.n_leaves()).unwrap();
+        let reversed =
+            Tree::from_parents(parent, vec![1.0; big.n_nodes()], big.n_leaves()).unwrap();
         assert_eq!(robinson_foulds(&big, &reversed).unwrap(), 0);
     }
 
@@ -1003,8 +1004,7 @@ mod tests {
         let (n, p) = (data.n_leaves, data.n_features);
         for g in 0..p {
             let scale = data.variances[g].sqrt();
-            let untransformed: Vec<f64> =
-                (0..n).map(|i| data.truth[i * p + g] * scale).collect();
+            let untransformed: Vec<f64> = (0..n).map(|i| data.truth[i * p + g] * scale).collect();
             let mean = untransformed.iter().sum::<f64>() / n as f64;
             let var = untransformed
                 .iter()
@@ -1068,7 +1068,10 @@ mod tests {
                 continue;
             }
             let t = data.tree.branch(node);
-            assert!((RANDOM_BRANCH_LO..=RANDOM_BRANCH_HI).contains(&t), "t was {t}");
+            assert!(
+                (RANDOM_BRANCH_LO..=RANDOM_BRANCH_HI).contains(&t),
+                "t was {t}"
+            );
             seen_short |= t < 1.0;
             seen_long |= t > 1.0;
         }
@@ -1154,6 +1157,10 @@ mod tests {
             .sum::<f64>()
             / data.means.len() as f64;
         assert_relative_eq!(residual.sqrt(), params.noise_sd, max_relative = 0.05);
-        assert!(data.sds.iter().all(|&s| (s - params.noise_sd).abs() < 1e-12));
+        assert!(
+            data.sds
+                .iter()
+                .all(|&s| (s - params.noise_sd).abs() < 1e-12)
+        );
     }
 }

@@ -196,4 +196,3 @@ impl SplitMix64 {
 pub fn splitmix64_at(index: u64) -> f64 {
     SplitMix64::new(index).uniform()
 }
-

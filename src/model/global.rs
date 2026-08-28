@@ -177,8 +177,7 @@ impl<T: BonsaiFloat> UpState<T> {
             let (first_m, second_m) = lo_m.split_at_mut(l as usize * p);
             let (first_w, second_w) = lo_w.split_at_mut(l as usize * p);
             let base = k as usize * p;
-            let (out_m_k, out_w_k) =
-                (&mut first_m[base..base + p], &mut first_w[base..base + p]);
+            let (out_m_k, out_w_k) = (&mut first_m[base..base + p], &mut first_w[base..base + p]);
             let (out_m_l, out_w_l) = (&mut second_m[..p], &mut second_w[..p]);
 
             for g in 0..p {
@@ -738,15 +737,13 @@ mod tests {
     /// * `state` - Node state, settled against that tree
     /// * `m` - Leaf means the tree was optimised against
     /// * `w` - Leaf precisions the tree was optimised against
-    fn assert_no_edge_can_be_improved(
-        tree: &Tree,
-        state: &NodeState<f64>,
-        m: &[f64],
-        w: &[f64],
-    ) {
+    fn assert_no_edge_can_be_improved(tree: &Tree, state: &NodeState<f64>, m: &[f64], w: &[f64]) {
         for (k, (t, relative, at_zero)) in residuals(tree, state).into_iter().enumerate() {
             if t == 0.0 {
-                assert!(at_zero >= 0.0, "edge {k} sits at zero with f(0) = {at_zero:e}");
+                assert!(
+                    at_zero >= 0.0,
+                    "edge {k} sits at zero with f(0) = {at_zero:e}"
+                );
             } else {
                 assert!(
                     relative < STATIONARY_RESIDUAL,
@@ -761,7 +758,11 @@ mod tests {
         let best = probe_state.prune(&probe);
         for k in 0..tree.n_nodes() - 1 {
             let t = tree.branch(k as u32);
-            let step = if t == 0.0 { PERTURBATION } else { t * PERTURBATION };
+            let step = if t == 0.0 {
+                PERTURBATION
+            } else {
+                t * PERTURBATION
+            };
             for delta in [step, -step] {
                 let moved = t + delta;
                 if moved < 0.0 {
@@ -832,7 +833,10 @@ mod tests {
                 }
                 checked += 1;
             }
-            assert!(checked >= tree.n_nodes() - 3, "only checked {checked} nodes");
+            assert!(
+                checked >= tree.n_nodes() - 3,
+                "only checked {checked} nodes"
+            );
         }
     }
 
@@ -895,8 +899,14 @@ mod tests {
                     }),
                 )
                 .unwrap();
-                assert!(l >= l0, "start {start}, cap {cap}: {l} below the start {l0}");
-                assert!(l >= previous, "start {start}, cap {cap}: {l} below {previous}");
+                assert!(
+                    l >= l0,
+                    "start {start}, cap {cap}: {l} below the start {l0}"
+                );
+                assert!(
+                    l >= previous,
+                    "start {start}, cap {cap}: {l} below {previous}"
+                );
                 previous = l;
             }
         }

@@ -56,13 +56,17 @@ fn main() {
                     (cell / 8) as f64 * 0.6 + splitmix64_at(i) * 2.0 + (feat as f64 * 0.01).sin()
                 })
                 .collect();
-            let w: Vec<f64> = (0..total).map(|i| 0.4 + splitmix64_at(total + i) * 2.0).collect();
+            let w: Vec<f64> = (0..total)
+                .map(|i| 0.4 + splitmix64_at(total + i) * 2.0)
+                .collect();
 
             // The peeled rest of the star. In the real search this is recomputed
             // per pair by subtraction in O(p); here one representative is enough
             // to make the arithmetic honest.
             let m_r: Vec<f64> = (0..p).map(|g| 1.0 + (g as f64 * 0.03).cos()).collect();
-            let w_r: Vec<f64> = (0..p).map(|g| 0.7 + 0.2 * (g as f64 * 0.05).sin()).collect();
+            let w_r: Vec<f64> = (0..p)
+                .map(|g| 0.7 + 0.2 * (g as f64 * 0.05).sin())
+                .collect();
 
             // Candidate pairs: each node against the next NEIGHBOURS nodes,
             // which the clustering above makes a plausible neighbour list.

@@ -418,9 +418,7 @@ mod tests {
         let w_l32: Vec<f32> = w_l.iter().map(|&x| x as f32).collect();
         let mut m32 = vec![0.0f32; p];
         let mut w32 = vec![0.0f32; p];
-        let l32 = prune_binary_scalar(
-            &m_k32, &w_k32, t_k, &m_l32, &w_l32, t_l, &mut m32, &mut w32,
-        );
+        let l32 = prune_binary_scalar(&m_k32, &w_k32, t_k, &m_l32, &w_l32, t_l, &mut m32, &mut w32);
 
         assert_relative_eq!(l32, l64, epsilon = 1e-5);
     }

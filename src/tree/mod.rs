@@ -209,7 +209,9 @@ impl Tree {
             let n_child = (child_ptr[i + 1] - child_ptr[i]) as usize;
             if n_child < 2 {
                 return Err(BonsaiErrors::MalformedTree {
-                    reason: format!("internal node {i} has {n_child} children, expected at least 2"),
+                    reason: format!(
+                        "internal node {i} has {n_child} children, expected at least 2"
+                    ),
                 });
             }
         }
@@ -482,7 +484,10 @@ mod tests {
         }
         for node in tree.internal_postorder() {
             for &c in tree.children(node) {
-                assert!(seen[c as usize], "child {c} not visited before parent {node}");
+                assert!(
+                    seen[c as usize],
+                    "child {c} not visited before parent {node}"
+                );
             }
             seen[node as usize] = true;
         }

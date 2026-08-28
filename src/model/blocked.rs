@@ -16,8 +16,8 @@
 use rayon::prelude::*;
 
 use crate::errors::BonsaiErrors;
-use crate::tree::Tree;
 use crate::model::likelihood::prune_node_into;
+use crate::tree::Tree;
 use crate::utils::traits::BonsaiFloat;
 
 /// Default features per block.
@@ -252,11 +252,7 @@ mod tests {
         assert_relative_eq!(l_blocked, l_flat, max_relative = 1e-12);
         for node in 0..tree.n_nodes() as u32 {
             for g in 0..p {
-                assert_relative_eq!(
-                    blocked.means(node)[g],
-                    flat.means(node)[g],
-                    epsilon = 1e-12
-                );
+                assert_relative_eq!(blocked.means(node)[g], flat.means(node)[g], epsilon = 1e-12);
             }
         }
     }
@@ -270,7 +266,11 @@ mod tests {
         let mut flat = NodeState::new(tree.n_nodes(), p, &m, &w).unwrap();
         let mut blocked = BlockedState::new(tree.n_nodes(), p, &m, &w, 16).unwrap();
 
-        assert_relative_eq!(blocked.prune(&tree), flat.prune(&tree), max_relative = 1e-12);
+        assert_relative_eq!(
+            blocked.prune(&tree),
+            flat.prune(&tree),
+            max_relative = 1e-12
+        );
     }
 
     #[test]

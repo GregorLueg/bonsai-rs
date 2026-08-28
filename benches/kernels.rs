@@ -78,7 +78,9 @@ fn report<F: FnMut() -> f64>(name: &str, flops: f64, bytes: f64, mut f: F) {
 }
 
 fn main() {
-    let m_k: Vec<f64> = (0..P).map(|g| splitmix64_at(g as u64) * 4.0 - 2.0).collect();
+    let m_k: Vec<f64> = (0..P)
+        .map(|g| splitmix64_at(g as u64) * 4.0 - 2.0)
+        .collect();
     let w_k: Vec<f64> = (0..P)
         .map(|g| 0.3 + splitmix64_at(P as u64 + g as u64) * 3.0)
         .collect();

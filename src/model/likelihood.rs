@@ -358,12 +358,8 @@ pub(crate) mod tests {
         let branch_len = 0.7;
 
         // ((0,1)a, 2, 3) rooted at r.
-        let tree = Tree::from_parents(
-            vec![4, 4, 5, 5, 5, NO_NODE],
-            vec![branch_len; 6],
-            4,
-        )
-        .unwrap();
+        let tree =
+            Tree::from_parents(vec![4, 4, 5, 5, 5, NO_NODE], vec![branch_len; 6], 4).unwrap();
         let mut full = NodeState::new(tree.n_nodes(), p, &m, &w).unwrap();
         let l_full = full.prune(&tree);
 
@@ -377,8 +373,7 @@ pub(crate) mod tests {
         let mut w_sum = cherry_state.precisions(2).to_vec();
         m_sum.extend_from_slice(&m[2 * p..4 * p]);
         w_sum.extend_from_slice(&w[2 * p..4 * p]);
-        let collapsed =
-            Tree::from_parents(vec![3, 3, 3, NO_NODE], vec![branch_len; 4], 3).unwrap();
+        let collapsed = Tree::from_parents(vec![3, 3, 3, NO_NODE], vec![branch_len; 4], 3).unwrap();
         let mut collapsed_state = NodeState::new(4, p, &m_sum, &w_sum).unwrap();
         let l_collapsed = collapsed_state.prune(&collapsed);
 
@@ -397,8 +392,8 @@ pub(crate) mod tests {
         let (m, w) = leaf_data(4, p);
         let branch = vec![0.3, 1.7, 0.9, 0.5, 1.1, 0.2, 0.0];
 
-        let straight = Tree::from_parents(vec![4, 4, 5, 5, 6, 6, NO_NODE], branch.clone(), 4)
-            .unwrap();
+        let straight =
+            Tree::from_parents(vec![4, 4, 5, 5, 6, 6, NO_NODE], branch.clone(), 4).unwrap();
         let mut s1 = NodeState::new(straight.n_nodes(), p, &m, &w).unwrap();
         let l1 = s1.prune(&straight);
 

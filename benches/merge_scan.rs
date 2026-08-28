@@ -18,6 +18,7 @@
 //! Plain `main`, no harness.
 
 use bonsai_rs::model::merge::{EffLeaf, MergeScratch, score_merge};
+use bonsai_rs::utils::rng::splitmix64_at;
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -34,24 +35,6 @@ const NEIGHBOURS: usize = 10;
 
 /// Repeats per configuration; the reported time is the best of these.
 const REPEATS: usize = 3;
-
-/// One draw from the counter-based splitmix64 stream.
-///
-/// ### Params
-///
-/// * `index` - Position in the stream
-///
-/// ### Returns
-///
-/// A uniform in `[0, 1)`.
-#[inline]
-fn splitmix64(index: u64) -> f64 {
-    let mut z = index.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    (z >> 11) as f64 / (1u64 << 53) as f64
-}
 
 fn main() {
     println!("threads {}", rayon::current_num_threads());
@@ -70,10 +53,10 @@ fn main() {
                 .map(|i| {
                     let cell = i / p as u64;
                     let feat = i % p as u64;
-                    (cell / 8) as f64 * 0.6 + splitmix64(i) * 2.0 + (feat as f64 * 0.01).sin()
+                    (cell / 8) as f64 * 0.6 + splitmix64_at(i) * 2.0 + (feat as f64 * 0.01).sin()
                 })
                 .collect();
-            let w: Vec<f64> = (0..total).map(|i| 0.4 + splitmix64(total + i) * 2.0).collect();
+            let w: Vec<f64> = (0..total).map(|i| 0.4 + splitmix64_at(total + i) * 2.0).collect();
 
             // The peeled rest of the star. In the real search this is recomputed
             // per pair by subtraction in O(p); here one representative is enough

@@ -69,22 +69,6 @@ pub struct StarParams {
     pub merge: MergeParams,
 }
 
-impl StarParams {
-    /// Build parameters explicitly.
-    ///
-    /// ### Params
-    ///
-    /// * `min_gain` - Smallest accepted merge gain, in nats
-    /// * `merge` - Branch-length solve knobs for the merge score
-    ///
-    /// ### Returns
-    ///
-    /// The parameters.
-    pub fn new(min_gain: f64, merge: MergeParams) -> Self {
-        Self { min_gain, merge }
-    }
-}
-
 impl Default for StarParams {
     /// `DEFAULT_MIN_GAIN` and the default [`MergeParams`].
     ///
@@ -727,27 +711,9 @@ pub fn star_tree<T: BonsaiFloat>(
 mod tests {
     use super::*;
     use crate::model::likelihood::NodeState;
+    use crate::tree::simulate::splits;
+    use crate::utils::rng::SplitMix64;
     use approx::assert_relative_eq;
-
-    /// Deterministic pseudo-random stream, so tests need no rng dependency and
-    /// always describe the same scenario.
-    ///
-    /// ### Params
-    ///
-    /// * `seed` - Starting state, non-zero
-    ///
-    /// ### Returns
-    ///
-    /// A closure yielding uniforms in `[0, 1)`.
-    fn stream(seed: u64) -> impl FnMut() -> f64 {
-        let mut s = seed;
-        move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / (1u64 << 53) as f64
-        }
-    }
 
     /// Leaves drawn in `n_clusters` tight groups, far apart from each other.
     ///
@@ -769,14 +735,14 @@ mod tests {
         spread: f64,
         separation: f64,
     ) -> (Vec<f64>, Vec<f64>) {
-        let mut next = stream(0x2545_F491_4F6C_DD1D);
+        let mut rng = SplitMix64::new(0x2545_F491_4F6C_DD1D);
         // Each centre gets its own direction. Putting them on a line instead
         // makes the middle cluster coincide with the precision-weighted mean of
         // the outer two, so the remainder it would be peeled against sits
         // exactly on top of it and no branch separates them. That is the model
         // behaving correctly on a degenerate fixture, not a merge failing.
         let centres: Vec<Vec<f64>> = (0..n_clusters)
-            .map(|_| (0..p).map(|_| separation * (next() - 0.5)).collect())
+            .map(|_| (0..p).map(|_| separation * (rng.uniform() - 0.5)).collect())
             .collect();
 
         let mut m = Vec::with_capacity(n_clusters * per_cluster * p);
@@ -784,8 +750,8 @@ mod tests {
         for c in 0..n_clusters {
             for _ in 0..per_cluster {
                 for g in 0..p {
-                    m.push(centres[c][g] + spread * (next() - 0.5));
-                    w.push(0.5 + next());
+                    m.push(centres[c][g] + spread * (rng.uniform() - 0.5));
+                    w.push(0.5 + rng.uniform());
                 }
             }
         }
@@ -1007,15 +973,13 @@ mod tests {
         // terminating: a greedy scan that peels the remainder wrongly still
         // terminates, it just builds nonsense.
         //
-        // "Clade" here means a split of the *unrooted* tree, so a cluster is
-        // recovered if some node's leaf set is the cluster or is everything
-        // else. That is not pedantry. The centre is a bookkeeping root
-        // (SPEC.md section 2, S14), and once the star is down to four members
-        // the last merge has two spellings of one unrooted tree: joining the
-        // first two members and joining the other two give the same topology
-        // with the centre sitting on a different one of its degree-three
-        // nodes. Which of the two the greedy picks is arbitrary, so a rooted
-        // clade check would reject half of the correct answers.
+        // Checked as splits of the *unrooted* tree, which is what `splits`
+        // computes. That is not pedantry: once the star is down to four members
+        // the last merge has two spellings of one unrooted tree, joining the
+        // first two members or the other two, differing only in which of the
+        // centre's degree-three nodes it sits on. Which one the greedy picks is
+        // arbitrary, so a rooted clade check would reject half of the correct
+        // answers.
         for (n_clusters, per) in [(3usize, 4usize), (4, 4), (3, 6)] {
             let p = 24usize;
             let n = n_clusters * per;
@@ -1025,14 +989,21 @@ mod tests {
             let (tree, gain) = star_tree(star(&m, &w, &t0, p), None).expect("star tree");
             assert!(gain > 0.0);
 
-            let sets = leaf_sets(&tree);
+            let got = splits(&tree);
             for c in 0..n_clusters {
-                let want: Vec<u32> = ((c * per) as u32..((c + 1) * per) as u32).collect();
-                let rest: Vec<u32> = (0..n as u32).filter(|x| !want.contains(x)).collect();
+                // `splits` keys each bipartition by the side without leaf zero,
+                // so the cluster holding leaf zero is looked up by its
+                // complement. Clusters are contiguous blocks of leaves, so that
+                // is the only one that needs it.
+                let want: Vec<u32> = if c == 0 {
+                    (per as u32..n as u32).collect()
+                } else {
+                    ((c * per) as u32..((c + 1) * per) as u32).collect()
+                };
                 assert!(
-                    sets.iter().any(|s| *s == want || *s == rest),
+                    got.contains(&want),
                     "cluster {c} of {n_clusters} ({want:?}) is not a split of the tree; \
-                     leaf sets were {sets:?}"
+                     the splits were {got:?}"
                 );
             }
         }
@@ -1273,15 +1244,15 @@ mod tests {
         // longer than anything else, rather than dragging a near member out
         // of the group with it.
         let (p, n) = (24usize, 9usize);
-        let mut next = stream(0x9E37_79B9_7F4A_7C15);
+        let mut rng = SplitMix64::new(0x9E37_79B9_7F4A_7C15);
         let base: Vec<f64> = (0..p).map(|g| (g as f64 * 0.19).sin()).collect();
         let mut m = Vec::with_capacity(n * p);
         let mut w = Vec::with_capacity(n * p);
         for i in 0..n {
             for g in 0..p {
                 let far = if i == n - 1 { 40.0 } else { 0.0 };
-                m.push(base[g] + far + 0.3 * (next() - 0.5));
-                w.push(0.8 + 0.4 * next());
+                m.push(base[g] + far + 0.3 * (rng.uniform() - 0.5));
+                w.push(0.8 + 0.4 * rng.uniform());
             }
         }
         let t0 = vec![0.4f64; n];

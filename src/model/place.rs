@@ -67,18 +67,29 @@ const DEFAULT_TOLERANCE: f64 = 4.0;
 ///
 /// The reference uses `log(n)` centres from a distance-based clustering; our
 /// count is ours to choose (SPEC.md section 7.2). Measured on 2026-08-27 on the
-/// fixtures described on [`DEFAULT_TOLERANCE`], and the honest summary is that
-/// at the shipped tolerance the extra starts change no answer and cost scored
-/// nodes: 13 against 23 on the 127-node fixture, 18 against 29 on the 511-node
-/// one, 137 against 144 on the ladder.
+/// fixtures described on [`DEFAULT_TOLERANCE`]: at the shipped tolerance the
+/// extra starts changed no answer there and cost scored nodes, 13 against 23 on
+/// the 127-node fixture, 18 against 29 on the 511-node one, and 137 against 144
+/// on the ladder.
 ///
-/// Eight is kept anyway, as insurance against a caller tightening the
-/// tolerance, and because that is the point at which the insurance actually
-/// pays: at a tolerance of 2 the ladder recovers 16 queries out of 16 from
-/// eight starts, 13 or 14 from four, and 11 to 13 from one. It is also roughly
-/// `log2(n)` over the few hundred nodes a backbone round works with, which is
-/// the same order as the reference's `log(n)`. A caller placing millions of
-/// cells against a fixed backbone should drop it to one and keep the tolerance.
+/// That first measurement was too small to see the failure. Re-measured on
+/// 2026-08-28 over 144 queries (three shapes, nine seeds, sixteen queries each,
+/// 64 features, noise 0.3), the balanced fixtures still recover 144 out of 144
+/// from a single start at every tolerance tried, but a 128-leaf ladder at the
+/// shipped tolerance of 4 recovers 138 from one start, 142 from four and 144
+/// from eight. The six it loses are lost badly, not marginally: the worst is
+/// 197 nats short of the optimum and the six together are 1073, which is the
+/// same cliff [`DEFAULT_TOLERANCE`] describes. Tightening to a tolerance of 2
+/// makes it worse again, 90 from one start against 139 from eight.
+///
+/// Eight ships because on the shape that fails it is nearly free: 20294 scored
+/// nodes against 19050, six per cent. The 77 per cent it costs on the balanced
+/// fixtures is ten extra node scores per query on a 127-node tree, which is not
+/// what will decide whether this is fast enough. A caller placing millions of
+/// cells against a fixed backbone, and willing to accept the ladder case, can
+/// drop it to one through [`PlacementParams::n_starts`]. Eight is also roughly
+/// `log2(n)` over the few hundred nodes a backbone round works with, the same
+/// order as the reference's `log(n)`.
 const DEFAULT_STARTS: usize = 8;
 
 /// Tuning knobs for the beam search of SPEC.md section 7.2.
@@ -392,44 +403,8 @@ where
 mod tests {
     use super::*;
     use crate::tree::NO_NODE;
+    use crate::utils::rng::SplitMix64;
     use approx::assert_relative_eq;
-
-    /// One draw from a deterministic uniform stream.
-    ///
-    /// A splitmix64 step. The fixtures need reproducible pseudo-randomness and
-    /// nothing else, so this avoids pinning the tests to a particular version
-    /// of an external generator.
-    ///
-    /// ### Params
-    ///
-    /// * `state` - Generator state, advanced in place
-    ///
-    /// ### Returns
-    ///
-    /// A uniform draw on `[0, 1)`.
-    fn uniform(state: &mut u64) -> f64 {
-        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        (z >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// One standard normal draw, Box-Muller.
-    ///
-    /// ### Params
-    ///
-    /// * `state` - Generator state, advanced in place
-    ///
-    /// ### Returns
-    ///
-    /// A draw from `N(0, 1)`.
-    fn gauss(state: &mut u64) -> f64 {
-        let u = uniform(state).max(1e-12);
-        let v = uniform(state);
-        (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
-    }
 
     /// A tree with data simulated on it, plus the two-sided effective leaves.
     ///
@@ -468,7 +443,7 @@ mod tests {
         /// The fixture.
         fn new(tree: Tree, p: usize, sigma: f64, seed: u64) -> Self {
             let n = tree.n_nodes();
-            let mut state = seed;
+            let mut rng = SplitMix64::new(seed);
             let mut pos = vec![0.0f64; n * p];
             // Parents have larger indices than their children, so descending
             // index order visits every parent before its children.
@@ -479,7 +454,7 @@ mod tests {
                 };
                 let sd = tree.branch(node as u32).sqrt();
                 for g in 0..p {
-                    pos[node * p + g] = pos[par * p + g] + sd * gauss(&mut state);
+                    pos[node * p + g] = pos[par * p + g] + sd * rng.normal();
                 }
             }
             let n_leaves = tree.n_leaves();
@@ -487,7 +462,7 @@ mod tests {
             let leaf_w = vec![1.0 / (sigma * sigma); n_leaves * p];
             for i in 0..n_leaves {
                 for g in 0..p {
-                    leaf_m[i * p + g] = pos[i * p + g] + sigma * gauss(&mut state);
+                    leaf_m[i * p + g] = pos[i * p + g] + sigma * rng.normal();
                 }
             }
 

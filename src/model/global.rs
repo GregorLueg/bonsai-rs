@@ -312,22 +312,6 @@ pub struct GlobalBranchParams {
     pub tol: f64,
 }
 
-impl GlobalBranchParams {
-    /// Build a stopping rule.
-    ///
-    /// ### Params
-    ///
-    /// * `max_iter` - Maximum number of iterations
-    /// * `tol` - Relative improvement below which to stop
-    ///
-    /// ### Returns
-    ///
-    /// The parameters.
-    pub fn new(max_iter: usize, tol: f64) -> Self {
-        Self { max_iter, tol }
-    }
-}
-
 impl Default for GlobalBranchParams {
     /// Defaults chosen by measurement, 2026-08-27.
     ///
@@ -472,47 +456,8 @@ mod tests {
     use super::*;
     use crate::tree::{NO_NODE, Tree};
     use crate::utils::kernels::edge_newton;
+    use crate::utils::rng::SplitMix64;
     use approx::assert_relative_eq;
-
-    /// Deterministic uniform stream, so the fixtures need no rng dependency.
-    struct Rng(u64);
-
-    impl Rng {
-        /// Start the stream.
-        ///
-        /// ### Params
-        ///
-        /// * `seed` - Non-zero seed
-        ///
-        /// ### Returns
-        ///
-        /// The generator.
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-
-        /// Next uniform on `(0, 1)`.
-        ///
-        /// ### Returns
-        ///
-        /// The variate.
-        fn uniform(&mut self) -> f64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            ((self.0 >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-        }
-
-        /// Next standard normal, by Box-Muller.
-        ///
-        /// ### Returns
-        ///
-        /// The variate.
-        fn normal(&mut self) -> f64 {
-            let (u, v) = (self.uniform(), self.uniform());
-            (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
-        }
-    }
 
     /// Leaf means and precisions with no relation to any tree.
     ///
@@ -526,7 +471,7 @@ mod tests {
     ///
     /// Row-major means and precisions, `[leaf][feature]`.
     fn leaf_data(n_leaves: usize, p: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
-        let mut rng = Rng::new(seed);
+        let mut rng = SplitMix64::new(seed);
         let mut m = Vec::with_capacity(n_leaves * p);
         let mut w = Vec::with_capacity(n_leaves * p);
         for _ in 0..n_leaves * p {
@@ -554,7 +499,7 @@ mod tests {
     ///
     /// Row-major leaf means and precisions.
     fn simulate(tree: &Tree, p: usize, precision: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {
-        let mut rng = Rng::new(seed);
+        let mut rng = SplitMix64::new(seed);
         let n = tree.n_nodes();
         let mut x = vec![0.0f64; n * p];
         // Descending index order is a pre-order, so a parent is always drawn
@@ -944,7 +889,10 @@ mod tests {
                 let l = optimise_branch_lengths(
                     &mut t,
                     &mut state,
-                    Some(GlobalBranchParams::new(cap, 0.0)),
+                    Some(GlobalBranchParams {
+                        max_iter: cap,
+                        tol: 0.0,
+                    }),
                 )
                 .unwrap();
                 assert!(l >= l0, "start {start}, cap {cap}: {l} below the start {l0}");
@@ -980,7 +928,10 @@ mod tests {
         optimise_branch_lengths(
             &mut tree,
             &mut state,
-            Some(GlobalBranchParams::new(200, 0.0)),
+            Some(GlobalBranchParams {
+                max_iter: 200,
+                tol: 0.0,
+            }),
         )
         .unwrap();
 
@@ -1071,7 +1022,10 @@ mod tests {
         let l = optimise_branch_lengths(
             &mut tree,
             &mut state,
-            Some(GlobalBranchParams::new(200, 0.0)),
+            Some(GlobalBranchParams {
+                max_iter: 200,
+                tol: 0.0,
+            }),
         )
         .unwrap();
 

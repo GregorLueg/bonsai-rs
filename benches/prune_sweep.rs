@@ -22,6 +22,7 @@
 use bonsai_rs::model::blocked::{BlockedState, DEFAULT_BLOCK};
 use bonsai_rs::model::likelihood::NodeState;
 use bonsai_rs::tree::Tree;
+use bonsai_rs::utils::rng::splitmix64_at;
 use std::time::Instant;
 
 /// Leaf counts swept, all powers of two so the balanced binary builder applies.
@@ -37,27 +38,6 @@ const REPEATS: usize = 5;
 /// Branch length assigned to every edge in the fixture tree.
 const FIXTURE_BRANCH: f64 = 0.6;
 
-/// One draw from the counter-based splitmix64 stream.
-///
-/// Stateless, so element `i` is a pure function of `i` and the numpy reference
-/// can produce the same stream without a Python loop.
-///
-/// ### Params
-///
-/// * `index` - Position in the stream
-///
-/// ### Returns
-///
-/// A uniform in `[0, 1)`.
-#[inline]
-fn splitmix64(index: u64) -> f64 {
-    let mut z = index.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    (z >> 11) as f64 / (1u64 << 53) as f64
-}
-
 /// Leaf means and precisions in transformed units, row-major `[leaf][feature]`.
 ///
 /// ### Params
@@ -70,8 +50,8 @@ fn splitmix64(index: u64) -> f64 {
 /// The means and precisions blocks, each `n_leaves * n_features` long.
 fn make_fixture(n_leaves: usize, n_features: usize) -> (Vec<f64>, Vec<f64>) {
     let n = (n_leaves * n_features) as u64;
-    let means = (0..n).map(|i| splitmix64(i) * 4.0 - 2.0).collect();
-    let precisions = (n..2 * n).map(|i| 0.25 + splitmix64(i) * 3.0).collect();
+    let means = (0..n).map(|i| splitmix64_at(i) * 4.0 - 2.0).collect();
+    let precisions = (n..2 * n).map(|i| 0.25 + splitmix64_at(i) * 3.0).collect();
     (means, precisions)
 }
 

@@ -33,6 +33,7 @@
 //! the division is the wall and extra chains will never help.
 
 use bonsai_rs::utils::kernels::{edge_loglik, edge_newton, prep_edge, prune_binary_scalar};
+use bonsai_rs::utils::rng::splitmix64_at;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -44,24 +45,6 @@ const CALLS: usize = 20_000;
 
 /// Repeats; the reported time is the best.
 const REPEATS: usize = 5;
-
-/// One draw from the counter-based splitmix64 stream.
-///
-/// ### Params
-///
-/// * `index` - Position in the stream
-///
-/// ### Returns
-///
-/// A uniform in `[0, 1)`.
-#[inline]
-fn splitmix64(index: u64) -> f64 {
-    let mut z = index.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    (z >> 11) as f64 / (1u64 << 53) as f64
-}
 
 /// Time a kernel and report its achieved rates.
 ///
@@ -95,15 +78,15 @@ fn report<F: FnMut() -> f64>(name: &str, flops: f64, bytes: f64, mut f: F) {
 }
 
 fn main() {
-    let m_k: Vec<f64> = (0..P).map(|g| splitmix64(g as u64) * 4.0 - 2.0).collect();
+    let m_k: Vec<f64> = (0..P).map(|g| splitmix64_at(g as u64) * 4.0 - 2.0).collect();
     let w_k: Vec<f64> = (0..P)
-        .map(|g| 0.3 + splitmix64(P as u64 + g as u64) * 3.0)
+        .map(|g| 0.3 + splitmix64_at(P as u64 + g as u64) * 3.0)
         .collect();
     let m_l: Vec<f64> = (0..P)
-        .map(|g| splitmix64(2 * P as u64 + g as u64) * 4.0 - 2.0)
+        .map(|g| splitmix64_at(2 * P as u64 + g as u64) * 4.0 - 2.0)
         .collect();
     let w_l: Vec<f64> = (0..P)
-        .map(|g| 0.3 + splitmix64(3 * P as u64 + g as u64) * 3.0)
+        .map(|g| 0.3 + splitmix64_at(3 * P as u64 + g as u64) * 3.0)
         .collect();
 
     let mut m_out = vec![0.0f64; P];

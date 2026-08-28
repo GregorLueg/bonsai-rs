@@ -17,8 +17,7 @@ use rayon::prelude::*;
 
 use crate::errors::BonsaiErrors;
 use crate::tree::Tree;
-use crate::utils::kernels::prune_general;
-use crate::utils::simd::prune_binary;
+use crate::model::likelihood::prune_node_into;
 use crate::utils::traits::BonsaiFloat;
 
 /// Default features per block.
@@ -190,7 +189,7 @@ impl<T: BonsaiFloat> BlockedState<T> {
     /// The tree loglikelihood, up to the dropped additive constants.
     pub fn prune(&mut self, tree: &Tree) -> f64 {
         debug_assert_eq!(tree.n_nodes(), self.n_nodes);
-        let (n_nodes, p, block) = (self.n_nodes, self.p, self.block);
+        let (p, block) = (self.p, self.block);
         let starts = &self.block_start;
         let n_blocks = starts.len() - 1;
 
@@ -216,52 +215,8 @@ impl<T: BonsaiFloat> BlockedState<T> {
                 let mut acc = 0.0f64;
 
                 for node in tree.internal_postorder() {
-                    let split = node as usize * len;
-                    let (m_lo, m_hi) = m.split_at_mut(split);
-                    let (w_lo, w_hi) = w.split_at_mut(split);
-                    let m_out = &mut m_hi[..len];
-                    let w_out = &mut w_hi[..len];
-
-                    let kids = tree.children(node);
-                    acc += match kids.len() {
-                        2 => {
-                            let (k, l) = (kids[0] as usize, kids[1] as usize);
-                            prune_binary(
-                                &m_lo[k * len..k * len + len],
-                                &w_lo[k * len..k * len + len],
-                                tree.branch(kids[0]),
-                                &m_lo[l * len..l * len + len],
-                                &w_lo[l * len..l * len + len],
-                                tree.branch(kids[1]),
-                                m_out,
-                                w_out,
-                            )
-                        }
-                        n_child => {
-                            if scratch.len() < len * n_child {
-                                scratch.resize(len * n_child, 0.0);
-                            }
-                            let children: Vec<(&[T], &[T], f64)> = kids
-                                .iter()
-                                .map(|&c| {
-                                    let lo = c as usize * len;
-                                    (
-                                        &m_lo[lo..lo + len],
-                                        &w_lo[lo..lo + len],
-                                        tree.branch(c),
-                                    )
-                                })
-                                .collect();
-                            prune_general(
-                                &children,
-                                m_out,
-                                w_out,
-                                &mut scratch[..len * n_child],
-                            )
-                        }
-                    };
+                    acc += prune_node_into(tree, node, len, m, w, &mut scratch);
                 }
-                let _ = n_nodes;
                 acc
             })
             .collect_into_vec(&mut parts);
@@ -277,27 +232,9 @@ impl<T: BonsaiFloat> BlockedState<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::likelihood::NodeState;
+    use crate::model::likelihood::{NodeState, tests::leaf_data};
     use crate::tree::Tree;
     use approx::assert_relative_eq;
-
-    /// Deterministic leaf data, matching the generator in `likelihood`.
-    fn leaf_data(n_leaves: usize, p: usize) -> (Vec<f64>, Vec<f64>) {
-        let mut m = Vec::with_capacity(n_leaves * p);
-        let mut w = Vec::with_capacity(n_leaves * p);
-        let mut s = 0x2545_F491_4F6C_DD1Du64;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / (1u64 << 53) as f64
-        };
-        for _ in 0..n_leaves * p {
-            m.push(next() * 4.0 - 2.0);
-            w.push(0.25 + next() * 3.0);
-        }
-        (m, w)
-    }
 
     #[test]
     fn test_blocked_matches_row_major_on_a_balanced_tree() {

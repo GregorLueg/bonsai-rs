@@ -49,27 +49,6 @@ pub enum BonsaiErrors {
         feature: usize,
     },
 
-    /// Feature variances must be strictly positive; the ingest transform of
-    /// SPEC.md section 3.1 divides by their square root.
-    #[error("Non-positive variance {value} for feature {feature}.")]
-    NonPositiveVariance {
-        /// Offending value
-        value: f64,
-        /// Feature index
-        feature: usize,
-    },
-
-    /// Every feature was rejected by the signal-to-noise filter.
-    #[error(
-        "The signal-to-noise threshold {threshold} rejected all {n_features} features. Lower the threshold."
-    )]
-    NoFeaturesRetained {
-        /// Threshold that was applied
-        threshold: f64,
-        /// Number of features considered
-        n_features: usize,
-    },
-
     // -- tree structure --
     /// A node index was outside the arena.
     #[error("Node index {index} is out of range for a tree with {n_nodes} nodes.")]

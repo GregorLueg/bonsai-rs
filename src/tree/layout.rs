@@ -145,48 +145,6 @@ pub struct LayoutParams {
     pub hyperbolic_zoom: f64,
 }
 
-impl LayoutParams {
-    /// Build a parameter set explicitly.
-    ///
-    /// ### Params
-    ///
-    /// * `leaf_spacing` - Vertical distance between adjacent dendrogram leaves
-    /// * `start_angle` - Direction of the first wedge boundary, in radians
-    /// * `daylight_max_nodes` - Node count above which refinement is skipped
-    /// * `daylight_max_sweeps` - Cap on accepted refinement sweeps
-    /// * `daylight_angle_tol` - Rotation below which a sweep counts as
-    ///   converged
-    /// * `daylight_damping` - Fraction of each rotation actually applied
-    /// * `hyperbolic_origin` - Point sent to the centre of the disk
-    /// * `hyperbolic_zoom` - Scale applied after the translation
-    ///
-    /// ### Returns
-    ///
-    /// The parameter set.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        leaf_spacing: f64,
-        start_angle: f64,
-        daylight_max_nodes: usize,
-        daylight_max_sweeps: usize,
-        daylight_angle_tol: f64,
-        daylight_damping: f64,
-        hyperbolic_origin: (f64, f64),
-        hyperbolic_zoom: f64,
-    ) -> Self {
-        Self {
-            leaf_spacing,
-            start_angle,
-            daylight_max_nodes,
-            daylight_max_sweeps,
-            daylight_angle_tol,
-            daylight_damping,
-            hyperbolic_origin,
-            hyperbolic_zoom,
-        }
-    }
-}
-
 impl Default for LayoutParams {
     /// The shipped defaults: one unit per leaf, wedges starting along the
     /// positive `x` axis, the measured daylight gate of
@@ -1274,54 +1232,8 @@ pub fn has_edge_crossing(tree: &Tree, layout: &Layout) -> Result<bool, BonsaiErr
 mod tests {
     use super::*;
     use crate::tree::NO_NODE;
+    use crate::utils::rng::SplitMix64;
     use approx::assert_relative_eq;
-
-    /// A linear congruential generator, so the fixtures are reproducible
-    /// without pulling a distribution crate into a geometry test.
-    struct Lcg(u64);
-
-    impl Lcg {
-        /// Next raw draw.
-        ///
-        /// ### Returns
-        ///
-        /// A 64-bit value.
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            self.0
-        }
-
-        /// Next draw in `[lo, hi)`.
-        ///
-        /// ### Params
-        ///
-        /// * `lo` - Lower bound
-        /// * `hi` - Upper bound
-        ///
-        /// ### Returns
-        ///
-        /// A value in the half-open interval.
-        fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
-            let u = (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
-            lo + u * (hi - lo)
-        }
-
-        /// Next draw below `n`.
-        ///
-        /// ### Params
-        ///
-        /// * `n` - Exclusive upper bound, at least one
-        ///
-        /// ### Returns
-        ///
-        /// An index below `n`.
-        fn below(&mut self, n: usize) -> usize {
-            (self.next_u64() % n as u64) as usize
-        }
-    }
 
     /// A star: every leaf hanging directly off the root.
     ///
@@ -1336,10 +1248,8 @@ mod tests {
     fn star(n_leaves: usize, branch: f64) -> Tree {
         let mut parent = vec![n_leaves as u32; n_leaves + 1];
         parent[n_leaves] = NO_NODE;
-        match Tree::from_parents(parent, vec![branch; n_leaves + 1], n_leaves) {
-            Ok(t) => t,
-            Err(e) => panic!("star fixture is malformed: {e}"),
-        }
+        Tree::from_parents(parent, vec![branch; n_leaves + 1], n_leaves)
+            .expect("star fixture is malformed")
     }
 
     /// A tree mixing a polytomy with resolved clades: the root has five
@@ -1351,10 +1261,7 @@ mod tests {
     fn polytomy() -> Tree {
         let parent = vec![8, 8, 9, 9, 9, 10, 10, 10, 10, 10, NO_NODE];
         let branch = vec![0.3, 0.7, 0.2, 0.9, 0.4, 1.1, 0.6, 0.8, 0.5, 1.3, 0.0];
-        match Tree::from_parents(parent, branch, 8) {
-            Ok(t) => t,
-            Err(e) => panic!("polytomy fixture is malformed: {e}"),
-        }
+        Tree::from_parents(parent, branch, 8).expect("polytomy fixture is malformed")
     }
 
     /// A random binary tree with random branch lengths.
@@ -1371,7 +1278,7 @@ mod tests {
     ///
     /// The tree.
     fn random_tree(n_leaves: usize, seed: u64) -> Tree {
-        let mut rng = Lcg(seed.wrapping_mul(2_862_933_555_777_941_757).wrapping_add(3));
+        let mut rng = SplitMix64::new(seed);
         let n_nodes = 2 * n_leaves - 1;
         let mut parent = vec![NO_NODE; n_nodes];
         let mut branch = vec![0.0f64; n_nodes];
@@ -1384,15 +1291,12 @@ mod tests {
             let b = active.swap_remove(j);
             parent[a as usize] = next_free;
             parent[b as usize] = next_free;
-            branch[a as usize] = rng.uniform(0.05, 2.0);
-            branch[b as usize] = rng.uniform(0.05, 2.0);
+            branch[a as usize] = rng.range(0.05, 2.0);
+            branch[b as usize] = rng.range(0.05, 2.0);
             active.push(next_free);
             next_free += 1;
         }
-        match Tree::from_parents(parent, branch, n_leaves) {
-            Ok(t) => t,
-            Err(e) => panic!("random fixture is malformed: {e}"),
-        }
+        Tree::from_parents(parent, branch, n_leaves).expect("random fixture is malformed")
     }
 
     /// The fixture set every "does it work at all" test runs over: a balanced
@@ -1402,14 +1306,8 @@ mod tests {
     ///
     /// Named trees.
     fn shapes() -> Vec<(&'static str, Tree)> {
-        let balanced = match Tree::balanced_binary(16, 0.7) {
-            Ok(t) => t,
-            Err(e) => panic!("balanced fixture is malformed: {e}"),
-        };
-        let ladder = match Tree::ladder(17, 0.4) {
-            Ok(t) => t,
-            Err(e) => panic!("ladder fixture is malformed: {e}"),
-        };
+        let balanced = Tree::balanced_binary(16, 0.7).expect("balanced fixture is malformed");
+        let ladder = Tree::ladder(17, 0.4).expect("ladder fixture is malformed");
         vec![
             ("balanced", balanced),
             ("ladder", ladder),
@@ -1814,13 +1712,13 @@ mod tests {
 
     #[test]
     fn test_hyperbolic_keeps_everything_strictly_inside_the_unit_disk() {
-        let mut rng = Lcg(11);
+        let mut rng = SplitMix64::new(11);
         let n = 4096;
         let mut x = Vec::with_capacity(n);
         let mut y = Vec::with_capacity(n);
         for _ in 0..n {
-            x.push(rng.uniform(-1e12, 1e12));
-            y.push(rng.uniform(-1e12, 1e12));
+            x.push(rng.range(-1e12, 1e12));
+            y.push(rng.range(-1e12, 1e12));
         }
         let disk = Layout { x, y }.hyperbolic(None);
         for i in 0..n {
@@ -1831,7 +1729,7 @@ mod tests {
 
     #[test]
     fn test_hyperbolic_preserves_the_angle() {
-        let mut rng = Lcg(29);
+        let mut rng = SplitMix64::new(29);
         let params = LayoutParams {
             hyperbolic_origin: (0.4, -1.7),
             hyperbolic_zoom: 2.5,
@@ -1841,8 +1739,8 @@ mod tests {
         let mut x = Vec::with_capacity(n);
         let mut y = Vec::with_capacity(n);
         for _ in 0..n {
-            x.push(rng.uniform(-50.0, 50.0));
-            y.push(rng.uniform(-50.0, 50.0));
+            x.push(rng.range(-50.0, 50.0));
+            y.push(rng.range(-50.0, 50.0));
         }
         let source = Layout { x, y };
         let disk = source.hyperbolic(Some(params));

@@ -41,35 +41,24 @@
 //!
 //! ### Determinism
 //!
-//! The random stream is deliberately fixed. A local counter-based splitmix64
-//! (the same shape as `benches/prune_sweep.rs`) is used rather than `rand`, so
-//! the output is byte-identical on every platform and independent of thread
-//! count. Normal variates come from Box-Muller on two uniforms and exponentials
-//! from the inverse transform, both exactly reproducible. Draws are consumed in
-//! one fixed order: `v[g]`, then the target means, then the topology, then node
-//! positions, then measurement noise. Changing that order changes every
-//! fixture in the crate, so do not reorder it casually.
+//! The random stream is deliberately fixed. [`crate::utils::rng::SplitMix64`]
+//! is used rather than `rand`, so the output is byte-identical on every
+//! platform and independent of thread count. Normal variates come from
+//! Box-Muller on two uniforms and exponentials from the inverse transform, both
+//! exactly reproducible. Draws are consumed in one fixed order: `v[g]`, then
+//! the target means, then the topology, then node positions, then measurement
+//! noise. Changing that order changes every fixture in the crate, so do not
+//! reorder it casually.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};
+use crate::utils::rng::SplitMix64;
 use crate::utils::traits::{BonsaiFloat, narrow};
 use rustc_hash::FxHashSet;
 
 ///////////////
 // Constants //
 ///////////////
-
-/// Golden-ratio increment of the splitmix64 stream, `floor(2^64 / phi)`.
-const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// First multiplicative mixing constant of splitmix64.
-const SPLITMIX_MIX_A: u64 = 0xBF58_476D_1CE4_E5B9;
-
-/// Second multiplicative mixing constant of splitmix64.
-const SPLITMIX_MIX_B: u64 = 0x94D0_49BB_1331_11EB;
-
-/// Mantissa bits used when turning a `u64` into a double in `[0, 1)`.
-const MANTISSA_BITS: u32 = 53;
 
 /// Mean of the exponential distribution the per-feature variances `v[g]` are
 /// drawn from (SPEC.md section 13.1: "drawn from an exponential distribution
@@ -91,141 +80,6 @@ const RANDOM_BRANCH_HI: f64 = 2.0;
 /// the paper's; it only guards a degenerate case that a well-formed simulation
 /// never reaches.
 const MIN_FEATURE_VARIANCE: f64 = 1e-300;
-
-//////////////
-// The PRNG //
-//////////////
-
-/// A splitmix64 stream.
-///
-/// Three lines of state advance and mixing, no dependency, identical output
-/// everywhere. Seeded directly with the caller's seed, so distinct seeds give
-/// distinct streams from the first draw.
-#[derive(Clone, Copy, Debug)]
-struct SplitMix64 {
-    /// Stream position; advanced by [`SPLITMIX_GAMMA`] per draw.
-    state: u64,
-}
-
-impl SplitMix64 {
-    /// Start a stream at a seed.
-    ///
-    /// ### Params
-    ///
-    /// * `seed` - Seed value; any `u64` is valid, including zero
-    ///
-    /// ### Returns
-    ///
-    /// The stream.
-    #[inline]
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    /// Draw the next raw 64-bit word.
-    ///
-    /// ### Returns
-    ///
-    /// A uniformly distributed `u64`.
-    #[inline]
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(SPLITMIX_GAMMA);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(SPLITMIX_MIX_A);
-        z = (z ^ (z >> 27)).wrapping_mul(SPLITMIX_MIX_B);
-        z ^ (z >> 31)
-    }
-
-    /// Draw a uniform on the half-open interval `[0, 1)`.
-    ///
-    /// ### Returns
-    ///
-    /// The variate.
-    #[inline]
-    fn uniform(&mut self) -> f64 {
-        let bits = self.next_u64() >> (64 - MANTISSA_BITS);
-        bits as f64 / (1u64 << MANTISSA_BITS) as f64
-    }
-
-    /// Draw a uniform on the half-open interval `(0, 1]`.
-    ///
-    /// Needed wherever a logarithm is taken of the variate, which is both
-    /// Box-Muller and the exponential inverse transform.
-    ///
-    /// ### Returns
-    ///
-    /// The variate, never zero.
-    #[inline]
-    fn uniform_nonzero(&mut self) -> f64 {
-        let bits = self.next_u64() >> (64 - MANTISSA_BITS);
-        (bits as f64 + 1.0) / (1u64 << MANTISSA_BITS) as f64
-    }
-
-    /// Draw a standard normal variate by Box-Muller.
-    ///
-    /// The second variate of the pair is discarded rather than cached. Caching
-    /// would halve the cost but would make the stream position depend on the
-    /// parity of previous calls, and this module interleaves normal and uniform
-    /// draws; a fixed two-uniforms-per-normal cost keeps the stream trivially
-    /// auditable.
-    ///
-    /// ### Returns
-    ///
-    /// A draw from `N(0, 1)`.
-    #[inline]
-    fn normal(&mut self) -> f64 {
-        let radial = (-2.0 * self.uniform_nonzero().ln()).sqrt();
-        let angle = std::f64::consts::TAU * self.uniform();
-        radial * angle.cos()
-    }
-
-    /// Draw an exponential variate with a given mean, by inverse transform.
-    ///
-    /// ### Params
-    ///
-    /// * `mean` - Mean of the distribution, strictly positive
-    ///
-    /// ### Returns
-    ///
-    /// The variate, strictly positive.
-    #[inline]
-    fn exponential(&mut self, mean: f64) -> f64 {
-        -mean * self.uniform_nonzero().ln()
-    }
-
-    /// Draw a log-uniform variate on `[lo, hi]`.
-    ///
-    /// ### Params
-    ///
-    /// * `lo` - Lower bound, strictly positive
-    /// * `hi` - Upper bound, at least `lo`
-    ///
-    /// ### Returns
-    ///
-    /// The variate.
-    #[inline]
-    fn log_uniform(&mut self, lo: f64, hi: f64) -> f64 {
-        let (log_lo, log_hi) = (lo.ln(), hi.ln());
-        (log_lo + self.uniform() * (log_hi - log_lo)).exp()
-    }
-
-    /// Draw an index uniformly from `0..n`.
-    ///
-    /// Uses the low bits of a 64-bit draw. The modulo bias is on the order of
-    /// `n / 2^64` and is irrelevant for the leaf counts this module handles.
-    ///
-    /// ### Params
-    ///
-    /// * `n` - Exclusive upper bound, strictly positive
-    ///
-    /// ### Returns
-    ///
-    /// An index in `0..n`.
-    #[inline]
-    fn below(&mut self, n: usize) -> usize {
-        (self.next_u64() % n as u64) as usize
-    }
-}
 
 ////////////////
 // Parameters //
@@ -256,9 +110,10 @@ pub struct SimulationParams {
     pub noise_sd: f64,
     /// Spread of the per-cell per-feature error bars about `noise_sd`. Each
     /// standard deviation is multiplied by a log-uniform draw on
-    /// `[1 / noise_spread, noise_spread]`, so `1.0` is homoscedastic. Real data
-    /// is not homoscedastic and the precision-weighted machinery deserves to be
-    /// exercised, so the default is not `1.0`.
+    /// `[1 / noise_spread, noise_spread]`, so `1.0` is homoscedastic and values
+    /// below `1.0` are rejected. Real data is not homoscedastic and the
+    /// precision-weighted machinery deserves to be exercised, so the default is
+    /// not `1.0`.
     pub noise_spread: f64,
     /// Standard deviation of the per-feature target means `mu[g]` of SPEC.md
     /// section 13.1, in *untransformed* units. The tree loglikelihood depends
@@ -268,44 +123,6 @@ pub struct SimulationParams {
     pub feature_mean_sd: f64,
     /// Seed for the splitmix64 stream.
     pub seed: u64,
-}
-
-impl SimulationParams {
-    /// Build a parameter set explicitly.
-    ///
-    /// ### Params
-    ///
-    /// * `n_leaves` - Number of cells
-    /// * `n_features` - Number of features
-    /// * `branch_length` - Constant branch length `t`
-    /// * `noise_sd` - Measurement noise level in transformed units
-    /// * `noise_spread` - Log-uniform spread factor on the error bars
-    /// * `feature_mean_sd` - Spread of the per-feature target means
-    /// * `seed` - Seed for the random stream
-    ///
-    /// ### Returns
-    ///
-    /// The parameter set.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        n_leaves: usize,
-        n_features: usize,
-        branch_length: f64,
-        noise_sd: f64,
-        noise_spread: f64,
-        feature_mean_sd: f64,
-        seed: u64,
-    ) -> Self {
-        Self {
-            n_leaves,
-            n_features,
-            branch_length,
-            noise_sd,
-            noise_spread,
-            feature_mean_sd,
-            seed,
-        }
-    }
 }
 
 impl Default for SimulationParams {
@@ -419,10 +236,13 @@ fn open_stream(
         });
     }
     if !params.noise_spread.is_finite() || params.noise_spread < 1.0 {
-        return Err(BonsaiErrors::NonPositiveSd {
-            value: params.noise_spread,
-            cell: 0,
-            feature: 0,
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!(
+                "noise_spread {} is below 1; the error bars are multiplied by a log-uniform \
+                 draw on [1 / noise_spread, noise_spread], so the spread factor is the upper \
+                 end of that interval and cannot be less than one",
+                params.noise_spread
+            ),
         });
     }
 
@@ -779,7 +599,7 @@ pub fn simulate_unbalanced<T: BonsaiFloat>(
 /// ### Returns
 ///
 /// The canonical non-trivial splits.
-fn splits(tree: &Tree) -> FxHashSet<Vec<u32>> {
+pub(crate) fn splits(tree: &Tree) -> FxHashSet<Vec<u32>> {
     let n_leaves = tree.n_leaves();
     let n_nodes = tree.n_nodes();
 

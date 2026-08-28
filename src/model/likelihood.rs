@@ -152,63 +152,93 @@ impl<T: BonsaiFloat> NodeState<T> {
     pub fn prune(&mut self, tree: &Tree) -> f64 {
         debug_assert_eq!(tree.n_nodes(), self.n_nodes);
         let mut total = 0.0f64;
-        let mut parts: Vec<f64> = Vec::new();
-
         for level in 0..tree.n_levels() {
             let (start, end) = tree.level(level);
-            parts.clear();
-            parts.extend((start..end).map(|node| self.prune_node(tree, node as u32)));
-            total += parts.iter().sum::<f64>();
+            let mut level_total = 0.0f64;
+            for node in start..end {
+                level_total += prune_node_into(
+                    tree,
+                    node as u32,
+                    self.p,
+                    &mut self.m,
+                    &mut self.w,
+                    &mut self.scratch,
+                );
+            }
+            total += level_total;
         }
         total
     }
+}
 
-    /// Prune one internal node, reading its children's settled rows.
-    ///
-    /// ### Params
-    ///
-    /// * `tree` - Tree whose topology and branch lengths to use
-    /// * `node` - Internal node to settle
-    ///
-    /// ### Returns
-    ///
-    /// The node's loglikelihood contribution.
-    fn prune_node(&mut self, tree: &Tree, node: u32) -> f64 {
-        let p = self.p;
-        let split = node as usize * p;
-        let (m_lo, m_hi) = self.m.split_at_mut(split);
-        let (w_lo, w_hi) = self.w.split_at_mut(split);
-        let m_out = &mut m_hi[..p];
-        let w_out = &mut w_hi[..p];
+///////////////////////
+// Per-node dispatch //
+///////////////////////
 
-        let kids = tree.children(node);
-        match kids.len() {
-            2 => {
-                let (k, l) = (kids[0] as usize, kids[1] as usize);
-                prune_binary(
-                    &m_lo[k * p..k * p + p],
-                    &w_lo[k * p..k * p + p],
-                    tree.branch(kids[0]),
-                    &m_lo[l * p..l * p + p],
-                    &w_lo[l * p..l * p + p],
-                    tree.branch(kids[1]),
-                    m_out,
-                    w_out,
-                )
+/// Prune one internal node into a slab, reading its children's settled rows.
+///
+/// The two node-state layouts differ in what a "row" is: `[node][feature]` over
+/// all `p` features here, `[block][node][feature]` over one block's features in
+/// [`crate::model::blocked::BlockedState`]. Both are a slab of equal-length
+/// rows indexed by node, so the dispatch between the binary and polytomy
+/// kernels is the same code for both, and is written once here rather than
+/// twice. The traversal order, the parallel axis and the order the per-node
+/// contributions are summed in stay each module's own business, which is what
+/// makes the two independent enough to cross-check.
+///
+/// ### Params
+///
+/// * `tree` - Tree whose topology and branch lengths to use
+/// * `node` - Internal node to settle
+/// * `len` - Row stride, that is, features per node in this slab
+/// * `m` - Effective means slab, `node`'s row written in place
+/// * `w` - Effective precisions slab, same
+/// * `scratch` - Polytomy scratch, grown on demand and reused across calls
+///
+/// ### Returns
+///
+/// The node's loglikelihood contribution.
+pub(crate) fn prune_node_into<T: BonsaiFloat>(
+    tree: &Tree,
+    node: u32,
+    len: usize,
+    m: &mut [T],
+    w: &mut [T],
+    scratch: &mut Vec<f64>,
+) -> f64 {
+    let split = node as usize * len;
+    let (m_lo, m_hi) = m.split_at_mut(split);
+    let (w_lo, w_hi) = w.split_at_mut(split);
+    let m_out = &mut m_hi[..len];
+    let w_out = &mut w_hi[..len];
+
+    let kids = tree.children(node);
+    match kids.len() {
+        2 => {
+            let (k, l) = (kids[0] as usize, kids[1] as usize);
+            prune_binary(
+                &m_lo[k * len..k * len + len],
+                &w_lo[k * len..k * len + len],
+                tree.branch(kids[0]),
+                &m_lo[l * len..l * len + len],
+                &w_lo[l * len..l * len + len],
+                tree.branch(kids[1]),
+                m_out,
+                w_out,
+            )
+        }
+        n_child => {
+            if scratch.len() < len * n_child {
+                scratch.resize(len * n_child, 0.0);
             }
-            n_child => {
-                if self.scratch.len() < p * n_child {
-                    self.scratch.resize(p * n_child, 0.0);
-                }
-                let children: Vec<(&[T], &[T], f64)> = kids
-                    .iter()
-                    .map(|&c| {
-                        let lo = c as usize * p;
-                        (&m_lo[lo..lo + p], &w_lo[lo..lo + p], tree.branch(c))
-                    })
-                    .collect();
-                prune_general(&children, m_out, w_out, &mut self.scratch[..p * n_child])
-            }
+            let children: Vec<(&[T], &[T], f64)> = kids
+                .iter()
+                .map(|&c| {
+                    let lo = c as usize * len;
+                    (&m_lo[lo..lo + len], &w_lo[lo..lo + len], tree.branch(c))
+                })
+                .collect();
+            prune_general(&children, m_out, w_out, &mut scratch[..len * n_child])
         }
     }
 }
@@ -218,26 +248,33 @@ impl<T: BonsaiFloat> NodeState<T> {
 ///////////
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tree::{NO_NODE, Tree};
+    use crate::utils::rng::SplitMix64;
     use approx::assert_relative_eq;
 
     /// Deterministic pseudo-random leaf data, so tests do not need an rng
     /// dependency and always describe the same scenario.
-    fn leaf_data(n_leaves: usize, p: usize) -> (Vec<f64>, Vec<f64>) {
+    ///
+    /// Shared with `blocked`, whose tests cross-check against this module and
+    /// so must see byte-identical input.
+    ///
+    /// ### Params
+    ///
+    /// * `n_leaves` - Number of leaves
+    /// * `p` - Number of features
+    ///
+    /// ### Returns
+    ///
+    /// Row-major means and precisions, `[leaf][feature]`.
+    pub(crate) fn leaf_data(n_leaves: usize, p: usize) -> (Vec<f64>, Vec<f64>) {
+        let mut rng = SplitMix64::new(0x2545_F491_4F6C_DD1D);
         let mut m = Vec::with_capacity(n_leaves * p);
         let mut w = Vec::with_capacity(n_leaves * p);
-        let mut s = 0x2545_F491_4F6C_DD1Du64;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / (1u64 << 53) as f64
-        };
         for _ in 0..n_leaves * p {
-            m.push(next() * 4.0 - 2.0);
-            w.push(0.25 + next() * 3.0);
+            m.push(rng.uniform() * 4.0 - 2.0);
+            w.push(0.25 + rng.uniform() * 3.0);
         }
         (m, w)
     }
@@ -271,7 +308,7 @@ mod tests {
 
         // Exactly filling the arena is legal, as is leaving room for the
         // internal rows the sweep will write.
-        assert!(NodeState::new(3, p, &vec![1.0f64; 24], &vec![1.0f64; 24]).is_ok());
+        assert!(NodeState::new(3, p, &[1.0f64; 24], &[1.0f64; 24]).is_ok());
         assert!(NodeState::new(9, p, &vec![1.0f64; 40], &vec![1.0f64; 40]).is_ok());
     }
 

@@ -239,6 +239,15 @@ impl MergeScratch {
     /// `a = 1 / (t + c)` the chain rule needs only `da/dt = -a^2`, so both
     /// partials fall out of the same pass that evaluates the score.
     ///
+    /// Neither partial has a production consumer today: the split is solved by
+    /// [`MergeScratch::split_derivative`] and `t_ar` by the edge solve, so
+    /// [`score_merge`] and [`gain_at`] both call this for the gain alone. They
+    /// are kept because they are what pins the two gradient copies against
+    /// central differences, and they are nearly free: this runs once per
+    /// candidate pair, against the tens of `split_derivative` calls the
+    /// bisection makes. `d_dtar` is also what SPEC.md section 10's upper-bound
+    /// machinery will want when it is written.
+    ///
     /// ### Params
     ///
     /// * `total` - The total `k`-to-`l` branch length, held fixed
@@ -497,22 +506,6 @@ pub fn gain_at(total: f64, u: f64, t_ar: f64, scratch: &MergeScratch) -> f64 {
     scratch.gain_and_gradient(total, u, t_ar).0
 }
 
-/// Whether the edge-level stationarity condition is satisfied, for tests.
-///
-/// ### Params
-///
-/// * `s` - Summed inverse precisions
-/// * `d` - Squared separations
-/// * `t` - Branch length
-///
-/// ### Returns
-///
-/// The stationarity residual.
-#[cfg(test)]
-fn edge_residual(s: &[f64], d: &[f64], t: f64) -> f64 {
-    crate::utils::kernels::edge_newton(s, d, t).0
-}
-
 ///////////
 // Tests //
 ///////////
@@ -520,6 +513,7 @@ fn edge_residual(s: &[f64], d: &[f64], t: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::kernels::edge_newton;
     use approx::assert_relative_eq;
 
     /// Three effective leaves with `k` and `l` nearer to each other than either
@@ -586,6 +580,19 @@ mod tests {
 
         assert_relative_eq!(d_du, fd_u, max_relative = 1e-6);
         assert_relative_eq!(d_dtar, fd_tar, max_relative = 1e-6);
+
+        // `split_derivative` is the copy the bracketed solve actually runs, and
+        // it is the one the central differences above do not touch. It is
+        // documented as the same arithmetic with the logarithms dropped, so it
+        // must agree to the bit, not merely to a tolerance.
+        for &(u, t_ar) in [(0.3 * total, 0.7), (0.05 * total, 0.01), (0.95 * total, 5.0)].iter()
+        {
+            assert_eq!(
+                scratch.split_derivative(total, u, t_ar),
+                scratch.gain_and_gradient(total, u, t_ar).1,
+                "the two gradient copies disagree at u = {u}, t_ar = {t_ar}"
+            );
+        }
     }
 
     #[test]
@@ -619,9 +626,9 @@ mod tests {
         let total = score.t_ak + score.t_al;
         let p = scratch.c_k.len();
         let s: Vec<f64> = (0..p).map(|g| scratch.c_k[g] + scratch.c_l[g]).collect();
-        let scale = edge_residual(&s, &scratch.d_kl, 0.0).abs().max(1e-30);
+        let scale = edge_newton(&s, &scratch.d_kl, 0.0).0.abs().max(1e-30);
         assert!(
-            edge_residual(&s, &scratch.d_kl, total).abs() / scale < 1e-9,
+            edge_newton(&s, &scratch.d_kl, total).0.abs() / scale < 1e-9,
             "stage one did not solve the two-leaf problem"
         );
     }

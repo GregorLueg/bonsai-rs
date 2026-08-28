@@ -500,17 +500,63 @@ is never the best merge. So:
    children in Euclidean distance on the transformed means.
 2. Score only each node against its neighbours: `n*k` pairs, not `n^2`.
 3. A new ancestor **inherits the union** of its two children's neighbour lists.
-   Lists therefore grow over time, which is why they need periodic rebuilding.
 4. Rebuild the graph after a set number of new ancestors.
 
 They report `k` in the range 5 to 10 and a rebuild every `0.1*n` ancestors. **Our
 `k` and our cadence are ours to determine and to date.** Both are pure
 speed/accuracy knobs; neither changes the model.
 
+**Deviation: the union must be symmetric.** Rule 3 taken literally gives the
+ancestor its partners' lists but leaves no existing member pointing *at* the
+ancestor. A second ancestor then inherits lists that never mention the first, no
+pair of ancestors is ever offered as a candidate, and the star stalls several
+merges early. So the graph is symmetrised at rebuild and that symmetry is
+maintained on merge: both children are replaced by the ancestor everywhere they
+appear, not only in the ancestor's own list. Caught by the `k >= n - 1` equality
+gate of section 13.2, which is the test that exists for exactly this.
+
+**Correction, 2026-08-28.** An earlier draft of this section claimed lists grow
+under union inheritance and that this is why rule 4 exists. That was inference,
+not something the SI says, and measurement contradicts it: under the symmetric
+union the graph *thins*, because a merge removes two members' edges and adds back
+one deduplicated union. The widest round is always the first. Measured at
+`n = 128`, total pairs scored per star ran from 79 495 at cadence 1 down to
+59 957 with no rebuild at all, against 349 500 exhaustive. A rebuild therefore
+replenishes the candidate set rather than trimming it.
+
+Rule 4 is still worth following, but for the other reason: merging moves the
+points. An ancestor's effective mean is not either child's, so a graph built on
+the old positions goes stale as a description of the current geometry, and
+inheritance only propagates the old adjacency. Rebuilding re-derives the graph
+from where the members actually are. Recovery is flat in the cadence over the
+sizes tested, so this costs accuracy only at the extreme of never rebuilding.
+
 Approximation, honestly: the best pair in the whole dataset might not be in any
 neighbour list. The SI's argument is that with `n*k` candidates the probability
 of missing it is very close to one; that is an empirical claim, and the exactness
 test in section 13 is how we check it on our own fixtures.
+
+Measured on our own fixtures, 2026-08-28, 24 replicates at 128 leaves by 200
+features across three tree shapes, Robinson-Foulds to the generating tree out of
+125 splits, exhaustive baseline 3.67:
+
+| `k` | mean RF | excess over exhaustive | replicates identical to exhaustive |
+|---|---|---|---|
+| 4 | 7.62 | +3.96 | 0/24 |
+| 6 | 4.25 | +0.58 | 5/24 |
+| 8 | 4.08 | +0.42 | 12/24 |
+| 12 | 3.67 | 0 | 21/24 |
+| 16 | 3.67 | 0 | 24/24 |
+
+The knee sits in the same place at 64 and 256 leaves, so the required `k` does
+not appear to scale with `n` over the range that can be checked against an
+exhaustive baseline. Their 5 to 10 is not free but is not far off: `k = 8` costs
+0.42 splits of 125 and reproduces the exhaustive topology in half the replicates.
+This crate ships 16, where both measures stop moving.
+
+Note what that table cannot say. An exhaustive baseline costs `O(n^3 p)`, so
+nothing above a few hundred members is checkable this way, and the claim that
+`k = 16` remains sufficient at `10^4` upwards is extrapolation from three sizes.
 
 ## 12. Units and conventions
 

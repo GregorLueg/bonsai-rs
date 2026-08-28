@@ -19,8 +19,8 @@
 //!
 //! Candidate pairs come from a [`CandidatePairs`] provider, and the only one
 //! here is [`AllPairs`]. The `k`-nearest-neighbour restriction of SPEC.md
-//! section 11 and the upper-bound machinery of section 10 both fit behind that
-//! trait and are separate work.
+//! section 11 lives in [`crate::search::candidates`]; the upper-bound machinery
+//! of section 10 fits behind the same trait and is separate work.
 
 use crate::errors::BonsaiErrors;
 use crate::model::merge::{EffLeaf, MergeParams, MergeScratch, score_merge};
@@ -87,6 +87,35 @@ impl Default for StarParams {
 // Candidate pairs //
 /////////////////////
 
+/// One round's read-only view of the star, as a candidate provider sees it.
+///
+/// Both slabs are indexed by *node id*, not by position in `members`, and are
+/// row-major with stride `n_features`. They cover every node created so far,
+/// members and swallowed children alike, which is what lets a provider hold
+/// state keyed by node id across rounds. Precisions are not diffusion
+/// corrected; the branch to the centre is not part of this view, because
+/// nothing that chooses *which* pairs to consider needs it.
+#[derive(Clone, Copy, Debug)]
+pub struct Round<'a, T> {
+    /// Node ids of the current star members, ascending.
+    pub members: &'a [u32],
+    /// Effective means of every node created so far, row-major `[node][g]`.
+    pub means: &'a [T],
+    /// Effective precisions, same layout.
+    pub precisions: &'a [T],
+    /// Row stride of both slabs, that is, the number of features.
+    pub n_features: usize,
+    /// Gain of the merge accepted in the previous round, or negative infinity
+    /// in the first round.
+    ///
+    /// Every round accepts the best pair it scored, so this is also the largest
+    /// gain seen so far in the round before this one. It is the incumbent the
+    /// upper bounds of SPEC.md section 10 prune against, and it is deliberately
+    /// *not* a sound bound on this round's best: the root moves between rounds
+    /// and a later merge can beat an earlier one.
+    pub best_gain: f64,
+}
+
 /// Source of the candidate pairs a round of the scan considers.
 ///
 /// The seam for SPEC.md sections 10 and 11. Scoring every pair is `O(n^2 p)`
@@ -94,17 +123,43 @@ impl Default for StarParams {
 /// whose upper bound still beats the incumbent replaces this implementation
 /// without the primitive changing.
 ///
-/// Implementations are called once per round with the current membership, so
-/// they can keep state between rounds and see exactly which members went away.
-pub trait CandidatePairs {
+/// Providers are called once per round and notified after every merge, so they
+/// can maintain state incrementally rather than rediscovering what changed.
+/// Both halves are `&mut self` and the primitive calls them from one thread, in
+/// round order, so a provider needs no interior mutability and no locking.
+pub trait CandidatePairs<T: BonsaiFloat> {
     /// Fill `out` with the pairs to score this round.
     ///
     /// ### Params
     ///
-    /// * `members` - Node ids of the current star members, ascending
+    /// * `round` - Read-only view of the current round
     /// * `out` - Destination, cleared by the caller, holding positions into
-    ///   `members` with the smaller position first
-    fn candidates(&mut self, members: &[u32], out: &mut Vec<(usize, usize)>);
+    ///   `round.members` with the smaller position first
+    ///
+    /// ### Returns
+    ///
+    /// Nothing, or the error the provider failed with. An empty `out` stops the
+    /// primitive, so a provider with nothing left to offer just returns.
+    fn candidates(
+        &mut self,
+        round: Round<'_, T>,
+        out: &mut Vec<(usize, usize)>,
+    ) -> Result<(), BonsaiErrors>;
+
+    /// Notification that a merge has been accepted.
+    ///
+    /// Called after the ancestor has been summarised as an effective leaf and
+    /// put back into the star, so `ancestor` is exactly what later rounds will
+    /// score against. The default does nothing, which is right for any provider
+    /// that keeps no state between rounds.
+    ///
+    /// ### Params
+    ///
+    /// * `merge` - The merge that was performed
+    /// * `ancestor` - The new ancestor's row of the means and precisions slabs
+    fn merged(&mut self, merge: &StarMerge, ancestor: EffLeaf<'_, T>) {
+        let _ = (merge, ancestor);
+    }
 }
 
 /// Every pair of the current members.
@@ -113,19 +168,29 @@ pub trait CandidatePairs {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllPairs;
 
-impl CandidatePairs for AllPairs {
+impl<T: BonsaiFloat> CandidatePairs<T> for AllPairs {
     /// All `n * (n - 1) / 2` pairs, in ascending lexicographic order.
     ///
     /// ### Params
     ///
-    /// * `members` - Node ids of the current star members
+    /// * `round` - Read-only view of the current round
     /// * `out` - Destination for the pairs
-    fn candidates(&mut self, members: &[u32], out: &mut Vec<(usize, usize)>) {
-        for i in 0..members.len() {
-            for j in (i + 1)..members.len() {
+    ///
+    /// ### Returns
+    ///
+    /// Nothing; the exhaustive enumeration cannot fail.
+    fn candidates(
+        &mut self,
+        round: Round<'_, T>,
+        out: &mut Vec<(usize, usize)>,
+    ) -> Result<(), BonsaiErrors> {
+        let n = round.members.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
                 out.push((i, j));
             }
         }
+        Ok(())
     }
 }
 
@@ -516,7 +581,7 @@ pub fn resolve_star<T: BonsaiFloat>(
 ///
 /// The topology that was built, or `MalformedTree` if the star is
 /// ill-described, or the error the branch-length solve failed with.
-pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs>(
+pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
     star: Star<'_, T>,
     params: Option<StarParams>,
     candidates: &mut C,
@@ -594,12 +659,22 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs>(
     let mut mc = vec![0.0f64; p];
     let mut wc = vec![0.0f64; p];
     let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut best_gain = f64::NEG_INFINITY;
 
     while members.len() > MIN_CENTRE_MEMBERS {
         centre_leaf(&m, &w, &branch, &members, p, &mut mc, &mut wc);
 
         pairs.clear();
-        candidates.candidates(&members, &mut pairs);
+        candidates.candidates(
+            Round {
+                members: &members,
+                means: &m,
+                precisions: &w,
+                n_features: p,
+                best_gain,
+            },
+            &mut pairs,
+        )?;
         if pairs.is_empty() {
             break;
         }
@@ -635,7 +710,7 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs>(
         members.retain(|&x| x != best.left && x != best.right);
         members.push(ancestor);
 
-        merges.push(StarMerge {
+        let merge = StarMerge {
             left: best.left,
             right: best.right,
             ancestor,
@@ -643,7 +718,17 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs>(
             t_right: best.t_al,
             t_centre: best.t_ar,
             gain: best.gain,
-        });
+        };
+        let base = ancestor as usize * p;
+        candidates.merged(
+            &merge,
+            EffLeaf {
+                m: &m[base..base + p],
+                w: &w[base..base + p],
+            },
+        );
+        best_gain = best.gain;
+        merges.push(merge);
     }
 
     let ancestor_means = m.split_off(n * p);
@@ -1112,7 +1197,18 @@ mod tests {
             let mut wc = vec![0.0f64; p];
             centre_leaf(&m, &w, &branch, &members, p, &mut mc, &mut wc);
             let mut pairs = Vec::new();
-            AllPairs.candidates(&members, &mut pairs);
+            AllPairs
+                .candidates(
+                    Round {
+                        members: &members,
+                        means: &m,
+                        precisions: &w,
+                        n_features: p,
+                        best_gain: f64::NEG_INFINITY,
+                    },
+                    &mut pairs,
+                )
+                .expect("candidates");
             let work = Working {
                 m: &m,
                 w: &w,
@@ -1302,15 +1398,24 @@ mod tests {
         /// for the `k`-nearest-neighbour restriction of SPEC.md section 11.
         struct Consecutive;
 
-        impl CandidatePairs for Consecutive {
+        impl CandidatePairs<f64> for Consecutive {
             /// ### Params
             ///
-            /// * `members` - Current star members
+            /// * `round` - Current round
             /// * `out` - Destination for the pairs
-            fn candidates(&mut self, members: &[u32], out: &mut Vec<(usize, usize)>) {
-                for i in 0..members.len().saturating_sub(1) {
+            ///
+            /// ### Returns
+            ///
+            /// Nothing.
+            fn candidates(
+                &mut self,
+                round: Round<'_, f64>,
+                out: &mut Vec<(usize, usize)>,
+            ) -> Result<(), BonsaiErrors> {
+                for i in 0..round.members.len().saturating_sub(1) {
                     out.push((i, i + 1));
                 }
+                Ok(())
             }
         }
 

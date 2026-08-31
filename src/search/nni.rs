@@ -278,48 +278,6 @@ pub fn interchange_at<T: BonsaiFloat>(
 // Topology comparison //
 ////////////////////////
 
-/// Order-independent fingerprint of a tree's splits.
-///
-/// Each leaf carries a fixed pseudo-random word and a node carries the sum of
-/// its leaves', canonicalised against its complement so that the key does not
-/// depend on where the root sits. Two trees share a fingerprint exactly when
-/// they induce the same splits, up to a 64-bit collision over a few thousand
-/// node words, which sits far below the noise in anything else here.
-///
-/// `O(n log n)`, against the `O(n^2)` of comparing leaf sets, which matters
-/// because the greedy phase computes one per candidate edge per round.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-///
-/// ### Returns
-///
-/// The sorted split words.
-fn topology_key(tree: &Tree) -> Vec<u64> {
-    let mut word = vec![0u64; tree.n_nodes()];
-    for leaf in 0..tree.n_leaves() {
-        word[leaf] = SplitMix64::new(leaf as u64).next_u64();
-    }
-    for node in tree.internal_postorder() {
-        word[node as usize] = tree
-            .children(node)
-            .iter()
-            .fold(0u64, |acc, &child| acc.wrapping_add(word[child as usize]));
-    }
-    let total = word[tree.root() as usize];
-    let mut key: Vec<u64> = tree
-        .internal_postorder()
-        .filter(|&node| tree.parent(node).is_some())
-        .map(|node| {
-            let here = word[node as usize];
-            here.min(total.wrapping_sub(here))
-        })
-        .collect();
-    key.sort_unstable();
-    key
-}
-
 /////////////
 // Phases //
 /////////////
@@ -473,7 +431,7 @@ pub fn nni_greedy<T: BonsaiFloat>(
         rounds += 1;
         let (down, up, _) = settle(&tree, leaves)?;
 
-        let here = topology_key(&tree);
+        let here = crate::search::split_fingerprint(&tree);
         let mut winner: Option<(f64, Tree)> = None;
         for k in tree.internal_postorder() {
             let Some(spliced) = interchange_at(&tree, &down, &up, k, Some(params.star))? else {
@@ -489,7 +447,7 @@ pub fn nni_greedy<T: BonsaiFloat>(
             // with the Robinson-Foulds distance pinned at zero throughout, so
             // every one of those rounds was branch lengths and none was
             // topology.
-            if spliced.n_merges == 0 || topology_key(&spliced.tree) == here {
+            if spliced.n_merges == 0 || crate::search::split_fingerprint(&spliced.tree) == here {
                 continue;
             }
             let loglik = tree_loglik(&spliced.tree, leaves)?;

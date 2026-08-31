@@ -439,6 +439,7 @@ impl<T: BonsaiFloat> CandidatePairs<T> for KnnCandidates {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::merge::MergeParams;
     use crate::search::star::{Star, StarResult, resolve_star, resolve_star_with};
     use crate::utils::rng::SplitMix64;
 
@@ -497,6 +498,10 @@ mod tests {
         p: usize,
     ) -> Vec<(usize, usize)> {
         let members: Vec<u32> = (0..(m.len() / p) as u32).collect();
+        // The restricted provider reads means alone, so the rest of the view
+        // is only there to satisfy the type.
+        let branch = vec![0.0f64; members.len()];
+        let (mc, wc) = (vec![0.0f64; p], vec![1.0f64; p]);
         let mut pairs = Vec::new();
         provider
             .candidates(
@@ -505,7 +510,12 @@ mod tests {
                     means: m,
                     precisions: w,
                     n_features: p,
+                    branch: &branch,
+                    centre_means: &mc,
+                    centre_precisions: &wc,
+                    merge: MergeParams::default(),
                     best_gain: f64::NEG_INFINITY,
+                    scored_last_round: 0,
                 },
                 &mut pairs,
             )
@@ -771,6 +781,8 @@ mod tests {
 
         let wide_pairs = first_round(&mut KnnCandidates::new(Some(params)), &m, &w, p);
 
+        let branch = vec![0.0f64; n];
+        let (mc, wc) = (vec![0.0f64; p], vec![1.0f64; p]);
         let m32: Vec<f32> = m.iter().map(|&x| x as f32).collect();
         let w32: Vec<f32> = w.iter().map(|&x| x as f32).collect();
         let mut narrow_provider = KnnCandidates::new(Some(params));
@@ -782,7 +794,12 @@ mod tests {
                     means: &m32,
                     precisions: &w32,
                     n_features: p,
+                    branch: &branch,
+                    centre_means: &mc,
+                    centre_precisions: &wc,
+                    merge: MergeParams::default(),
                     best_gain: f64::NEG_INFINITY,
+                    scored_last_round: 0,
                 },
                 &mut narrow_pairs,
             )

@@ -1,5 +1,8 @@
 //! The tree search of SPEC.md section 9.
 
+use crate::tree::Tree;
+use crate::utils::rng::SplitMix64;
+
 pub mod bounds;
 pub mod candidates;
 pub mod nni;
@@ -22,4 +25,172 @@ pub struct Leaves<'a, T> {
     pub precisions: &'a [T],
     /// Number of features.
     pub n_features: usize,
+}
+
+////////////////////////
+// Split fingerprints //
+////////////////////////
+
+/// Order-independent fingerprint of a tree's unrooted splits.
+///
+/// Every leaf gets a fixed pseudo-random word; an internal node's word is the
+/// sum of its subtree's. A split is then canonicalised by taking the smaller of
+/// the word and its complement, so the fingerprint does not depend on which
+/// node is the root, on sibling order, or on internal node numbering.
+///
+/// Used by both NNI and SPR to reject a proposal that changes no split. That
+/// filter is load-bearing rather than cosmetic: without it, collapsing and
+/// re-resolving a star reports a gain from reoptimising branch lengths while
+/// leaving the topology alone, and the greedy phase does branch-length descent
+/// forever. See the deviation note on SPEC.md section 9.4.
+///
+/// **The `dedup` is not tidying.** A degree-two root's two children describe the
+/// same split, so the raw key carries it twice and two representations of one
+/// unrooted tree compare unequal. Removing it is what makes the fingerprint
+/// blind to rerooting, which is what the filter needs it to be.
+///
+/// ### Params
+///
+/// * `tree` - Tree to fingerprint
+///
+/// ### Returns
+///
+/// The sorted, deduplicated split words.
+pub(crate) fn split_fingerprint(tree: &Tree) -> Vec<u64> {
+    let word = leaf_words(tree);
+    let total = word[tree.root() as usize];
+
+    // Leaf counts, to drop the splits that carry no information.
+    let mut below = vec![0usize; tree.n_nodes()];
+    for leaf in 0..tree.n_leaves() {
+        below[leaf] = 1;
+    }
+    for node in tree.internal_postorder() {
+        below[node as usize] = tree.children(node).iter().map(|&c| below[c as usize]).sum();
+    }
+    let n_leaves = tree.n_leaves();
+
+    let mut key: Vec<u64> = tree
+        .internal_postorder()
+        .filter(|&node| tree.parent(node).is_some())
+        .filter(|&node| {
+            // A split with fewer than two leaves on a side is trivial: every
+            // tree over the same leaves has it, so it distinguishes nothing.
+            // Excluding it is what makes the fingerprint survive rooting on a
+            // leaf's own branch, which puts the old root one step above a tip
+            // and makes it describe exactly such a split.
+            let here = below[node as usize];
+            here >= 2 && n_leaves - here >= 2
+        })
+        .map(|node| {
+            let here = word[node as usize];
+            here.min(total.wrapping_sub(here))
+        })
+        .collect();
+    key.sort_unstable();
+    key.dedup();
+    key
+}
+
+/// Per-node word summarising which leaves sit below it.
+///
+/// Each leaf gets a fixed pseudo-random word and an internal node gets the sum
+/// of its subtree's, so the value identifies a *set of leaves* rather than a
+/// node index. That is what makes it survive the renumbering `Tree::from_parents`
+/// performs: SPR uses it to name a subtree across a rebuild, and
+/// [`split_fingerprint`] to name a split.
+///
+/// Summation means two different leaf sets can collide, at roughly `2^-64` per
+/// comparison. Fine for both callers, neither of which is deciding correctness
+/// on the result alone.
+///
+/// ### Params
+///
+/// * `tree` - Tree to summarise
+///
+/// ### Returns
+///
+/// One word per node, indexed by node id.
+pub(crate) fn leaf_words(tree: &Tree) -> Vec<u64> {
+    let mut word = vec![0u64; tree.n_nodes()];
+    for leaf in 0..tree.n_leaves() {
+        word[leaf] = SplitMix64::new(leaf as u64).next_u64();
+    }
+    for node in tree.internal_postorder() {
+        word[node as usize] = tree
+            .children(node)
+            .iter()
+            .fold(0u64, |acc, &child| acc.wrapping_add(word[child as usize]));
+    }
+    word
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::cluster::reroot;
+
+    /// Regression, 2026-08-31. NNI and SPR independently grew the same split
+    /// fingerprint, but only SPR's deduplicated. A degree-two root's two
+    /// children describe one split, so the raw key carries it twice and the
+    /// same unrooted tree compares unequal to itself under a different root.
+    /// NNI's move filter would then accept a proposal that changed nothing but
+    /// where the root sat, which is the branch-length descent the filter exists
+    /// to stop.
+    #[test]
+    fn test_the_fingerprint_is_blind_to_where_the_tree_is_rooted() {
+        let tree = Tree::balanced_binary(16, 0.7).expect("balanced fixture");
+        let want = split_fingerprint(&tree);
+
+        // Every internal edge is a legal place to put the root, and none of
+        // them may change the fingerprint.
+        let mut checked = 0usize;
+        for edge in 0..tree.n_nodes() as u32 {
+            if tree.parent(edge).is_none() {
+                continue;
+            }
+            let rerooted = reroot(&tree, edge).expect("reroot");
+            assert_eq!(
+                split_fingerprint(&rerooted),
+                want,
+                "rooting on the branch above node {edge} changed the fingerprint"
+            );
+            checked += 1;
+        }
+        assert!(checked > 20, "only {checked} edges exercised");
+    }
+
+    #[test]
+    fn test_the_fingerprint_separates_genuinely_different_topologies() {
+        // The other half: a filter that never fires is as useless as one that
+        // always does.
+        let balanced = Tree::balanced_binary(16, 0.7).expect("balanced fixture");
+        let ladder = Tree::ladder(16, 0.7).expect("ladder fixture");
+        assert_ne!(split_fingerprint(&balanced), split_fingerprint(&ladder));
+    }
+
+    #[test]
+    fn test_leaf_words_name_a_leaf_set_not_a_node() {
+        // The property SPR relies on: the word identifies the set of leaves
+        // below a node, so it survives the renumbering a rebuild performs.
+        let tree = Tree::balanced_binary(8, 1.0).expect("balanced fixture");
+        let word = leaf_words(&tree);
+        for node in tree.internal_postorder() {
+            let summed: u64 = tree
+                .children(node)
+                .iter()
+                .fold(0u64, |acc, &c| acc.wrapping_add(word[c as usize]));
+            assert_eq!(word[node as usize], summed);
+        }
+        // Distinct leaves get distinct words, so no two leaves alias.
+        let mut leaves: Vec<u64> = (0..tree.n_leaves()).map(|l| word[l]).collect();
+        leaves.sort_unstable();
+        let before = leaves.len();
+        leaves.dedup();
+        assert_eq!(leaves.len(), before);
+    }
 }

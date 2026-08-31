@@ -19,11 +19,15 @@
 //!
 //! Candidate pairs come from a [`CandidatePairs`] provider, and the only one
 //! here is [`AllPairs`]. The `k`-nearest-neighbour restriction of SPEC.md
-//! section 11 lives in [`crate::search::candidates`]; the upper-bound machinery
-//! of section 10 fits behind the same trait and is separate work.
+//! section 11 lives in [`crate::search::candidates`] and the upper-bound
+//! machinery of section 10 in [`crate::search::bounds`], which wraps either of
+//! the other two. What this module contributes to section 10 is the two seams
+//! it needs: [`Round`] carries enough of the star for a provider to score a
+//! pair itself, and [`CandidatePairs::bounds`] lets one say the pairs are
+//! ordered, at which point the scan walks them and stops early.
 
 use crate::errors::BonsaiErrors;
-use crate::model::merge::{EffLeaf, MergeParams, MergeScratch, score_merge};
+use crate::model::merge::{EffLeaf, MergeParams, MergeScore, MergeScratch, score_merge};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
@@ -56,6 +60,43 @@ const MIN_CENTRE_MEMBERS: usize = 3;
 /// sitting far below any gain that carries information: a real merge gain is
 /// `O(p)` nats. See `test_the_default_min_gain_clears_the_zero_gain_floor`.
 const DEFAULT_MIN_GAIN: f64 = 1e-9;
+
+/// How many bound-ordered pairs [`walk_bounded`] scores before it rechecks the
+/// stopping rule.
+///
+/// The walk is inherently sequential and the scan inside it is not, so this
+/// trades parallelism against overshoot: a chunk of one is the tightest
+/// possible stop and runs on one thread, a chunk of everything is the full
+/// parallel scan and stops nowhere. Measured 2026-08-31 on an M1 Max at 128
+/// members by 200 features, four seeds, exhaustive candidates under
+/// [`crate::search::bounds::EllipsoidBounds`] at `nsteps = 48`. Pairs scored is
+/// the whole star's, against 349,500 for the unbounded scan; seconds are the
+/// whole star on the default thread pool.
+///
+/// | chunk | pairs scored | seconds |
+/// |---|---|---|
+/// | 4 | 34,726 | 0.366 |
+/// | 16 | 35,536 | 0.270 |
+/// | 64 | 38,837 | 0.270 |
+/// | 256 | 54,666 | 0.350 |
+///
+/// `16` is the knee: it costs the same wall time as `64` and scores nine per
+/// cent fewer pairs, while `4` is too small to fill the pool and pays a third
+/// more time for two per cent fewer pairs. This does not change the answer at
+/// any value: the stopping rule is only ever checked at a chunk boundary, so a
+/// larger chunk scores a superset of what a smaller one scores.
+///
+/// Public because it is the granularity of the only signal the online
+/// ellipsoid sizing of SPEC.md section 10.5 has: a round offering fewer pairs
+/// than this always walks all of them, and reads as "the bounds pruned
+/// nothing" when it means "there was nothing to prune".
+pub const BOUND_WALK_CHUNK: usize = 16;
+
+/// Rounds between exact recomputations of the centre's effective leaf when
+/// [`StarParams::incremental_centre`] is on.
+///
+/// See that field for the drift measurement that fixes it.
+const CENTRE_EXACT_EVERY: usize = 32;
 
 /// How the primitive picks the pair to merge in a round.
 ///
@@ -117,6 +158,40 @@ pub struct StarParams {
     pub selection: StarSelection,
     /// Branch-length solve knobs handed to [`score_merge`].
     pub merge: MergeParams,
+    /// Update the centre's effective leaf by removing the merged pair and
+    /// adding the ancestor, rather than re-accumulating it over every member.
+    ///
+    /// The exact recompute is `O(n p)` a round and so `O(n^2 p)` over a star.
+    /// That is a factor of `k` below the restricted scan of SPEC.md section 11
+    /// and invisible next to it, but once the upper bounds of section 10 cut
+    /// the scan to a handful of pairs a round it is the largest term left. The
+    /// incremental update is `O(p)`: it is the peel of section 8.1 followed by
+    /// the ancestor's own diffusion-corrected contribution, which is exactly
+    /// what changed.
+    ///
+    /// Off by default, and the question is drift. The update differences
+    /// quantities of similar magnitude, so it loses digits where the exact
+    /// recompute does not, and the error compounds across a whole star. An
+    /// exact recompute every `CENTRE_EXACT_EVERY` rounds caps that.
+    ///
+    /// **Measured 2026-08-31 and it is safe.** At 128 members by 200 features
+    /// over eight seeds, the worst relative deviation from the exact value at
+    /// any round of a star is `1.5e-14` in the precision and `2.4e-12` in the
+    /// mean with no recompute at all, and `3.2e-15` and `7.2e-13` with one
+    /// every thirty-two rounds. Both are orders below the `1e-16` per feature a
+    /// merge gain itself rounds to, and the trees come out identical on every
+    /// fixture in this crate. See
+    /// `test_the_incremental_centre_leaf_does_not_drift` for the table and
+    /// `crate::search::bounds`'s
+    /// `test_incremental_centre_matches_the_exact_recompute` for the trees.
+    ///
+    /// It is off by default anyway, and the reason is not the arithmetic. It is
+    /// that this is a silent numerical change to a path every search step
+    /// depends on, and a caller who is not paying the `O(n^2 p)` recompute back
+    /// in saved scan time gains nothing by taking it on. Turn it on with the
+    /// bounds of SPEC.md section 10, where the recompute is the largest term
+    /// left; leave it off without them.
+    pub incremental_centre: bool,
 }
 
 impl Default for StarParams {
@@ -130,6 +205,7 @@ impl Default for StarParams {
             min_gain: DEFAULT_MIN_GAIN,
             selection: StarSelection::Greedy,
             merge: MergeParams::default(),
+            incremental_centre: false,
         }
     }
 }
@@ -144,8 +220,14 @@ impl Default for StarParams {
 /// row-major with stride `n_features`. They cover every node created so far,
 /// members and swallowed children alike, which is what lets a provider hold
 /// state keyed by node id across rounds. Precisions are not diffusion
-/// corrected; the branch to the centre is not part of this view, because
-/// nothing that chooses *which* pairs to consider needs it.
+/// corrected; the correction of SPEC.md section 4 needs `branch`, which is
+/// carried separately.
+///
+/// A provider that only picks pairs by geometry, such as
+/// [`crate::search::candidates::KnnCandidates`], reads the first four fields
+/// and nothing else. The rest is what a provider that has to *score* pairs
+/// needs, which is the upper-bound machinery of SPEC.md section 10; see
+/// [`Round::score_pair`].
 #[derive(Clone, Copy, Debug)]
 pub struct Round<'a, T> {
     /// Node ids of the current star members, ascending.
@@ -156,15 +238,70 @@ pub struct Round<'a, T> {
     pub precisions: &'a [T],
     /// Row stride of both slabs, that is, the number of features.
     pub n_features: usize,
+    /// Branch length from each node to its ancestor, or to the centre, indexed
+    /// by node id.
+    pub branch: &'a [f64],
+    /// The centre's own effective means over the current members, length
+    /// `n_features`. This is `M[g,r]` of SPEC.md section 8.1.
+    pub centre_means: &'a [f64],
+    /// The centre's own effective precisions, `W[g,r]`, same length.
+    pub centre_precisions: &'a [f64],
+    /// Branch-length solve knobs the scan will use.
+    ///
+    /// A provider that scores pairs itself must pass these through, or its
+    /// scores will not agree with the scan's to the last bit.
+    pub merge: MergeParams,
     /// Gain of the merge accepted in the previous round, or negative infinity
     /// in the first round.
     ///
     /// Every round accepts the best pair it scored, so this is also the largest
-    /// gain seen so far in the round before this one. It is the incumbent the
-    /// upper bounds of SPEC.md section 10 prune against, and it is deliberately
-    /// *not* a sound bound on this round's best: the root moves between rounds
-    /// and a later merge can beat an earlier one.
+    /// gain seen so far in the round before this one. It is deliberately *not*
+    /// a sound bound on this round's best: the root moves between rounds and a
+    /// later merge can beat an earlier one.
     pub best_gain: f64,
+    /// How many pairs the previous round's scan actually scored, or zero in the
+    /// first round.
+    ///
+    /// The signal the online ellipsoid sizing of SPEC.md section 10.5 reads:
+    /// deep means the bounds were too loose.
+    pub scored_last_round: usize,
+}
+
+impl<'a, T: BonsaiFloat> Round<'a, T> {
+    /// Score one candidate pair exactly as the scan will.
+    ///
+    /// For a provider that has to know a pair's true gain, which is the
+    /// upper-bound machinery of SPEC.md section 10 and nothing else. The peel
+    /// of section 8.1 is left in `scratch`, because a caller computing
+    /// derivatives with respect to the centre needs the remainder it was taken
+    /// against.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Position of the first member of the pair in `members`
+    /// * `j` - Position of the second
+    /// * `scratch` - Reusable buffers, sized to `n_features`
+    ///
+    /// ### Returns
+    ///
+    /// The gain and the three optimised branch lengths, or the error the
+    /// branch-length solve failed with.
+    pub fn score_pair(
+        &self,
+        i: usize,
+        j: usize,
+        scratch: &mut PairScratch<T>,
+    ) -> Result<MergeScore, BonsaiErrors> {
+        let work = Working {
+            m: self.means,
+            w: self.precisions,
+            branch: self.branch,
+            mc: self.centre_means,
+            wc: self.centre_precisions,
+            p: self.n_features,
+        };
+        score_pair_raw(&work, self.members, i, j, self.merge, scratch)
+    }
 }
 
 /// Source of the candidate pairs a round of the scan considers.
@@ -210,6 +347,25 @@ pub trait CandidatePairs<T: BonsaiFloat> {
     /// * `ancestor` - The new ancestor's row of the means and precisions slabs
     fn merged(&mut self, merge: &StarMerge, ancestor: EffLeaf<'_, T>) {
         let _ = (merge, ancestor);
+    }
+
+    /// Upper bounds on the gains of the pairs the last [`CandidatePairs::candidates`]
+    /// call emitted, in that order.
+    ///
+    /// SPEC.md section 10.4. When this returns `Some`, the greedy scan walks
+    /// the pairs from the top and stops as soon as the best true gain it has
+    /// seen exceeds the next pair's bound: every pair below that point has a
+    /// true gain no larger, so the winner is already known. The slice must be
+    /// the same length as `out` was left, and **must be non-increasing**, or
+    /// the walk stops early on a pair that was not the best.
+    ///
+    /// `None`, the default, scores every emitted pair.
+    ///
+    /// ### Returns
+    ///
+    /// The bounds, or `None` for a provider that does not maintain them.
+    fn bounds(&self) -> Option<&[f64]> {
+        None
     }
 }
 
@@ -400,12 +556,10 @@ struct Working<'a, T> {
 /// reason as in [`crate::utils::kernels::prune_general`]: every partial value
 /// stays inside the convex hull of the member means.
 ///
-/// Recomputed from scratch once per round rather than updated in place, which
-/// makes the primitive `O(n^2 p)` overall in the recompute alone. That is the
-/// same order as the exhaustive pair scan it sits inside, so it costs nothing
-/// today; once candidate restriction cuts the scan to `O(n k p)` this becomes
-/// the dominant term and wants an incremental update, at the cost of drift
-/// accumulating over the whole run.
+/// `O(n p)` a round, so `O(n^2 p)` over a star. That is below the pair scan it
+/// sits inside until the upper bounds of SPEC.md section 10 cut the scan to a
+/// handful of pairs, at which point it is the largest term left; see
+/// [`update_centre_leaf`] and [`StarParams::incremental_centre`].
 ///
 /// ### Params
 ///
@@ -436,6 +590,61 @@ fn centre_leaf<T: BonsaiFloat>(
             wc[g] += wd;
             mc[g] += (wide(m[base + g]) - mc[g]) * (wd / wc[g]);
         }
+    }
+}
+
+/// Move the centre's effective leaf across one merge, in `O(p)`.
+///
+/// A merge removes two members and adds one, so the centre's effective leaf
+/// changes by two subtractions and one addition rather than by an
+/// `O(n p)` re-accumulation. The subtractions are the peel of SPEC.md section
+/// 8.1 and lose digits for the same reason it does; the caller caps the drift
+/// with a periodic exact recompute. See [`StarParams::incremental_centre`].
+///
+/// The two children's branch lengths must still be the ones they had to the
+/// centre, so this is called *before* they are overwritten with the branches to
+/// their new ancestor.
+///
+/// ### Params
+///
+/// * `m` - Effective means of every node, row-major
+/// * `w` - Effective precisions of every node, row-major
+/// * `t_rk` - Branch the first child had to the centre
+/// * `t_rl` - Branch the second child had to the centre
+/// * `k` - Node id of the first child
+/// * `l` - Node id of the second child
+/// * `a` - Node id of the ancestor, already summarised into `m` and `w`
+/// * `t_ar` - Branch from the ancestor to the centre
+/// * `p` - Number of features
+/// * `mc` - The centre's effective means, updated in place
+/// * `wc` - The centre's effective precisions, updated in place
+#[allow(clippy::too_many_arguments)]
+fn update_centre_leaf<T: BonsaiFloat>(
+    m: &[T],
+    w: &[T],
+    t_rk: f64,
+    t_rl: f64,
+    k: usize,
+    l: usize,
+    a: usize,
+    t_ar: f64,
+    p: usize,
+    mc: &mut [f64],
+    wc: &mut [f64],
+) {
+    let (bk, bl, ba) = (k * p, l * p, a * p);
+    for g in 0..p {
+        let wk = wide(w[bk + g]);
+        let wl = wide(w[bl + g]);
+        let wa = wide(w[ba + g]);
+        let wdk = wk / (1.0 + t_rk * wk);
+        let wdl = wl / (1.0 + t_rl * wl);
+        let wda = wa / (1.0 + t_ar * wa);
+
+        let total =
+            wc[g] * mc[g] - wdk * wide(m[bk + g]) - wdl * wide(m[bl + g]) + wda * wide(m[ba + g]);
+        wc[g] += wda - wdk - wdl;
+        mc[g] = total / wc[g];
     }
 }
 
@@ -483,13 +692,16 @@ fn peel<T: BonsaiFloat>(work: &Working<'_, T>, i: usize, j: usize, m_r: &mut [T]
 /// One worker's reusable buffers for the pair scan.
 ///
 /// Allocated once per worker through `map_init` rather than once per pair.
-struct PairScratch<T> {
+/// Public because a candidate provider that scores pairs itself, which is the
+/// upper-bound machinery of SPEC.md section 10, wants the same amortisation and
+/// the same peel.
+pub struct PairScratch<T> {
     /// Branch-length solve scratch.
     merge: MergeScratch,
-    /// The remainder's means, from the peel.
-    m_r: Vec<T>,
-    /// The remainder's precisions, from the peel.
-    w_r: Vec<T>,
+    /// The remainder's means, from the peel of SPEC.md section 8.1.
+    pub m_r: Vec<T>,
+    /// The remainder's precisions, from the same peel.
+    pub w_r: Vec<T>,
 }
 
 impl<T: BonsaiFloat> PairScratch<T> {
@@ -502,13 +714,60 @@ impl<T: BonsaiFloat> PairScratch<T> {
     /// ### Returns
     ///
     /// The scratch.
-    fn new(p: usize) -> Self {
+    pub fn new(p: usize) -> Self {
         Self {
             merge: MergeScratch::new(p),
             m_r: vec![T::zero(); p],
             w_r: vec![T::zero(); p],
         }
     }
+}
+
+/// Peel a pair off the centre and score the merge.
+///
+/// ### Params
+///
+/// * `work` - The round's working set
+/// * `members` - Nodes currently attached to the centre
+/// * `a` - Position of the first member of the pair
+/// * `b` - Position of the second
+/// * `merge` - Branch-length solve knobs
+/// * `scratch` - Reusable buffers, left holding the peel
+///
+/// ### Returns
+///
+/// The gain and the three optimised branch lengths, or the error the
+/// branch-length solve failed with.
+fn score_pair_raw<T: BonsaiFloat>(
+    work: &Working<'_, T>,
+    members: &[u32],
+    a: usize,
+    b: usize,
+    merge: MergeParams,
+    scratch: &mut PairScratch<T>,
+) -> Result<MergeScore, BonsaiErrors> {
+    let p = work.p;
+    let (i, j) = (members[a] as usize, members[b] as usize);
+    peel(work, i, j, &mut scratch.m_r, &mut scratch.w_r);
+
+    score_merge(
+        EffLeaf {
+            m: &work.m[i * p..i * p + p],
+            w: &work.w[i * p..i * p + p],
+        },
+        EffLeaf {
+            m: &work.m[j * p..j * p + p],
+            w: &work.w[j * p..j * p + p],
+        },
+        EffLeaf {
+            m: &scratch.m_r,
+            w: &scratch.w_r,
+        },
+        work.branch[i],
+        work.branch[j],
+        Some(merge),
+        &mut scratch.merge,
+    )
 }
 
 /// Score one candidate pair.
@@ -538,28 +797,7 @@ fn score_pair<T: BonsaiFloat>(
     merge: MergeParams,
     scratch: &mut PairScratch<T>,
 ) -> Result<Candidate, BonsaiErrors> {
-    let p = work.p;
-    let (i, j) = (members[a] as usize, members[b] as usize);
-    peel(work, i, j, &mut scratch.m_r, &mut scratch.w_r);
-
-    let score = score_merge(
-        EffLeaf {
-            m: &work.m[i * p..i * p + p],
-            w: &work.w[i * p..i * p + p],
-        },
-        EffLeaf {
-            m: &work.m[j * p..j * p + p],
-            w: &work.w[j * p..j * p + p],
-        },
-        EffLeaf {
-            m: &scratch.m_r,
-            w: &scratch.w_r,
-        },
-        work.branch[i],
-        work.branch[j],
-        Some(merge),
-        &mut scratch.merge,
-    )?;
+    let score = score_pair_raw(work, members, a, b, merge, scratch)?;
 
     Ok(if score.gain.is_finite() {
         Candidate {
@@ -607,6 +845,56 @@ fn scan_pairs<T: BonsaiFloat>(
             |scratch, &(a, b)| score_pair(work, members, a, b, merge, scratch),
         )
         .try_reduce(|| Candidate::NONE, |x, y| Ok(x.better(y)))
+}
+
+/// Walk a bound-ordered candidate list, stopping once the best is provably
+/// found.
+///
+/// SPEC.md section 10.4 step 2. `bounds` is non-increasing and each entry is an
+/// upper bound on its pair's gain, so once the best true gain seen exceeds the
+/// next entry every remaining pair is beaten and the walk can stop.
+///
+/// **The comparison is strict.** With `>=` a pair whose true gain ties the
+/// incumbent could be left unscored, and [`Candidate::better`] breaks ties on
+/// node ids, so the winner would depend on where the walk happened to stop.
+/// Strict `>` scores every pair whose bound reaches the incumbent, which is
+/// every pair that could tie it, and the exhaustive scan's answer is recovered
+/// exactly.
+///
+/// The list is consumed in chunks so the scan inside a chunk is still parallel.
+/// Chunk boundaries are fixed by index, so the pairs scored and the winner are
+/// the same at any thread count.
+///
+/// ### Params
+///
+/// * `work` - The round's working set
+/// * `members` - Nodes currently attached to the centre
+/// * `pairs` - Candidate pairs, as positions into `members`, in bound order
+/// * `bounds` - Upper bound per pair, non-increasing
+/// * `merge` - Branch-length solve knobs
+///
+/// ### Returns
+///
+/// The best candidate and how many pairs were scored, or the error the
+/// branch-length solve failed with.
+fn walk_bounded<T: BonsaiFloat>(
+    work: &Working<'_, T>,
+    members: &[u32],
+    pairs: &[(usize, usize)],
+    bounds: &[f64],
+    merge: MergeParams,
+) -> Result<(Candidate, usize), BonsaiErrors> {
+    let mut best = Candidate::NONE;
+    let mut done = 0usize;
+    while done < pairs.len() {
+        if best.gain > bounds[done] {
+            break;
+        }
+        let end = (done + BOUND_WALK_CHUNK).min(pairs.len());
+        best = best.better(scan_pairs(work, members, &pairs[done..end], merge)?);
+        done = end;
+    }
+    Ok((best, done))
 }
 
 /// Score every candidate pair and sample one in proportion to the likelihood of
@@ -847,13 +1135,18 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
     let mut wc = vec![0.0f64; p];
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     let mut best_gain = f64::NEG_INFINITY;
+    let mut scored_last_round = 0usize;
+    let mut since_exact_centre = usize::MAX;
     let mut rng = SplitMix64::new(match params.selection {
         StarSelection::Greedy => 0,
         StarSelection::Weighted { seed } => seed,
     });
 
     while members.len() > MIN_CENTRE_MEMBERS {
-        centre_leaf(&m, &w, &branch, &members, p, &mut mc, &mut wc);
+        if !params.incremental_centre || since_exact_centre >= CENTRE_EXACT_EVERY {
+            centre_leaf(&m, &w, &branch, &members, p, &mut mc, &mut wc);
+            since_exact_centre = 0;
+        }
 
         pairs.clear();
         candidates.candidates(
@@ -862,7 +1155,12 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
                 means: &m,
                 precisions: &w,
                 n_features: p,
+                branch: &branch,
+                centre_means: &mc,
+                centre_precisions: &wc,
+                merge: params.merge,
                 best_gain,
+                scored_last_round,
             },
             &mut pairs,
         )?;
@@ -881,15 +1179,31 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
         // `Candidate::NONE` carries minus infinity, so an empty or entirely
         // non-finite round falls out of the loop here too.
         let best = match params.selection {
-            StarSelection::Greedy => scan_pairs(&work, &members, &pairs, params.merge)?,
-            StarSelection::Weighted { .. } => sample_pair(
-                &work,
-                &members,
-                &pairs,
-                params.merge,
-                params.min_gain,
-                &mut rng,
-            )?,
+            // A provider's bounds are ignored under weighted selection, which
+            // needs every pair's score to form the softmax and so has nothing
+            // to prune with.
+            StarSelection::Greedy => match candidates.bounds() {
+                Some(bounds) if bounds.len() == pairs.len() => {
+                    let (best, done) = walk_bounded(&work, &members, &pairs, bounds, params.merge)?;
+                    scored_last_round = done;
+                    best
+                }
+                _ => {
+                    scored_last_round = pairs.len();
+                    scan_pairs(&work, &members, &pairs, params.merge)?
+                }
+            },
+            StarSelection::Weighted { .. } => {
+                scored_last_round = pairs.len();
+                sample_pair(
+                    &work,
+                    &members,
+                    &pairs,
+                    params.merge,
+                    params.min_gain,
+                    &mut rng,
+                )?
+            }
         };
         if best.gain <= params.min_gain {
             break;
@@ -898,6 +1212,22 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
         let (k, l) = (best.left as usize, best.right as usize);
         let ancestor = parent.len() as u32;
         push_ancestor(&mut m, &mut w, k, l, best.t_ak, best.t_al, p);
+        if params.incremental_centre {
+            update_centre_leaf(
+                &m,
+                &w,
+                branch[k],
+                branch[l],
+                k,
+                l,
+                ancestor as usize,
+                best.t_ar,
+                p,
+                &mut mc,
+                &mut wc,
+            );
+            since_exact_centre += 1;
+        }
         parent[k] = ancestor;
         parent[l] = ancestor;
         branch[k] = best.t_ak;
@@ -996,10 +1326,141 @@ pub fn star_tree<T: BonsaiFloat>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::model::likelihood::NodeState;
     use crate::tree::simulate::splits;
     use crate::utils::rng::SplitMix64;
     use approx::assert_relative_eq;
+
+    /// Worst relative deviation of the incremental centre from the exact one.
+    ///
+    /// Replays a star's merges twice over the same topology, once maintaining
+    /// the centre by [`update_centre_leaf`] and once recomputing it, and
+    /// compares the two at every round. Driving both over the *same* merges is
+    /// the point: it isolates the arithmetic from any topology change it might
+    /// otherwise cause.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Members
+    /// * `p` - Features
+    /// * `seed` - Random seed
+    /// * `every` - Rounds between exact recomputes, zero for never
+    ///
+    /// ### Returns
+    ///
+    /// The worst relative deviation of the precision and of the mean.
+    fn centre_drift(n: usize, p: usize, seed: u64, every: usize) -> (f64, f64) {
+        let mut rng = SplitMix64::new(seed);
+        let groups = (n / 4).max(2);
+        let centres: Vec<Vec<f64>> = (0..groups)
+            .map(|_| (0..p).map(|_| 4.0 * (rng.uniform() - 0.5)).collect())
+            .collect();
+        let mut m = Vec::new();
+        let mut w = Vec::new();
+        for i in 0..n {
+            for g in 0..p {
+                m.push(centres[i % groups][g] + 0.35 * (rng.uniform() - 0.5));
+                w.push(0.5 + 2.0 * rng.uniform());
+            }
+        }
+        let branch: Vec<f64> = (0..n).map(|_| 0.05 + 0.2 * rng.uniform()).collect();
+
+        let base = resolve_star(
+            Star {
+                means: &m,
+                precisions: &w,
+                branch: &branch,
+                n_features: p,
+            },
+            None,
+        )
+        .expect("resolve");
+
+        let mut mm = m.clone();
+        let mut ww = w.clone();
+        let mut br = branch.clone();
+        let mut members: Vec<u32> = (0..n as u32).collect();
+        let (mut mc, mut wc) = (vec![0.0; p], vec![0.0; p]);
+        let (mut exact_m, mut exact_w) = (vec![0.0; p], vec![0.0; p]);
+        let (mut worst_w, mut worst_m) = (0.0f64, 0.0f64);
+        let mut since = usize::MAX;
+        for merge in &base.merges {
+            if since == usize::MAX || (every > 0 && since >= every) {
+                centre_leaf(&mm, &ww, &br, &members, p, &mut mc, &mut wc);
+                since = 0;
+            }
+            centre_leaf(&mm, &ww, &br, &members, p, &mut exact_m, &mut exact_w);
+            for g in 0..p {
+                worst_w = worst_w.max((wc[g] - exact_w[g]).abs() / exact_w[g].abs());
+                worst_m = worst_m.max((mc[g] - exact_m[g]).abs() / exact_m[g].abs().max(1e-3));
+            }
+
+            let (k, l) = (merge.left as usize, merge.right as usize);
+            let (t_rk, t_rl) = (br[k], br[l]);
+            push_ancestor(&mut mm, &mut ww, k, l, merge.t_left, merge.t_right, p);
+            let a = br.len();
+            update_centre_leaf(
+                &mm,
+                &ww,
+                t_rk,
+                t_rl,
+                k,
+                l,
+                a,
+                merge.t_centre,
+                p,
+                &mut mc,
+                &mut wc,
+            );
+            since += 1;
+            br[k] = merge.t_left;
+            br[l] = merge.t_right;
+            br.push(merge.t_centre);
+            members.retain(|&x| x != merge.left && x != merge.right);
+            members.push(a as u32);
+        }
+        (worst_w, worst_m)
+    }
+
+    /// The incremental centre update stays inside the gains' own rounding.
+    ///
+    /// **Measured 2026-08-31**, eight seeds, worst relative deviation from the
+    /// exact recompute at any round of the star:
+    ///
+    /// | members | features | recompute | precision | mean |
+    /// |---|---|---|---|---|
+    /// | 64 | 100 | never | 9.3e-15 | 1.5e-12 |
+    /// | 64 | 100 | every 32 | 2.6e-15 | 1.0e-12 |
+    /// | 128 | 200 | never | 1.5e-14 | 2.4e-12 |
+    /// | 128 | 200 | every 32 | 3.2e-15 | 7.2e-13 |
+    ///
+    /// The mean drifts three orders further than the precision, which is what
+    /// [`peel`] warns about: it is a difference of large numbers divided by
+    /// another difference of large numbers, and the precision is only the
+    /// first half of that. Both are far inside the `1e-16` per feature that a
+    /// merge gain itself rounds to, and neither grows enough over a star to
+    /// need the periodic recompute. The recompute is kept anyway: it costs one
+    /// `O(n p)` pass in thirty-two and it is what stops the drift being
+    /// unbounded in the star sizes nobody has run yet.
+    #[test]
+    fn test_the_incremental_centre_leaf_does_not_drift() {
+        for &(n, p) in &[(64usize, 100usize), (128, 200)] {
+            for every in [0usize, CENTRE_EXACT_EVERY] {
+                let (mut worst_w, mut worst_m) = (0.0f64, 0.0f64);
+                for seed in [1u64, 2, 3, 4, 5, 6, 7, 8] {
+                    let (a, b) = centre_drift(n, p, seed, every);
+                    worst_w = worst_w.max(a);
+                    worst_m = worst_m.max(b);
+                }
+                assert!(
+                    worst_w < 1e-12 && worst_m < 1e-10,
+                    "{n} by {p}, recompute every {every}: drift {worst_w:e} in the precision \
+                     and {worst_m:e} in the mean, an order past what was measured"
+                );
+            }
+        }
+    }
 
     /// Leaves drawn in `n_clusters` tight groups, far apart from each other.
     ///
@@ -1405,7 +1866,12 @@ mod tests {
                         means: &m,
                         precisions: &w,
                         n_features: p,
+                        branch: &branch,
+                        centre_means: &mc,
+                        centre_precisions: &wc,
+                        merge: MergeParams::default(),
                         best_gain: f64::NEG_INFINITY,
+                        scored_last_round: 0,
                     },
                     &mut pairs,
                 )

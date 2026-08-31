@@ -524,6 +524,45 @@ are too loose, so shrink the ellipsoid. Shallow means we can afford looser bound
 and fewer recomputations, so grow it. **The schedule and its clamps are ours, and
 must be tuned and dated, not inherited.**
 
+**Deviation: depth alone is the wrong signal.** The walk over the sorted list is
+chunked, because scoring pairs one at a time wastes the parallel scan. It
+therefore cannot stop part way through a chunk, so once the bounds are working
+at all every round reports the same minimum depth, every round reads as shallow,
+and the ellipsoid grows until it meets whatever cap it was given. Measured, the
+cap rather than the schedule was choosing the answer. What is tracked instead is
+a running average of redraw cost against walk cost, hill-climbing on the
+difference, which for a trade-off of this shape settles at the bottom of the
+bowl. The value is robustness rather than the last few per cent: fixed schedules
+either side of the optimum cost 0.175 and 0.170 against the adaptive 0.109.
+
+### 10.6 Two corrections to this section, 2026-08-31
+
+Both were found by measurement while implementing, and both are errors in this
+document rather than in the SI.
+
+**S45 is a norm, not a sum of absolute values.** The equation as transcribed sums
+`|dL/dM| * scale` over features. That is the maximum of the linear form over the
+circumscribing *box*, not over the ellipsoid, and the two differ by up to
+`sqrt(p)`. At two thousand features the box form inflates every bound by about
+45 times, at which point nothing is ever pruned and the whole section is dead
+weight. The prose either side of S45 says "the vector's norm", which is correct;
+take the Euclidean norm.
+
+**S41's half-axes need the feature count.** The ellipsoid is a norm over all `p`
+features at once, so a movement of one merge's size in *every* feature sits at
+radius `sqrt(p)`, not at radius 1. Both scales therefore pick up a factor of
+`sqrt(p)`. Without it, `nsteps` is wrong by a factor of `p`, and worse, a default
+measured at one feature count means nothing at another, which is the kind of
+constant that looks tuned and is actually arbitrary.
+
+**Restructuring worth keeping.** The maximum of a linear form over a ball of
+radius `R` is `R` times its maximum over the unit ball. So rather than adding a
+fixed worst-case slack to every bound, store the ellipsoid as a metric,
+accumulate the distance the centre has travelled in that metric round by round,
+and let a pair's bound be `gain + distance * unit_slack`. Strictly tighter, and
+it makes a pair scored during the current round need no special case: its
+distance is zero, so its bound is exactly its own gain.
+
 ## 11. Candidate restriction (SI.D.2)
 
 Bounds alone still require a full `O(n*k*p)` rescore whenever the root leaves the

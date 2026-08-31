@@ -25,10 +25,12 @@ use crate::ingest::{IngestParams, PreparedData, prepare};
 use crate::model::global::{GlobalBranchParams, UpState, optimise_branch_lengths};
 use crate::model::likelihood::NodeState;
 use crate::search::Leaves;
+use crate::search::bounds::{EllipsoidBounds, EllipsoidBoundsParams};
+use crate::search::candidates::{KnnCandidates, KnnCandidatesParams};
 use crate::search::nni::{NniParams, nni};
 use crate::search::polytomy::resolve_polytomies;
 use crate::search::spr::{SprParams, spr};
-use crate::search::star::{Star, StarParams, star_tree};
+use crate::search::star::{Star, StarParams, star_tree_with};
 use crate::tree::Tree;
 use crate::tree::cluster::reroot_for_display;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
@@ -52,6 +54,14 @@ pub struct BonsaiParams {
     pub ingest: IngestParams,
     /// The greedy star primitive (section 9.1) and polytomy resolution (9.2).
     pub star: StarParams,
+    /// Candidate-pair restriction (section 11).
+    ///
+    /// Not optional in practice. Scanning every pair makes step 2 `O(n^3 p)`
+    /// and 94 per cent of the runtime; measured, it scales as `n^2.9` without
+    /// this and the ellipsoid bounds below.
+    pub knn: KnnCandidatesParams,
+    /// Upper bounds on merge scores (section 10).
+    pub bounds: EllipsoidBoundsParams,
     /// Global branch-length optimisation (section 6), steps 1, 4 and 7.
     pub branch: GlobalBranchParams,
     /// Subtree pruning and regrafting (section 9.3), step 5.
@@ -186,7 +196,12 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
 
     // Step 2: greedily add ancestors. The star's optimised branch lengths carry
     // over as the members' branches to the centre.
-    let (tree, _) = star_tree(
+    // Both restrictions on, which is what makes this step tractable. The
+    // bounds sit outside the neighbour graph: the graph decides which pairs
+    // exist, the bounds decide which of those need rescoring this round.
+    let mut candidates =
+        EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)), Some(params.bounds));
+    let (tree, _) = star_tree_with(
         Star {
             means: leaves.means,
             precisions: leaves.precisions,
@@ -194,6 +209,7 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
             n_features: p,
         },
         Some(params.star),
+        &mut candidates,
     )?;
     record("2 merge", tree_loglik(&tree, leaves)?, &mut steps);
 

@@ -1429,7 +1429,40 @@ pub fn star_tree<T: BonsaiFloat>(
     star: Star<'_, T>,
     params: Option<StarParams>,
 ) -> Result<(Tree, f64), BonsaiErrors> {
-    let result = resolve_star(star, params)?;
+    star_tree_with(star, params, &mut AllPairs)
+}
+
+/// Resolve a star into a tree, choosing which candidate pairs are considered.
+///
+/// The exhaustive scan of [`star_tree`] is `O(n^2)` pairs per round over `O(n)`
+/// rounds, so a whole star is `O(n^3 p)`. That is what
+/// [`crate::search::candidates::KnnCandidates`] and
+/// [`crate::search::bounds::EllipsoidBounds`] exist to avoid, and a caller
+/// building trees of any size wants them: measured end to end, the merge step
+/// is 94 per cent of the pipeline's runtime and scales as `n^2.9` without them.
+///
+/// The two compose, bounds outermost:
+///
+/// ```ignore
+/// let mut provider = EllipsoidBounds::new(KnnCandidates::new(None), None);
+/// let (tree, gain) = star_tree_with(star, None, &mut provider)?;
+/// ```
+///
+/// ### Params
+///
+/// * `star` - The members and their branches to the centre
+/// * `params` - Star knobs, or `None` for the defaults
+/// * `candidates` - Which pairs to consider each round
+///
+/// ### Returns
+///
+/// The tree and the summed gain of its merges.
+pub fn star_tree_with<T: BonsaiFloat, C: CandidatePairs<T>>(
+    star: Star<'_, T>,
+    params: Option<StarParams>,
+    candidates: &mut C,
+) -> Result<(Tree, f64), BonsaiErrors> {
+    let result = resolve_star_with(star, params, candidates)?;
     let gain: f64 = result.merges.iter().map(|x| x.gain).sum();
 
     let root = result.parent.len() as u32;

@@ -35,6 +35,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod errors;
+pub mod ingest;
 pub mod model;
 pub mod search;
 pub mod tree;

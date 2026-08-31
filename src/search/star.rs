@@ -1,8 +1,8 @@
-//! The greedy star primitive of SPEC.md section 9.1.
+//! The star primitive of SPEC.md section 9.1.
 //!
 //! Given a centre and the star of effective leaves hanging off it, score every
 //! candidate pair with [`crate::model::merge::score_merge`], insert an ancestor
-//! above the best-scoring pair, summarise that ancestor as an effective leaf
+//! above the pair [`StarSelection`] picks, summarise that ancestor as an effective leaf
 //! (SPEC.md section 4) so the remaining structure is a star again, and repeat.
 //! Stop when the centre has three members left or no pair gives a gain worth
 //! taking.
@@ -25,6 +25,7 @@
 use crate::errors::BonsaiErrors;
 use crate::model::merge::{EffLeaf, MergeParams, MergeScratch, score_merge};
 use crate::tree::{NO_NODE, Tree};
+use crate::utils::rng::SplitMix64;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
 use rayon::prelude::*;
 
@@ -56,7 +57,54 @@ const MIN_CENTRE_MEMBERS: usize = 3;
 /// `O(p)` nats. See `test_the_default_min_gain_clears_the_zero_gain_floor`.
 const DEFAULT_MIN_GAIN: f64 = 1e-9;
 
-/// Tuning knobs for the greedy star primitive.
+/// How the primitive picks the pair to merge in a round.
+///
+/// SPEC.md section 9.4. The greedy rule drives search steps 2 and 3 and is the
+/// default; the weighted rule is the random phase of the nearest-neighbour
+/// interchanges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StarSelection {
+    /// Take the highest-scoring pair of the round.
+    #[default]
+    Greedy,
+    /// Sample a pair with probability proportional to the likelihood of the
+    /// tree the merge would produce.
+    ///
+    /// The candidates differ from the resulting tree loglikelihoods by the
+    /// current tree's own loglikelihood, which is common to the round, so a
+    /// softmax over the gains is the same distribution as a softmax over the
+    /// resulting tree loglikelihoods. The round maximum is subtracted before
+    /// exponentiating.
+    ///
+    /// **Deviation.** The specification samples over every pair; this samples
+    /// over the pairs that clear [`StarParams::min_gain`] and stops when none
+    /// do, so that the primitive's stopping rule is the same in both modes. A
+    /// pair below the floor carries softmax weight `exp(-O(p))` against the
+    /// round's best, so nothing measurable is given up.
+    ///
+    /// **Cost.** Unlike the greedy rule this materialises one score per
+    /// candidate pair rather than reducing them as they are produced, so it
+    /// wants the small stars of an interchange and not a whole-dataset star.
+    ///
+    /// **How random this actually is.** The weights are a softmax over
+    /// quantities whose gaps are `O(p)` nats, so the distribution concentrates
+    /// on the greedy pick as the feature count grows. That is the specification
+    /// taken literally and not a shortcut: measured 2026-08-31 through
+    /// [`crate::search::nni::nni_random`] at 32 leaves over eight seeds, eight
+    /// of eight seeds moved the tree off its starting topology at 8 features,
+    /// four of eight at 32, and two and three of eight at 128 and 512. A caller
+    /// relying on this to escape a local optimum at ten thousand features
+    /// should expect it to behave close to greedy.
+    Weighted {
+        /// Seed of the splitmix64 stream the draws come from.
+        ///
+        /// One draw per round, taken after the pairs have been scored and
+        /// ordered, so the sampled pair does not depend on the thread count.
+        seed: u64,
+    },
+}
+
+/// Tuning knobs for the star primitive.
 #[derive(Clone, Copy, Debug)]
 pub struct StarParams {
     /// Smallest loglikelihood gain, in nats, that will be accepted as a merge.
@@ -65,12 +113,14 @@ pub struct StarParams {
     /// Absolute rather than scaled by the feature count, so a caller running at
     /// an unusually large `p` should raise it; see `DEFAULT_MIN_GAIN`.
     pub min_gain: f64,
+    /// Which pair of the round is merged.
+    pub selection: StarSelection,
     /// Branch-length solve knobs handed to [`score_merge`].
     pub merge: MergeParams,
 }
 
 impl Default for StarParams {
-    /// `DEFAULT_MIN_GAIN` and the default [`MergeParams`].
+    /// `DEFAULT_MIN_GAIN`, greedy selection and the default [`MergeParams`].
     ///
     /// ### Returns
     ///
@@ -78,6 +128,7 @@ impl Default for StarParams {
     fn default() -> Self {
         Self {
             min_gain: DEFAULT_MIN_GAIN,
+            selection: StarSelection::Greedy,
             merge: MergeParams::default(),
         }
     }
@@ -429,16 +480,107 @@ fn peel<T: BonsaiFloat>(work: &Working<'_, T>, i: usize, j: usize, m_r: &mut [T]
     }
 }
 
+/// One worker's reusable buffers for the pair scan.
+///
+/// Allocated once per worker through `map_init` rather than once per pair.
+struct PairScratch<T> {
+    /// Branch-length solve scratch.
+    merge: MergeScratch,
+    /// The remainder's means, from the peel.
+    m_r: Vec<T>,
+    /// The remainder's precisions, from the peel.
+    w_r: Vec<T>,
+}
+
+impl<T: BonsaiFloat> PairScratch<T> {
+    /// Allocate for a given feature count.
+    ///
+    /// ### Params
+    ///
+    /// * `p` - Number of features
+    ///
+    /// ### Returns
+    ///
+    /// The scratch.
+    fn new(p: usize) -> Self {
+        Self {
+            merge: MergeScratch::new(p),
+            m_r: vec![T::zero(); p],
+            w_r: vec![T::zero(); p],
+        }
+    }
+}
+
+/// Score one candidate pair.
+///
+/// A pair whose gain comes back non-finite becomes [`Candidate::NONE`] rather
+/// than a selectable candidate. That is a numerical pathology in the
+/// branch-length solve for that pair alone, and letting it win would stop the
+/// whole primitive.
+///
+/// ### Params
+///
+/// * `work` - The round's working set
+/// * `members` - Nodes currently attached to the centre
+/// * `a` - Position of the first member of the pair
+/// * `b` - Position of the second
+/// * `merge` - Branch-length solve knobs
+/// * `scratch` - Reusable buffers
+///
+/// ### Returns
+///
+/// The candidate, or the error the branch-length solve failed with.
+fn score_pair<T: BonsaiFloat>(
+    work: &Working<'_, T>,
+    members: &[u32],
+    a: usize,
+    b: usize,
+    merge: MergeParams,
+    scratch: &mut PairScratch<T>,
+) -> Result<Candidate, BonsaiErrors> {
+    let p = work.p;
+    let (i, j) = (members[a] as usize, members[b] as usize);
+    peel(work, i, j, &mut scratch.m_r, &mut scratch.w_r);
+
+    let score = score_merge(
+        EffLeaf {
+            m: &work.m[i * p..i * p + p],
+            w: &work.w[i * p..i * p + p],
+        },
+        EffLeaf {
+            m: &work.m[j * p..j * p + p],
+            w: &work.w[j * p..j * p + p],
+        },
+        EffLeaf {
+            m: &scratch.m_r,
+            w: &scratch.w_r,
+        },
+        work.branch[i],
+        work.branch[j],
+        Some(merge),
+        &mut scratch.merge,
+    )?;
+
+    Ok(if score.gain.is_finite() {
+        Candidate {
+            gain: score.gain,
+            left: members[a],
+            right: members[b],
+            t_ak: score.t_ak,
+            t_al: score.t_al,
+            t_ar: score.t_ar,
+        }
+    } else {
+        Candidate::NONE
+    })
+}
+
 /// Score every candidate pair and return the best.
 ///
 /// Read-only over the working set, so the scan is a parallel map and reduce.
 /// Each worker allocates its scratch and its remainder buffers once through
 /// `map_init` rather than once per pair; the reduction is a total order over
 /// `(gain, node ids)`, so the winner does not depend on the thread count.
-///
-/// A pair whose gain comes back non-finite is dropped rather than selected.
-/// That is a numerical pathology in the branch-length solve for that pair
-/// alone, and letting it win would stop the whole primitive.
 ///
 /// ### Params
 ///
@@ -461,42 +603,87 @@ fn scan_pairs<T: BonsaiFloat>(
     pairs
         .par_iter()
         .map_init(
-            || (MergeScratch::new(p), vec![T::zero(); p], vec![T::zero(); p]),
-            |(scratch, m_r, w_r), &(a, b)| {
-                let (i, j) = (members[a] as usize, members[b] as usize);
-                peel(work, i, j, m_r, w_r);
-
-                let score = score_merge(
-                    EffLeaf {
-                        m: &work.m[i * p..i * p + p],
-                        w: &work.w[i * p..i * p + p],
-                    },
-                    EffLeaf {
-                        m: &work.m[j * p..j * p + p],
-                        w: &work.w[j * p..j * p + p],
-                    },
-                    EffLeaf { m: m_r, w: w_r },
-                    work.branch[i],
-                    work.branch[j],
-                    Some(merge),
-                    scratch,
-                )?;
-
-                Ok(if score.gain.is_finite() {
-                    Candidate {
-                        gain: score.gain,
-                        left: members[a],
-                        right: members[b],
-                        t_ak: score.t_ak,
-                        t_al: score.t_al,
-                        t_ar: score.t_ar,
-                    }
-                } else {
-                    Candidate::NONE
-                })
-            },
+            || PairScratch::new(p),
+            |scratch, &(a, b)| score_pair(work, members, a, b, merge, scratch),
         )
         .try_reduce(|| Candidate::NONE, |x, y| Ok(x.better(y)))
+}
+
+/// Score every candidate pair and sample one in proportion to the likelihood of
+/// the tree its merge would produce.
+///
+/// SPEC.md section 9.4. The scores are collected in `pairs` order, which rayon
+/// preserves for an indexed iterator, and the softmax and the cumulative draw
+/// then run sequentially over that fixed order. So the sampled pair is a
+/// function of the seed and the star alone and not of which worker finished
+/// first, which is what a `RAYON_NUM_THREADS` sweep in the tests pins.
+///
+/// Only pairs clearing `min_gain` are eligible, so this has the same stopping
+/// rule as the greedy scan; see [`StarSelection::Weighted`].
+///
+/// ### Params
+///
+/// * `work` - The round's working set
+/// * `members` - Nodes currently attached to the centre
+/// * `pairs` - Candidate pairs, as positions into `members`
+/// * `merge` - Branch-length solve knobs
+/// * `min_gain` - Floor a pair must clear to be eligible
+/// * `rng` - Stream the round's single draw is taken from
+///
+/// ### Returns
+///
+/// The sampled candidate, or [`Candidate::NONE`] if no pair was eligible, or
+/// the error the branch-length solve failed with.
+fn sample_pair<T: BonsaiFloat>(
+    work: &Working<'_, T>,
+    members: &[u32],
+    pairs: &[(usize, usize)],
+    merge: MergeParams,
+    min_gain: f64,
+    rng: &mut SplitMix64,
+) -> Result<Candidate, BonsaiErrors> {
+    let p = work.p;
+    let scored: Vec<Candidate> = pairs
+        .par_iter()
+        .map_init(
+            || PairScratch::new(p),
+            |scratch, &(a, b)| score_pair(work, members, a, b, merge, scratch),
+        )
+        .collect::<Result<Vec<_>, BonsaiErrors>>()?;
+
+    let eligible = |c: &&Candidate| c.gain > min_gain;
+    let top = scored
+        .iter()
+        .filter(eligible)
+        .fold(f64::NEG_INFINITY, |acc, c| acc.max(c.gain));
+    if !top.is_finite() {
+        return Ok(Candidate::NONE);
+    }
+
+    // Softmax over loglikelihoods, so the maximum comes off before the
+    // exponential: a round's gains are `O(p)` nats apart and would otherwise
+    // overflow at a few hundred features.
+    let total: f64 = scored
+        .iter()
+        .filter(eligible)
+        .map(|c| (c.gain - top).exp())
+        .sum();
+    let target = rng.uniform() * total;
+    let mut acc = 0.0f64;
+    for c in scored.iter().filter(eligible) {
+        acc += (c.gain - top).exp();
+        if acc >= target {
+            return Ok(*c);
+        }
+    }
+    // The cumulative sum can fall a rounding short of `total`. Nothing was
+    // sampled then, so take the last eligible pair rather than nothing.
+    Ok(scored
+        .iter()
+        .rev()
+        .find(eligible)
+        .copied()
+        .unwrap_or(Candidate::NONE))
 }
 
 /// Summarise a merged pair as one effective leaf, SPEC.md section 4.
@@ -540,7 +727,7 @@ fn push_ancestor<T: BonsaiFloat>(
 // The primitive //
 ///////////////////
 
-/// Run the greedy star primitive with the exhaustive candidate provider.
+/// Run the star primitive with the exhaustive candidate provider.
 ///
 /// SPEC.md section 9.1. See [`resolve_star_with`] for the general form.
 ///
@@ -560,10 +747,10 @@ pub fn resolve_star<T: BonsaiFloat>(
     resolve_star_with(star, params, &mut AllPairs)
 }
 
-/// Run the greedy star primitive.
+/// Run the star primitive.
 ///
-/// Each round scores the candidate pairs, inserts an ancestor above the best
-/// one, summarises it as an effective leaf, and puts it back in the star in
+/// Each round scores the candidate pairs, inserts an ancestor above the one
+/// [`StarSelection`] picks, summarises it as an effective leaf, and puts it back in the star in
 /// place of the two members it swallowed. Stops at `MIN_CENTRE_MEMBERS`
 /// members or when no pair clears [`StarParams::min_gain`].
 ///
@@ -660,6 +847,10 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
     let mut wc = vec![0.0f64; p];
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     let mut best_gain = f64::NEG_INFINITY;
+    let mut rng = SplitMix64::new(match params.selection {
+        StarSelection::Greedy => 0,
+        StarSelection::Weighted { seed } => seed,
+    });
 
     while members.len() > MIN_CENTRE_MEMBERS {
         centre_leaf(&m, &w, &branch, &members, p, &mut mc, &mut wc);
@@ -689,7 +880,17 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
         };
         // `Candidate::NONE` carries minus infinity, so an empty or entirely
         // non-finite round falls out of the loop here too.
-        let best = scan_pairs(&work, &members, &pairs, params.merge)?;
+        let best = match params.selection {
+            StarSelection::Greedy => scan_pairs(&work, &members, &pairs, params.merge)?,
+            StarSelection::Weighted { .. } => sample_pair(
+                &work,
+                &members,
+                &pairs,
+                params.merge,
+                params.min_gain,
+                &mut rng,
+            )?,
+        };
         if best.gain <= params.min_gain {
             break;
         }

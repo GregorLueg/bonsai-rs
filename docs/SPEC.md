@@ -397,6 +397,43 @@ For four subtrees this recovers exactly the classical NNI. Two phases:
 - **Greedy.** Score an NNI for every edge, perform the best, repeat until no move
   improves the likelihood.
 
+**Deviation: the greedy stopping rule needs a topology filter.** Taken literally,
+"repeat until no move improves the likelihood" does not terminate on topology at
+all. Collapsing an edge and re-resolving the star regroups the same subtrees but
+reoptimises three branch lengths at the centre, so it reports a gain while
+changing nothing about the topology. Started from the generating tree itself,
+the greedy phase ran 104 to 239 rounds with Robinson-Foulds pinned at zero
+throughout: it was doing branch-length descent wearing a topology search's
+clothes. Any proposal whose split fingerprint matches the current tree is
+therefore discarded. Ladder recovery went from 115 rounds to 23. Branch lengths
+are steps 4 and 7 and should not be smuggled in here.
+
+The corollary is that **NNI must run after step 4**, which is the order the SI
+gives anyway. On a ladder with unoptimised branch lengths the filter makes
+recovery worse (RF 44 to 24 rather than to 0), because the landscape is then
+dominated by wrong branch lengths and the only improvements available are the
+ones the filter rejects.
+
+**The random phase is close to inert at realistic feature counts.** This is a
+property of the method as published, not of this implementation. The softmax is
+over loglikelihoods whose gaps scale as `O(p)`, so it concentrates on the greedy
+pick as `p` grows. Measured at 32 leaves over 8 seeds, counting how many moved
+the topology off its starting point at all:
+
+| features | seeds that moved |
+|---|---|
+| 8 | 8/8 |
+| 32 | 4/8 |
+| 128 | 2/8 |
+| 512 | 3/8 |
+
+At 256 features it left the topology untouched for every seed tried and only
+reoptimised branch lengths. Since the paper works at thousands of features, the
+phase it describes as escaping local optima will rarely move anything. A
+temperature would fix that, but the SI specifies none and inventing one is a
+change to the method rather than to its implementation, so this crate ships the
+phase off by default with the measurement recorded against it.
+
 ## 10. Upper bounds on merge scores (SI.D.1)
 
 **Not an optimisation. Without this the algorithm does not run.** Naive scaling

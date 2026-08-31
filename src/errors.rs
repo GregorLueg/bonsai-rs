@@ -49,6 +49,56 @@ pub enum BonsaiErrors {
         feature: usize,
     },
 
+    /// A mean was not a finite number.
+    #[error("Non-finite mean {value} at cell {cell}, feature {feature}.")]
+    NonFiniteMean {
+        /// Offending value
+        value: f64,
+        /// Cell index
+        cell: usize,
+        /// Feature index
+        feature: usize,
+    },
+
+    /// Per-feature variances must be strictly positive; the ingest transform of
+    /// SPEC.md section 3.1 divides by their square root.
+    #[error("Non-positive variance {value} for feature {feature}.")]
+    NonPositiveVariance {
+        /// Offending value
+        value: f64,
+        /// Feature index
+        feature: usize,
+    },
+
+    /// The signal-to-noise filter of SPEC.md section 3.3 kept nothing.
+    #[error(
+        "The signal-to-noise threshold {threshold} retained none of the {n_features} features. Lower the threshold."
+    )]
+    NoFeaturesRetained {
+        /// Number of features considered
+        n_features: usize,
+        /// Threshold that was applied
+        threshold: f64,
+    },
+
+    /// Recovering likelihood parameters from Sanity posteriors was
+    /// ill-conditioned for every feature (SPEC.md section 3.4, S5).
+    ///
+    /// The conversion amplifies by `v / (v - eps^2)`, which blows up as the
+    /// posterior error bar approaches the feature variance. Losing the whole
+    /// panel to it usually means the posteriors came from a Sanity run
+    /// reporting the *expectation* of `v`; the posterior-maximising mode is the
+    /// one this model wants.
+    #[error(
+        "Recovering likelihood parameters from Sanity posteriors exceeded the amplification cap {cap} for all {n_features} features."
+    )]
+    IllConditionedConversion {
+        /// Number of features considered
+        n_features: usize,
+        /// Amplification cap that was applied
+        cap: f64,
+    },
+
     // -- tree structure --
     /// A node index was outside the arena.
     #[error("Node index {index} is out of range for a tree with {n_nodes} nodes.")]

@@ -18,6 +18,7 @@
 //! which is free for callers: internal rows are always computed by the sweep,
 //! never supplied, so no caller-held data is indexed by an internal node.
 
+pub mod cluster;
 pub mod layout;
 pub mod newick;
 pub mod simulate;

@@ -1,8 +1,10 @@
 //! The tree search of SPEC.md section 9.
 
+pub mod bounds;
 pub mod candidates;
 pub mod nni;
 pub mod polytomy;
+pub mod spr;
 pub mod star;
 
 /// The leaf data a search step scores its trees against.

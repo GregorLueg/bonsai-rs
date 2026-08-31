@@ -55,10 +55,13 @@ const MIN_CENTRE_MEMBERS: usize = 3;
 /// `f64` rounding of a sum whose magnitude is `O(p)`, which is what it should
 /// be, so the floor scales with the feature count and not with anything else.
 ///
-/// `1e-9` therefore clears the floor by four orders of magnitude at the ten
-/// thousand features this crate expects and still by one at a million, while
-/// sitting far below any gain that carries information: a real merge gain is
-/// `O(p)` nats. See `test_the_default_min_gain_clears_the_zero_gain_floor`.
+/// At the ten thousand features this crate expects the floor is `1.1e-12`, so
+/// `1e-9` clears it by a factor of 900: just under three orders of magnitude,
+/// not the four an earlier version of this comment claimed (adversarial review
+/// N3). At a million features the floor is `1.1e-10` and the headroom is nine.
+/// It still sits far below any gain that carries information, since a real
+/// merge gain is `O(p)` nats. See
+/// `test_the_default_min_gain_clears_the_zero_gain_floor`.
 const DEFAULT_MIN_GAIN: f64 = 1e-9;
 
 /// How many bound-ordered pairs [`walk_bounded`] scores before it rechecks the
@@ -658,11 +661,31 @@ fn update_centre_leaf<T: BonsaiFloat>(
 /// one member carries most of the centre's precision then `WR` is a small
 /// difference of large numbers and loses significant digits, and the mean is
 /// worse because the subtraction happens in the numerator *and* the small `WR`
-/// then divides it. The accumulation is in `f64` regardless of storage type,
-/// which keeps this out of the way for the star sizes and precision ranges
-/// tested so far. If a fixture ever shows it biting, that is a finding to
-/// report, not something to paper over by changing the maths: the re-accumulated
-/// form is a different cost class.
+/// then divides it. The accumulation is in `f64` regardless of storage type.
+///
+/// The adversarial review asked for the fixture that shows it biting and it is
+/// now `test_the_peel_loses_the_remainder_when_one_member_dominates`. Measured
+/// 2026-08-31, six members on zero-length branches with one carrying the whole
+/// star's precision and sitting inside the peeled pair, relative error in the
+/// remainder's mean against a re-accumulation:
+///
+/// | dominance | rel err in `MR` | features with `WR <= 0` |
+/// |---|---|---|
+/// | 1e9  | 1.9e-7 | 0 of 8 |
+/// | 1e13 | 4.1e-3 | 0 of 8 |
+/// | 1e15 | 2.5e-1 | 0 of 8 |
+/// | 1e16 | 9.9e1  | 8 of 8 |
+///
+/// The law is `2^-53 * W_centre / W_R`, so it is total loss at `1e16` and a
+/// negative remainder past it. Two things keep it away from a real star: the
+/// diffusion correction caps `wd` at `1/t`, so the range that reaches the
+/// subtraction is bounded by the branch lengths and not by the raw precisions,
+/// and the ordinary late-round case has `W_centre / W_R` of order `n`, which is
+/// `1e-12` at eight thousand members. The band to fear is `1e13` to `1e16`,
+/// where the score is wrong but finite and so competes on equal terms; past it
+/// the pair's own solve fails and the pair is dropped. This is documented
+/// rather than defended: the re-accumulated form is a different cost class, and
+/// the fixtures that reach the band all need zero-length branches throughout.
 ///
 /// ### Params
 ///
@@ -770,12 +793,65 @@ fn score_pair_raw<T: BonsaiFloat>(
     )
 }
 
+/// What one scan found: the best pair, and how many were dropped.
+///
+/// `dropped` is summed rather than compared, and addition of counts is
+/// associative and commutative, so the reduction stays independent of how rayon
+/// split the work in exactly the way [`Candidate::better`] makes the winner
+/// independent of it.
+#[derive(Clone, Copy, Debug)]
+struct Scan {
+    /// Best candidate seen, [`Candidate::NONE`] if there was none.
+    best: Candidate,
+    /// Pairs whose branch-length solve diverged and were dropped.
+    dropped: usize,
+}
+
+impl Scan {
+    /// The identity of the reduction: nothing seen, nothing dropped.
+    const EMPTY: Self = Self {
+        best: Candidate::NONE,
+        dropped: 0,
+    };
+
+    /// One pair whose branch-length solve diverged.
+    const DROPPED: Self = Self {
+        best: Candidate::NONE,
+        dropped: 1,
+    };
+
+    /// Combine two scans.
+    ///
+    /// ### Params
+    ///
+    /// * `other` - The scan to fold in
+    ///
+    /// ### Returns
+    ///
+    /// The better candidate and the summed drop count.
+    #[inline]
+    fn merge(self, other: Self) -> Self {
+        Self {
+            best: self.best.better(other.best),
+            dropped: self.dropped + other.dropped,
+        }
+    }
+}
+
 /// Score one candidate pair.
 ///
 /// A pair whose gain comes back non-finite becomes [`Candidate::NONE`] rather
 /// than a selectable candidate. That is a numerical pathology in the
 /// branch-length solve for that pair alone, and letting it win would stop the
 /// whole primitive.
+///
+/// **A diverged solve is dropped for the same reason**, and counted so that a
+/// round in which every pair diverged can still be reported rather than
+/// returning an unresolved star. Letting the error out of the scan instead
+/// would stop the whole primitive on one pathological pair, which is the
+/// outcome the paragraph above exists to avoid, and would make the error path
+/// depend on the thread count: `try_reduce` short-circuits, so which of several
+/// failing pairs surfaced would be whichever worker got there first.
 ///
 /// ### Params
 ///
@@ -788,7 +864,8 @@ fn score_pair_raw<T: BonsaiFloat>(
 ///
 /// ### Returns
 ///
-/// The candidate, or the error the branch-length solve failed with.
+/// The scan of this one pair, or the error the branch-length solve failed with
+/// where that error is not a divergence.
 fn score_pair<T: BonsaiFloat>(
     work: &Working<'_, T>,
     members: &[u32],
@@ -796,21 +873,62 @@ fn score_pair<T: BonsaiFloat>(
     b: usize,
     merge: MergeParams,
     scratch: &mut PairScratch<T>,
-) -> Result<Candidate, BonsaiErrors> {
-    let score = score_pair_raw(work, members, a, b, merge, scratch)?;
+) -> Result<Scan, BonsaiErrors> {
+    let score = match score_pair_raw(work, members, a, b, merge, scratch) {
+        Ok(score) => score,
+        Err(BonsaiErrors::RootFindDiverged { .. }) => return Ok(Scan::DROPPED),
+        Err(other) => return Err(other),
+    };
 
-    Ok(if score.gain.is_finite() {
-        Candidate {
-            gain: score.gain,
-            left: members[a],
-            right: members[b],
-            t_ak: score.t_ak,
-            t_al: score.t_al,
-            t_ar: score.t_ar,
-        }
-    } else {
-        Candidate::NONE
+    Ok(Scan {
+        best: if score.gain.is_finite() {
+            Candidate {
+                gain: score.gain,
+                left: members[a],
+                right: members[b],
+                t_ak: score.t_ak,
+                t_al: score.t_al,
+                t_ar: score.t_ar,
+            }
+        } else {
+            Candidate::NONE
+        },
+        dropped: 0,
     })
+}
+
+/// Recover the error that a round of nothing but diverged pairs swallowed.
+///
+/// Called only when every pair scored in a round was dropped, and it rescores
+/// the first of them sequentially so the caller is handed the actual solver
+/// error rather than an `Ok` holding an unresolved star. The first pair is a
+/// fixed choice, so the error does not depend on the thread count.
+///
+/// ### Params
+///
+/// * `work` - The round's working set
+/// * `members` - Nodes currently attached to the centre
+/// * `pairs` - The round's candidate pairs, non-empty
+/// * `merge` - Branch-length solve knobs
+///
+/// ### Returns
+///
+/// The error the first pair fails with.
+fn diverged_round<T: BonsaiFloat>(
+    work: &Working<'_, T>,
+    members: &[u32],
+    pairs: &[(usize, usize)],
+    merge: MergeParams,
+) -> BonsaiErrors {
+    let (a, b) = pairs[0];
+    let mut scratch = PairScratch::new(work.p);
+    match score_pair_raw(work, members, a, b, merge, &mut scratch) {
+        Err(error) => error,
+        Ok(_) => BonsaiErrors::RootFindDiverged {
+            max_iter: 0,
+            last_step: f64::NAN,
+        },
+    }
 }
 
 /// Score every candidate pair and return the best.
@@ -829,14 +947,14 @@ fn score_pair<T: BonsaiFloat>(
 ///
 /// ### Returns
 ///
-/// The best candidate, or [`Candidate::NONE`] if there were no scoreable
+/// The scan, whose best is [`Candidate::NONE`] if there were no scoreable
 /// pairs, or the error the branch-length solve failed with.
 fn scan_pairs<T: BonsaiFloat>(
     work: &Working<'_, T>,
     members: &[u32],
     pairs: &[(usize, usize)],
     merge: MergeParams,
-) -> Result<Candidate, BonsaiErrors> {
+) -> Result<Scan, BonsaiErrors> {
     let p = work.p;
     pairs
         .par_iter()
@@ -844,7 +962,7 @@ fn scan_pairs<T: BonsaiFloat>(
             || PairScratch::new(p),
             |scratch, &(a, b)| score_pair(work, members, a, b, merge, scratch),
         )
-        .try_reduce(|| Candidate::NONE, |x, y| Ok(x.better(y)))
+        .try_reduce(|| Scan::EMPTY, |x, y| Ok(x.merge(y)))
 }
 
 /// Walk a bound-ordered candidate list, stopping once the best is provably
@@ -875,26 +993,26 @@ fn scan_pairs<T: BonsaiFloat>(
 ///
 /// ### Returns
 ///
-/// The best candidate and how many pairs were scored, or the error the
-/// branch-length solve failed with.
+/// The scan and how many pairs were scored, or the error the branch-length
+/// solve failed with.
 fn walk_bounded<T: BonsaiFloat>(
     work: &Working<'_, T>,
     members: &[u32],
     pairs: &[(usize, usize)],
     bounds: &[f64],
     merge: MergeParams,
-) -> Result<(Candidate, usize), BonsaiErrors> {
-    let mut best = Candidate::NONE;
+) -> Result<(Scan, usize), BonsaiErrors> {
+    let mut scan = Scan::EMPTY;
     let mut done = 0usize;
     while done < pairs.len() {
-        if best.gain > bounds[done] {
+        if scan.best.gain > bounds[done] {
             break;
         }
         let end = (done + BOUND_WALK_CHUNK).min(pairs.len());
-        best = best.better(scan_pairs(work, members, &pairs[done..end], merge)?);
+        scan = scan.merge(scan_pairs(work, members, &pairs[done..end], merge)?);
         done = end;
     }
-    Ok((best, done))
+    Ok((scan, done))
 }
 
 /// Score every candidate pair and sample one in proportion to the likelihood of
@@ -935,7 +1053,9 @@ fn sample_pair<T: BonsaiFloat>(
         .par_iter()
         .map_init(
             || PairScratch::new(p),
-            |scratch, &(a, b)| score_pair(work, members, a, b, merge, scratch),
+            |scratch, &(a, b)| {
+                score_pair(work, members, a, b, merge, scratch).map(|scan| scan.best)
+            },
         )
         .collect::<Result<Vec<_>, BonsaiErrors>>()?;
 
@@ -1182,17 +1302,25 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
             // A provider's bounds are ignored under weighted selection, which
             // needs every pair's score to form the softmax and so has nothing
             // to prune with.
-            StarSelection::Greedy => match candidates.bounds() {
-                Some(bounds) if bounds.len() == pairs.len() => {
-                    let (best, done) = walk_bounded(&work, &members, &pairs, bounds, params.merge)?;
-                    scored_last_round = done;
-                    best
+            StarSelection::Greedy => {
+                let (scan, done) = match candidates.bounds() {
+                    Some(bounds) if bounds.len() == pairs.len() => {
+                        walk_bounded(&work, &members, &pairs, bounds, params.merge)?
+                    }
+                    _ => (
+                        scan_pairs(&work, &members, &pairs, params.merge)?,
+                        pairs.len(),
+                    ),
+                };
+                scored_last_round = done;
+                // Every pair the round looked at diverged. Dropping them one by
+                // one is right; coming back with an unresolved star and no
+                // diagnostic is not, so the first pair's error is recovered.
+                if scan.dropped == done && done > 0 {
+                    return Err(diverged_round(&work, &members, &pairs, params.merge));
                 }
-                _ => {
-                    scored_last_round = pairs.len();
-                    scan_pairs(&work, &members, &pairs, params.merge)?
-                }
-            },
+                scan.best
+            }
             StarSelection::Weighted { .. } => {
                 scored_last_round = pairs.len();
                 sample_pair(
@@ -1884,7 +2012,9 @@ mod tests {
                 wc: &wc,
                 p,
             };
-            let best = scan_pairs(&work, &members, &pairs, MergeParams::default()).expect("scan");
+            let best = scan_pairs(&work, &members, &pairs, MergeParams::default())
+                .expect("scan")
+                .best;
 
             let bound = FLOOR_PER_FEATURE * p as f64;
             assert!(
@@ -1898,6 +2028,170 @@ mod tests {
                 DEFAULT_MIN_GAIN
             );
         }
+    }
+
+    /// A star whose feature 0 makes the peel of some or all pairs unscoreable.
+    ///
+    /// With `poison_all` the whole feature carries `f64::MAX`, so the centre's
+    /// precision there is `+inf` and every peel leaves `inf` behind, whose mean
+    /// is `NaN`. Otherwise only members 0 and 1 carry weight in that feature and
+    /// the rest carry `1e-300`, which the centre's sum swallows exactly, so
+    /// peeling that one pair leaves a remainder of exactly zero precision and no
+    /// other pair is affected. Every input is finite and positive, so the star
+    /// passes validation and the pathology is genuinely in the arithmetic.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of members
+    /// * `p` - Number of features
+    /// * `poison_all` - Whether every pair is unscoreable rather than one
+    ///
+    /// ### Returns
+    ///
+    /// The means, the precisions and the branches to the centre.
+    fn poisoned_peel(n: usize, p: usize, poison_all: bool) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut m = Vec::with_capacity(n * p);
+        let mut w = Vec::with_capacity(n * p);
+        for i in 0..n {
+            for g in 0..p {
+                // Well separated, so the root branch of a merge has a positive
+                // bracket and the solve is entered rather than short-circuited.
+                m.push(6.0 * i as f64 + (g as f64 * 0.37).sin());
+                w.push(match (g, poison_all) {
+                    (0, true) => f64::MAX,
+                    (0, false) if i < 2 => 1.0,
+                    (0, false) => 1e-300,
+                    _ => 1.0 + 0.3 * (i as f64 + g as f64).cos(),
+                });
+            }
+        }
+        (m, w, vec![0.0f64; n])
+    }
+
+    #[test]
+    fn test_the_peel_loses_the_remainder_when_one_member_dominates() {
+        // The fixture the doc comment on `peel` asks for (adversarial review
+        // N1). Nothing here is a bug: the peel is a subtraction and this is
+        // what a subtraction does. What the test pins is where the loss starts
+        // and that it is monotone in the dominance, so a change to the
+        // accumulation that moved either would be caught.
+        let (p, n) = (8usize, 6usize);
+        let mut previous = 0.0f64;
+        for (ratio, bound, non_positive) in [
+            (1e9f64, 1e-6f64, false),
+            (1e13, 1e-2, false),
+            (1e15, 1e0, false),
+            (1e16, f64::INFINITY, true),
+        ] {
+            let mut m = Vec::with_capacity(n * p);
+            let mut w = Vec::with_capacity(n * p);
+            for i in 0..n {
+                for g in 0..p {
+                    m.push((i as f64 * 0.7 + g as f64 * 0.13).sin());
+                    w.push(if i == 0 { ratio } else { 1.0 });
+                }
+            }
+            let t0 = vec![0.0f64; n];
+            let members: Vec<u32> = (0..n as u32).collect();
+            let (mut mc, mut wc) = (vec![0.0f64; p], vec![0.0f64; p]);
+            centre_leaf(&m, &w, &t0, &members, p, &mut mc, &mut wc);
+            let work = Working {
+                m: &m,
+                w: &w,
+                branch: &t0,
+                mc: &mc,
+                wc: &wc,
+                p,
+            };
+
+            // Peel the pair holding the dominant member, then re-accumulate the
+            // same remainder exactly and compare.
+            let (mut m_r, mut w_r) = (vec![0.0f64; p], vec![0.0f64; p]);
+            peel(&work, 0, 1, &mut m_r, &mut w_r);
+            let rest: Vec<u32> = (2..n as u32).collect();
+            let (mut m_e, mut w_e) = (vec![0.0f64; p], vec![0.0f64; p]);
+            centre_leaf(&m, &w, &t0, &rest, p, &mut m_e, &mut w_e);
+
+            let mut worst = 0.0f64;
+            let mut seen_non_positive = false;
+            for g in 0..p {
+                seen_non_positive |= w_r[g] <= 0.0;
+                worst = worst.max((m_r[g] - m_e[g]).abs() / m_e[g].abs().max(1e-30));
+            }
+            assert_eq!(
+                seen_non_positive, non_positive,
+                "at a dominance of {ratio:e} the remainder's precision changed sign class"
+            );
+            assert!(
+                worst < bound,
+                "at a dominance of {ratio:e} the remainder's mean was off by {worst:e}"
+            );
+            assert!(
+                worst >= previous,
+                "the loss stopped being monotone in the dominance at {ratio:e}"
+            );
+            previous = worst;
+        }
+    }
+
+    #[test]
+    fn test_one_diverged_pair_does_not_stop_the_star() {
+        // Adversarial review 2026-08-27, N9. A non-finite gain is dropped
+        // because letting it win would stop the whole primitive; a diverged
+        // branch-length solve used to propagate out of the scan's `try_reduce`
+        // and stop the primitive anyway, which is the same outcome by another
+        // route. It is now dropped like any other unscoreable pair.
+        let (p, n) = (5usize, 5usize);
+        let (m, w, t0) = poisoned_peel(n, p, false);
+
+        // The fixture only means anything if that pair really does diverge.
+        let members: Vec<u32> = (0..n as u32).collect();
+        let (mut mc, mut wc) = (vec![0.0f64; p], vec![0.0f64; p]);
+        centre_leaf(&m, &w, &t0, &members, p, &mut mc, &mut wc);
+        let work = Working {
+            m: &m,
+            w: &w,
+            branch: &t0,
+            mc: &mc,
+            wc: &wc,
+            p,
+        };
+        let mut scratch = PairScratch::new(p);
+        assert!(
+            matches!(
+                score_pair_raw(&work, &members, 0, 1, MergeParams::default(), &mut scratch),
+                Err(BonsaiErrors::RootFindDiverged { .. })
+            ),
+            "the fixture no longer diverges on the pair it was built around"
+        );
+        assert!(
+            score_pair_raw(&work, &members, 0, 2, MergeParams::default(), &mut scratch).is_ok(),
+            "the fixture poisoned more than the one pair"
+        );
+
+        let result =
+            resolve_star(star(&m, &w, &t0, p), None).expect("one bad pair stopped the star");
+        assert_eq!(result.centre_children.len(), MIN_CENTRE_MEMBERS);
+        assert_eq!(result.merges.len(), n - MIN_CENTRE_MEMBERS);
+        for merge in &result.merges {
+            assert!(merge.gain.is_finite() && merge.gain > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_a_round_of_nothing_but_diverged_pairs_is_an_error() {
+        // The other half of N9: dropping every pair silently would hand back an
+        // unresolved star and call it success, which is what the blocking B2
+        // fix exists to prevent. The error is recovered from the first pair, so
+        // it is the same error whatever the thread count.
+        let (p, n) = (5usize, 5usize);
+        let (m, w, t0) = poisoned_peel(n, p, true);
+        let out = resolve_star(star(&m, &w, &t0, p), None);
+        assert!(
+            matches!(out, Err(BonsaiErrors::RootFindDiverged { .. })),
+            "a wholly unscoreable round returned {:?}",
+            out.map(|r| r.merges.len())
+        );
     }
 
     #[test]

@@ -24,6 +24,21 @@
 //! * Negative branch lengths are rejected. They are diffusion times here
 //!   (SPEC.md section 1, `t[i]`), and a negative one is nonsense the arena would
 //!   happily carry into the likelihood.
+//! * A lone leaf is refused by the writer. The arena holds one and
+//!   [`crate::tree::cluster`] has a use for it, but the Newick for it is a bare
+//!   label, which this parser and every other one reject; writing something
+//!   nothing can read back is worse than refusing.
+//!
+//! ### Empty labels, and the trailing comma
+//!
+//! Strict Newick permits an empty label, so `"(a,b,);"` is a legal
+//! **three**-leaf tree whose third leaf is unnamed, and `"(,,,);"` is a legal
+//! four-leaf one. This parser follows the standard and reads them that way.
+//! The cost is that a trailing-comma typo is a silently wrong topology rather
+//! than an error, and nothing can distinguish the two; the alternative, banning
+//! empty labels, would reject valid files that carry their names elsewhere.
+//! Noted rather than fixed, and pinned by
+//! `test_a_trailing_comma_is_an_unnamed_leaf`.
 
 use std::fmt::Write as _;
 
@@ -76,7 +91,8 @@ const MAX_NODES: usize = NO_NODE as usize;
 /// ### Returns
 ///
 /// The Newick string, semicolon terminated, or `MalformedTree` if the label
-/// count does not match the leaf count.
+/// count does not match the leaf count, or if the tree is a lone leaf, which
+/// has no Newick form the reader will take back.
 pub fn write_newick<S: AsRef<str>>(tree: &Tree, leaf_labels: &[S]) -> Result<String, BonsaiErrors> {
     write_newick_labelled::<S, S>(tree, leaf_labels, None)
 }
@@ -97,7 +113,8 @@ pub fn write_newick<S: AsRef<str>>(tree: &Tree, leaf_labels: &[S]) -> Result<Str
 /// ### Returns
 ///
 /// The Newick string, semicolon terminated, or `MalformedTree` if either label
-/// count does not match the arena.
+/// count does not match the arena, or if the tree is a lone leaf, which has no
+/// Newick form the reader will take back.
 pub fn write_newick_labelled<S: AsRef<str>, T: AsRef<str>>(
     tree: &Tree,
     leaf_labels: &[S],
@@ -105,6 +122,19 @@ pub fn write_newick_labelled<S: AsRef<str>, T: AsRef<str>>(
 ) -> Result<String, BonsaiErrors> {
     let n_leaves = tree.n_leaves();
     let n_internal = tree.n_nodes() - n_leaves;
+    // The arena holds a lone leaf, deliberately, because `tree::cluster` has a
+    // use for one. Newick cannot: the string for it is a bare label, which
+    // `parse_newick` rejects as not a tree and which no other reader treats as
+    // one either. Refusing to write it is what keeps the writer and the reader
+    // agreed on what a tree is (adversarial review N15); the alternative would
+    // be a parser that accepts `";"`.
+    if n_leaves < 2 {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!(
+                "a tree of {n_leaves} leaf/leaves has no Newick form; at least two are needed"
+            ),
+        });
+    }
     if leaf_labels.len() != n_leaves {
         return Err(BonsaiErrors::MalformedTree {
             reason: format!(
@@ -715,6 +745,29 @@ mod tests {
     // -- round trips --
 
     #[test]
+    fn test_the_writer_refuses_the_one_tree_the_reader_will_not_take_back() {
+        // Adversarial review 2026-08-27, N15. The arena holds a lone leaf and
+        // `tree::cluster` relies on that, but Newick has no form for one: the
+        // writer emitted `"only;"` and the reader rejected it, so the two
+        // disagreed about what a tree is. The writer now refuses instead.
+        let tree = Tree::from_parents(vec![NO_NODE], vec![0.0], 1).expect("one leaf is an arena");
+        assert!(
+            matches!(
+                write_newick(&tree, &["only"]),
+                Err(BonsaiErrors::MalformedTree { .. })
+            ),
+            "a lone leaf was written out"
+        );
+        assert!(
+            parse_newick("only;").is_err(),
+            "the reader started accepting a bare label, so the writer should too"
+        );
+        // Two leaves is the smallest tree, and it does round trip.
+        let pair = Tree::from_parents(vec![2, 2, NO_NODE], vec![0.3, 0.4, 0.0], 2).expect("pair");
+        assert_round_trip(&pair, &labels(2));
+    }
+
+    #[test]
     fn test_round_trip_balanced_binary() {
         let tree = Tree::balanced_binary(8, 0.25).expect("a valid fixture");
         assert_round_trip(&tree, &labels(8));
@@ -829,6 +882,21 @@ mod tests {
         let (tree, names) = parse_newick("(A:1,B:1,C:1,D:1);").expect("valid Newick");
         assert_eq!(names.len(), 4);
         assert_eq!(tree.n_nodes(), 5);
+        assert_eq!(tree.children(tree.root()).len(), 4);
+    }
+
+    #[test]
+    fn test_a_trailing_comma_is_an_unnamed_leaf() {
+        // Adversarial review 2026-08-27, N15. Deliberate and standard, but it
+        // means a typo is a wrong topology rather than an error, so it is
+        // pinned here rather than left to be rediscovered.
+        let (tree, names) = parse_newick("(a,b,);").expect("valid Newick");
+        assert_eq!(names, vec!["a", "b", ""]);
+        assert_eq!(tree.children(tree.root()).len(), 3);
+
+        let (tree, names) = parse_newick("(,,,);").expect("valid Newick");
+        assert_eq!(names.len(), 4);
+        assert!(names.iter().all(|s| s.is_empty()));
         assert_eq!(tree.children(tree.root()).len(), 4);
     }
 

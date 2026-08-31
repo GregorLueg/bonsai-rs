@@ -137,15 +137,17 @@ pub struct PolytomyResult {
     pub tree: Tree,
     /// Total loglikelihood gain over the input tree, in nats.
     pub gain: f64,
-    /// Number of polytomies the input tree had.
+    /// Number of polytomies the input tree had, once its zero-length internal
+    /// edges were collapsed into their parents.
     pub n_polytomies: usize,
     /// Number of resolutions that changed the tree.
     ///
-    /// A resolution only ever lowers its centre's degree and the ancestors it
-    /// creates are binary, so no node becomes a polytomy that was not one
-    /// already. This exceeding `n_polytomies` therefore means some node had to
-    /// be revisited after a neighbour moved, which is exactly the case a single
-    /// pass would miss.
+    /// Routinely larger than `n_polytomies`, and not a sign of anything wrong: a
+    /// resolution that leaves its new ancestor at zero distance from its centre
+    /// is collapsed at the top of the next sweep and makes a polytomy that was
+    /// not in the entry count. Within one sweep no node becomes a polytomy that
+    /// was not one already, since a resolution only lowers its own centre's
+    /// degree and the ancestors it creates are binary.
     pub n_resolved: usize,
     /// Number of sweeps over the tree, the last of which found nothing.
     pub sweeps: usize,
@@ -447,6 +449,75 @@ fn rebuild(
 // Step 3: the polytomies //
 ////////////////////////////
 
+/// Collapse every zero-length internal edge into the node above it.
+///
+/// The polytomies SPEC.md section 9.2 goes looking for are not structural when
+/// they are made: the merge scan solves a branch length to zero and the arena
+/// still holds two separate nodes joined by an edge of length zero. A
+/// zero-length edge puts its two ends at the same point, so deleting the lower
+/// one and hanging its children off the upper one leaves the loglikelihood
+/// exactly unchanged and gives the upper node the degree the model says it
+/// already has. Without this, [`count_polytomies`] finds nothing on a tree the
+/// greedy merge has left structurally binary, which is the ordinary case, and
+/// step 3 of the search does nothing at all.
+///
+/// ### Exactly zero, not a tolerance
+///
+/// The two places a branch reaches zero are the early return in
+/// [`crate::model::branch::optimise_edge`], which fires when the two effective
+/// leaves already sit closer than their own error bars allow, and the ends of
+/// the split bracket in [`crate::model::merge`]. Both return a literal `0.0`;
+/// the split solve was changed to do so on 2026-08-31 (adversarial review N10,
+/// where it returned `1e-12 * total` instead) precisely so that this test can
+/// be exact. A tolerance would need a scale to be relative to, and nothing in
+/// SPEC.md fixes one: a branch that is merely short is a claim the model is
+/// entitled to make, and collapsing it would be editing the answer.
+///
+/// ### Params
+///
+/// * `tree` - Tree to collapse; not modified
+///
+/// ### Returns
+///
+/// The collapsed tree, or `None` if there was no zero-length internal edge, or
+/// the error the arena rejected the rebuild with.
+fn collapse_zero_edges(tree: &Tree) -> Result<Option<Tree>, BonsaiErrors> {
+    let n = tree.n_nodes();
+    let n_leaves = tree.n_leaves();
+    let root = tree.root();
+
+    // A leaf is never collapsed, whatever its branch length: it carries an
+    // observation and has nowhere to put it. The root has no upstream branch.
+    let drop: Vec<bool> = (0..n)
+        .map(|i| i >= n_leaves && i as u32 != root && tree.branch(i as u32) == 0.0)
+        .collect();
+    if !drop.iter().any(|&d| d) {
+        return Ok(None);
+    }
+
+    let mut parent = vec![NO_NODE; n];
+    let mut branch = vec![0.0f64; n];
+    for i in 0..n {
+        if drop[i] {
+            // Left unreachable from the root, which is how `rebuild` drops it.
+            continue;
+        }
+        // A chain of zero-length edges collapses onto the node above the whole
+        // chain, so walk past every dropped ancestor rather than just one.
+        let mut up = tree.parent(i as u32);
+        while let Some(par) = up {
+            if !drop[par as usize] {
+                break;
+            }
+            up = tree.parent(par);
+        }
+        parent[i] = up.unwrap_or(NO_NODE);
+        branch[i] = tree.branch(i as u32);
+    }
+
+    rebuild(&parent, &branch, root, n_leaves).map(Some)
+}
+
 /// Resolve every polytomy in a tree (SPEC.md section 9.2).
 ///
 /// Merging creates zero-length branches, which collapse into polytomies. A
@@ -454,6 +525,11 @@ fn rebuild(
 /// optimal when it was made; by the time the root has moved it often is not, so
 /// the star primitive is run again on every node carrying more members than it
 /// stops at.
+///
+/// The collapse is [`collapse_zero_edges`] and it runs at the top of every
+/// sweep, because it is what makes the polytomies structural: a merge that put
+/// its new ancestor at zero distance from the centre leaves two nodes where the
+/// model has one, and nothing downstream of here would ever notice.
 ///
 /// ### Order
 ///
@@ -470,24 +546,36 @@ fn rebuild(
 ///
 /// A fixed point, because a resolution changes the up-state of every node in
 /// the tree and a centre that had nothing to gain earlier could have something
-/// to gain later. Termination is not an assumption: a resolution strictly
-/// lowers its centre's degree and every ancestor it creates is binary, so no
-/// node ever becomes a polytomy that was not one already, and the total excess
-/// degree of the tree is a non-negative integer that strictly falls with every
-/// accepted resolution. The sweep restarts after each one because
-/// [`Tree::from_parents`] renumbers the internal nodes and a cursor into the
-/// old numbering means nothing.
+/// to gain later. Termination rests on the loglikelihood rather than on the
+/// degrees: every accepted resolution raises it by more than the primitive's
+/// `min_gain`, the collapse leaves it exactly alone, and it is bounded above by
+/// the best of finitely many topologies. The degree argument that used to sit
+/// here is no longer available, because the collapse can hand a node a degree
+/// it did not have before. What it does bound is a single sweep: a resolution
+/// only lowers its own centre's degree and every ancestor it creates is binary.
+/// The sweep restarts after each one because [`Tree::from_parents`] renumbers
+/// the internal nodes and a cursor into the old numbering means nothing.
 ///
-/// **On these fixtures one pass would have done.** Measured 2026-08-31 over
-/// eighteen runs at 64 leaves and 128 features, on trees made by collapsing the
-/// short internal edges of a simulated tree at three thresholds, up to and
-/// including collapsing every edge into one giant star: `n_resolved` equalled
-/// `n_polytomies` every time, no residual polytomy was left, and the last sweep
-/// always found nothing. So every centre was fully resolved the first time it
-/// was visited and no node needed revisiting. `n_resolved` exceeding
-/// `n_polytomies` in a result is the signal that a fixture has been found where
-/// that is not true; it has not been seen yet, and the loop is here because
-/// there is no argument that it cannot be.
+/// **One pass is not enough, and the collapse is why.** Measured 2026-08-31
+/// over eighteen runs at 64 leaves and 128 features, on trees made by
+/// collapsing the short internal edges of a simulated tree at three thresholds,
+/// up to and including collapsing every edge into one giant star. Against the
+/// same runs with the collapse done once on entry rather than every sweep:
+///
+/// | | entry only | every sweep |
+/// |---|---|---|
+/// | resolutions | 8 to 13 | 28 to 45 |
+/// | gain over the input, nats | 757 to 7316 | 2868 to 7316 |
+/// | total Robinson-Foulds to the truth over the eighteen | 130 | 106 |
+///
+/// A resolution that puts its new ancestor at zero distance from its centre has
+/// made another polytomy, and re-resolving it against the moved centre is worth
+/// two to four times the loglikelihood of stopping there. It costs four to five
+/// times as many resolutions, and a resolution is a sweep, so this is the
+/// expensive half of step 3. Structural recovery follows the loglikelihood on
+/// aggregate but not run by run: at the mildest collapse threshold two of six
+/// seeds came out with a worse Robinson-Foulds despite a four-fold larger gain,
+/// which is the data's noise rather than the search's doing.
 ///
 /// ### Params
 ///
@@ -505,14 +593,23 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
     params: Option<StarParams>,
 ) -> Result<PolytomyResult, BonsaiErrors> {
     let p = leaves.n_features;
-    let n_polytomies = count_polytomies(tree);
-    let mut tree = tree.clone();
+    let mut tree = match collapse_zero_edges(tree)? {
+        Some(collapsed) => collapsed,
+        None => tree.clone(),
+    };
+    let n_polytomies = count_polytomies(&tree);
     let mut gain = 0.0f64;
     let mut n_resolved = 0usize;
     let mut sweeps = 0usize;
 
     loop {
         sweeps += 1;
+        // A no-op on the first sweep, since the entry tree was collapsed above.
+        // Later sweeps need it because a resolution can itself place an
+        // ancestor at zero distance from its centre.
+        if let Some(collapsed) = collapse_zero_edges(&tree)? {
+            tree = collapsed;
+        }
         let mut down = NodeState::new(tree.n_nodes(), p, leaves.means, leaves.precisions)?;
         down.prune(&tree);
         let mut up = UpState::new(tree.n_nodes(), p);
@@ -668,6 +765,25 @@ mod tests {
         let mut parent = vec![n_leaves as u32; n_leaves + 1];
         parent[n_leaves] = NO_NODE;
         Tree::from_parents(parent, vec![branch; n_leaves + 1], n_leaves).expect("star tree")
+    }
+
+    /// Count the internal edges of exactly zero length.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - The tree
+    ///
+    /// ### Returns
+    ///
+    /// The count, the root and the leaves excluded.
+    fn zero_internal_edges(tree: &Tree) -> usize {
+        (0..tree.n_nodes())
+            .filter(|&i| {
+                i >= tree.n_leaves()
+                    && tree.parent(i as u32).is_some()
+                    && tree.branch(i as u32) == 0.0
+            })
+            .count()
     }
 
     /// Collapse every internal edge shorter than a threshold, making
@@ -968,6 +1084,103 @@ mod tests {
         assert_eq!(out.sweeps, 1);
         assert_eq!(out.gain, 0.0);
         assert_eq!(splits(&out.tree), splits(&tree));
+    }
+
+    #[test]
+    fn test_collapsing_a_zero_length_edge_leaves_the_loglikelihood_alone() {
+        // The collapse is only allowed to change the arena, never the model. A
+        // zero-length edge puts its two ends at the same point, so deleting the
+        // lower end and reattaching its children one level up has to leave the
+        // loglikelihood where it was, which is also the proof that the rewiring
+        // is structurally right.
+        let (p, n) = (32usize, 32usize);
+        let (mut tree, m, w) = dataset(n, p, 13);
+        let leaves = Leaves {
+            means: &m,
+            precisions: &w,
+            n_features: p,
+        };
+
+        // A deep internal node, so the collapse has a real parent to fold into.
+        let victim = tree
+            .internal_postorder()
+            .find(|&node| tree.parent(node).is_some_and(|par| par != tree.root()))
+            .expect("no internal node with an internal parent");
+        let parent = tree.parent(victim).expect("victim has a parent");
+        let degree_before = tree.children(parent).len();
+        let kids = tree.children(victim).len();
+        tree.branches_mut()[victim as usize] = 0.0;
+        let before = loglik(&tree, leaves);
+
+        let collapsed = collapse_zero_edges(&tree)
+            .expect("collapse")
+            .expect("the zero-length edge was not found");
+        let after = loglik(&collapsed, leaves);
+
+        assert_eq!(collapsed.n_nodes(), tree.n_nodes() - 1);
+        assert_eq!(collapsed.n_leaves(), tree.n_leaves());
+        assert_relative_eq!(after, before, max_relative = 1e-14);
+        // The parent inherited the collapsed node's children in place of it.
+        assert!(
+            collapsed
+                .internal_postorder()
+                .any(|node| collapsed.children(node).len() == degree_before + kids - 1),
+            "no node picked up the collapsed node's children"
+        );
+        assert!(count_polytomies(&collapsed) > count_polytomies(&tree));
+    }
+
+    #[test]
+    fn test_the_merge_scans_zero_length_branches_are_the_polytomies_step_three_resolves() {
+        // Adversarial review 2026-08-31. Step 2 leaves a structurally binary
+        // tree whose zero-length internal edges are polytomies in everything
+        // but the arena, and step 3 counted degrees only and so did nothing at
+        // all on it. This is the pipeline's own step 2 followed by its step 3.
+        use crate::search::star::{Star, star_tree};
+        let (p, n) = (64usize, 128usize);
+        let (_, m, w) = dataset(n, p, 21);
+        let leaves = Leaves {
+            means: &m,
+            precisions: &w,
+            n_features: p,
+        };
+        let (merged, _) = star_tree(
+            Star {
+                means: &m,
+                precisions: &w,
+                branch: &vec![1.0f64; n],
+                n_features: p,
+            },
+            None,
+        )
+        .expect("star tree");
+
+        let zeros = zero_internal_edges(&merged);
+        assert!(
+            zeros > 0,
+            "the merge scan left no zero-length internal edge"
+        );
+        assert_eq!(
+            count_polytomies(&merged),
+            0,
+            "the fixture is already a structural polytomy and proves nothing"
+        );
+
+        let out = resolve_polytomies(&merged, leaves, None).expect("resolve");
+        assert!(
+            out.n_polytomies > 0,
+            "step 3 saw no polytomy in a tree with {zeros} zero-length internal edges"
+        );
+        assert!(
+            out.n_resolved > 0 && out.gain > 0.0,
+            "step 3 gained nothing"
+        );
+        assert!(loglik(&out.tree, leaves) > loglik(&merged, leaves));
+
+        // The last sweep collapses before it scans, so nothing that reads the
+        // result can find a zero-length internal edge left in it.
+        let left = zero_internal_edges(&out.tree);
+        assert_eq!(left, 0, "{left} zero-length internal edges survived step 3");
     }
 
     #[test]

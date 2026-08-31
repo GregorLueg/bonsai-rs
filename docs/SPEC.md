@@ -312,7 +312,7 @@ detached the tree is just `k - a - l`, so this is exactly section 6 with
 `T` fixes the `k`-to-`l` distance and is not revisited later in the iteration.
 
 **Stage 2.** Optimise all three, constrained to `t_ak + t_al = T`. Two free
-parameters: `u = t_ak` in `(0, T)` and `t_ar >= 0`. Analytic gradient via
+parameters: `u = t_ak` in `[0, T]` and `t_ar >= 0`. Analytic gradient via
 
 ```
 d(diffusion(W,t))/dt = -diffusion(W,t)^2
@@ -325,11 +325,18 @@ two-dimensional Newton, because each half is then a bracketed one-dimensional
 solve reusing machinery that already exists, and no Hessian is needed. Holding
 `u` fixed collapses `k` and `l` into one effective leaf at the ancestor, so
 `t_ar` is an ordinary edge solve (section 6). Holding `t_ar` fixed leaves a
-bracketed solve on `(0, T)` for the split, driven by the sign of `d(dL)/du`.
+bracketed solve on `[0, T]` for the split, driven by the sign of `d(dL)/du`.
 
-Two sweeps reach the fixed point exactly and further sweeps change nothing;
-one sweep is measurably short. Stage 2 is not cosmetic: it roughly triples the
-gain over the unrefined half-and-half split.
+Two sweeps is the default. One sweep is measurably short; two agree with twenty
+to the bit on almost every fixture, but the coordinate descent converges slowly
+where the split and the root branch are strongly coupled, and the shortfall
+there reaches `5e-3` relative in the gain. The numbers are on `MergeParams`.
+Stage 2 is not cosmetic: it roughly triples the gain over the unrefined
+half-and-half split.
+
+The split's bracket is closed, not open: an optimum at an end has to come back
+as exactly `0` or exactly `T`, because section 9.2 keys polytomy resolution on
+zero-length branches.
 
 **Cost note.** Stage 2 is the dominant term in a merge scan, so the solve that
 drives it must not compute anything it does not read. In particular the split
@@ -368,6 +375,16 @@ zero-length edge does not change the likelihood, so the configuration was optima
 when it was created, but the root moves as the search proceeds and it often stops
 being optimal. So: walk every node with more than two children and run the star
 primitive on it.
+
+**The collapse has to be done, not assumed.** A zero-length branch leaves two
+separate nodes in the arena, so a degree test alone finds nothing on a tree the
+merge scan has left structurally binary, which is the ordinary case: step 3 then
+does nothing at all. `search::polytomy` deletes every internal node whose
+upstream branch is exactly zero and reattaches its children to the node above,
+which leaves the loglikelihood untouched, before it counts degrees. The test is
+exact rather than a tolerance, which is why section 8.4's split bracket has to
+be closed. It runs at the top of every sweep, since a resolution can itself
+place an ancestor at zero distance from its centre.
 
 ### 9.3 SPR (SI.C.5)
 
@@ -639,7 +656,9 @@ nothing above a few hundred members is checkable this way, and the claim that
 - **Loglikelihood, not twice it.** The reference works throughout in `2*L`, and
   every acceptance threshold in the paper is stated in those units. This crate
   works in `L`. Any threshold transcribed from the paper must be halved. This is
-  asserted in a test.
+  asserted in `model::likelihood`'s
+  `test_the_loglikelihood_is_l_and_not_twice_it`, which transcribes S20 with its
+  factor of one half and checks the recursion against it.
 - **Additive constant.** Sections 3.1 and 3.2 drop terms that are constant across
   topologies. Absolute loglikelihoods are therefore not comparable to the
   reference implementation's; differences are.
@@ -683,7 +702,9 @@ tests: draw `v[g]` exponential with mean 2, draw a per-cell `t_c` log-uniform on
   on the tree loglikelihood, at several `(n, p)`.
 - **Analytic gradients**: section 6's `L'(t)`, and both partials of section 10.2,
   against central differences.
-- **Root independence** (S14): reroot and rescore, expect equality.
+- **Root independence** (S14): reroot and rescore, expect equality. Asserted in
+  `model::likelihood`'s `test_the_loglikelihood_is_the_same_at_every_rooting`,
+  over every edge of four topologies.
 - **Effective-leaf equivalence** (S19): scoring a tree with a subtree summarised
   equals scoring it unsummarised.
 - **Monotonicity**: loglikelihood never decreases across steps 1 to 7.

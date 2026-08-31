@@ -99,6 +99,19 @@ pub enum BonsaiErrors {
         cap: f64,
     },
 
+    /// A caller-supplied parameter was outside its valid range.
+    ///
+    /// Distinct from `MalformedTree`: the tree is fine, the knob is not.
+    #[error("Parameter '{name}' has invalid value {value}. {expected}")]
+    BadParameter {
+        /// Field name, as the caller wrote it
+        name: &'static str,
+        /// Offending value
+        value: f64,
+        /// What would have been acceptable
+        expected: &'static str,
+    },
+
     // -- tree structure --
     /// A node index was outside the arena.
     #[error("Node index {index} is out of range for a tree with {n_nodes} nodes.")]

@@ -219,6 +219,11 @@ impl Layout {
     /// overflowed above `1.3e154`, collapsed the scale to zero and sent the
     /// furthest points to the origin. Hence `hypot`.
     ///
+    /// Unlike the layout functions this takes no `Result`, so it cannot reject
+    /// a nonsensical parameter the way [`check_params`] does for them: a
+    /// non-finite `hyperbolic_origin` or `hyperbolic_zoom` gives non-finite
+    /// coordinates back rather than an error.
+    ///
     /// ### Params
     ///
     /// * `params` - Supplies `hyperbolic_origin` and `hyperbolic_zoom`; `None`
@@ -259,6 +264,58 @@ impl Layout {
 //////////////////////
 // Shared machinery //
 //////////////////////
+
+/// Reject layout parameters that cannot be drawn with.
+///
+/// The whole bundle is checked wherever any of it is read: it is one struct,
+/// and a caller who has put a `NaN` in one field has a bug whichever function
+/// happens to read it. Without this, `dendrogram` with a non-finite
+/// `leaf_spacing` returns a layout of `NaN` coordinates and reports success
+/// (adversarial review N15).
+///
+/// [`Layout::hyperbolic`] is the one entry point this cannot serve, because it
+/// returns a [`Layout`] rather than a `Result`; its own docs say what a
+/// non-finite origin or zoom does.
+///
+/// ### Params
+///
+/// * `params` - Parameters to check
+///
+/// ### Returns
+///
+/// Nothing, or `BadParameter` naming the offending field.
+fn check_params(params: &LayoutParams) -> Result<(), BonsaiErrors> {
+    let bad = |name: &'static str, value: f64| BonsaiErrors::BadParameter {
+        name,
+        value,
+        expected: "a finite value in the field's documented range",
+    };
+    if !params.leaf_spacing.is_finite() || params.leaf_spacing <= 0.0 {
+        return Err(bad("leaf_spacing", params.leaf_spacing));
+    }
+    if !params.start_angle.is_finite() {
+        return Err(bad("start_angle", params.start_angle));
+    }
+    if !params.daylight_angle_tol.is_finite() || params.daylight_angle_tol < 0.0 {
+        return Err(bad("daylight_angle_tol", params.daylight_angle_tol));
+    }
+    if !params.daylight_damping.is_finite()
+        || params.daylight_damping <= 0.0
+        || params.daylight_damping > 1.0
+    {
+        return Err(bad("daylight_damping", params.daylight_damping));
+    }
+    if !params.hyperbolic_origin.0.is_finite() {
+        return Err(bad("hyperbolic_origin.0", params.hyperbolic_origin.0));
+    }
+    if !params.hyperbolic_origin.1.is_finite() {
+        return Err(bad("hyperbolic_origin.1", params.hyperbolic_origin.1));
+    }
+    if !params.hyperbolic_zoom.is_finite() || params.hyperbolic_zoom <= 0.0 {
+        return Err(bad("hyperbolic_zoom", params.hyperbolic_zoom));
+    }
+    Ok(())
+}
 
 /// Reject branch lengths a layout cannot draw.
 ///
@@ -430,10 +487,12 @@ fn wrap_pi(a: f64) -> f64 {
 ///
 /// ### Returns
 ///
-/// The coordinates, or `MalformedTree` if a branch length cannot be drawn.
+/// The coordinates, or `MalformedTree` if a branch length or a layout
+/// parameter cannot be drawn with.
 pub fn dendrogram(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, BonsaiErrors> {
     check_branches(tree)?;
     let p = params.unwrap_or_default();
+    check_params(&p)?;
     let n = tree.n_nodes();
     let counts = leaf_counts(tree);
 
@@ -503,13 +562,26 @@ pub fn dendrogram(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, B
 ///
 /// The reason this is the default for large trees is that sibling subtrees are
 /// confined to disjoint angular wedges seen from their parent, so no two edges
-/// can cross. Be precise about that guarantee, because it is not quite
+/// can cross. Be precise about that guarantee, because it is not
 /// unconditional: the containment argument needs each wedge to be a convex
-/// cone, which holds when the wedge is at most `pi` wide. A wedge is never
-/// wider than its parent's and the root owns `2*pi`, so a wedge above `pi` can
-/// only appear along a chain from the root whose leaf counts are extremely
-/// lopsided. Nothing tried here produces one that crosses, ladders and random
-/// trees with branch lengths spread over a factor of forty included, and
+/// cone, which holds when the wedge is at most `pi` wide, and a node's wedge is
+/// `2*pi` times its share of the leaves.
+///
+/// **Wedges above `pi` are ordinary, not exotic.** Any node holding more than
+/// half the leaves has one, so a caterpillar has one on every rung of its
+/// upper half: measured 2026-08-31 on [`Tree::ladder`], 3 of the 14 non-root
+/// nodes at 8 leaves, 15 of 62 at 32, 63 of 254 at 128. A balanced tree has
+/// none at any size. An earlier version of this comment said such a wedge
+/// needed leaf counts that were extremely lopsided, which is wrong about
+/// exactly the shape SPEC.md calls biologically typical (adversarial review
+/// N15). So the convex-cone argument covers a balanced tree and does not cover
+/// half the internal nodes of a caterpillar.
+///
+/// What has never been produced is an actual crossing. Ladders, balanced trees
+/// and random trees up to 120 leaves with branch lengths spread over a factor
+/// of forty all come back clean, which is what
+/// `test_equal_angle_never_crosses_edges` runs, and the adversarial review's
+/// own sweep of four thousand random trees found none either.
 /// [`has_edge_crossing`] settles it exactly wherever it matters.
 ///
 /// Unlike [`dendrogram`], both axes carry meaning here: the Euclidean distance
@@ -523,10 +595,12 @@ pub fn dendrogram(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, B
 ///
 /// ### Returns
 ///
-/// The coordinates, or `MalformedTree` if a branch length cannot be drawn.
+/// The coordinates, or `MalformedTree` if a branch length or a layout
+/// parameter cannot be drawn with.
 pub fn equal_angle(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, BonsaiErrors> {
     check_branches(tree)?;
     let p = params.unwrap_or_default();
+    check_params(&p)?;
     let n = tree.n_nodes();
     let counts = leaf_counts(tree);
 
@@ -1003,7 +1077,8 @@ fn daylight_discrepancy(
 /// ### Returns
 ///
 /// The coordinates and a [`DaylightReport`] saying what happened, or
-/// `MalformedTree` if a branch length cannot be drawn.
+/// `MalformedTree` if a branch length or a layout parameter cannot be drawn
+/// with.
 pub fn equal_daylight(
     tree: &Tree,
     params: Option<LayoutParams>,
@@ -1822,6 +1897,80 @@ mod tests {
         assert!(
             (0..disk.n_nodes()).all(|i| disk.x[i].hypot(disk.y[i]) < 1.0),
             "a node escaped the unit disk"
+        );
+    }
+
+    #[test]
+    fn test_rejects_layout_parameters_that_cannot_be_drawn_with() {
+        // Adversarial review 2026-08-31, N15. A non-finite `leaf_spacing`
+        // produced a whole layout of `NaN` and reported success, because
+        // nothing validated `LayoutParams` at all.
+        let tree = Tree::balanced_binary(4, 1.0).expect("balanced");
+        let bad = [
+            LayoutParams {
+                leaf_spacing: f64::INFINITY,
+                ..Default::default()
+            },
+            LayoutParams {
+                leaf_spacing: 0.0,
+                ..Default::default()
+            },
+            LayoutParams {
+                start_angle: f64::NAN,
+                ..Default::default()
+            },
+            LayoutParams {
+                daylight_damping: 0.0,
+                ..Default::default()
+            },
+            LayoutParams {
+                daylight_angle_tol: f64::NAN,
+                ..Default::default()
+            },
+            LayoutParams {
+                hyperbolic_zoom: f64::INFINITY,
+                ..Default::default()
+            },
+            LayoutParams {
+                hyperbolic_origin: (0.0, f64::NAN),
+                ..Default::default()
+            },
+        ];
+        for params in bad {
+            assert!(
+                matches!(
+                    dendrogram(&tree, Some(params)),
+                    Err(BonsaiErrors::BadParameter { .. })
+                ),
+                "dendrogram accepted {params:?}"
+            );
+            assert!(
+                matches!(
+                    equal_angle(&tree, Some(params)),
+                    Err(BonsaiErrors::BadParameter { .. })
+                ),
+                "equal_angle accepted {params:?}"
+            );
+            assert!(
+                matches!(
+                    equal_daylight(&tree, Some(params)),
+                    Err(BonsaiErrors::BadParameter { .. })
+                ),
+                "equal_daylight accepted {params:?}"
+            );
+        }
+        // The defaults, and a plausible non-default, still go through.
+        assert!(dendrogram(&tree, None).is_ok());
+        assert!(
+            dendrogram(
+                &tree,
+                Some(LayoutParams {
+                    leaf_spacing: 2.5,
+                    start_angle: 0.3,
+                    ..Default::default()
+                })
+            )
+            .is_ok()
         );
     }
 

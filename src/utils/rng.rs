@@ -30,6 +30,12 @@ const SPLITMIX_MIX_B: u64 = 0x94D0_49BB_1331_11EB;
 /// Mantissa bits used when turning a `u64` into a double in `[0, 1)`.
 const MANTISSA_BITS: u32 = 53;
 
+/// Mantissa bits used for the open interval `(0, 1)`.
+///
+/// One fewer, so that the half-bit offset that opens the upper end is still
+/// representable; see [`SplitMix64::uniform_nonzero`].
+const OPEN_MANTISSA_BITS: u32 = 52;
+
 //////////////
 // The PRNG //
 //////////////
@@ -85,18 +91,29 @@ impl SplitMix64 {
         bits as f64 / (1u64 << MANTISSA_BITS) as f64
     }
 
-    /// Draw a uniform on the half-open interval `(0, 1]`.
+    /// Draw a uniform on the open interval `(0, 1)`.
     ///
     /// Needed wherever a logarithm is taken of the variate, which is both
     /// Box-Muller and the exponential inverse transform.
     ///
+    /// One bit shorter than [`SplitMix64::uniform`], and offset by half a bit,
+    /// which is what keeps both ends open. `(bits + 1) / 2^53` is exactly `1.0`
+    /// on the largest of the `2^53` mantissas, whose logarithm is zero, and an
+    /// exponential of exactly zero is a variance of zero that the simulator
+    /// divides by (adversarial review N14). Half a bit does not fix that at 53:
+    /// the spacing just below `2^53` is `1`, so `2^53 - 0.5` rounds straight
+    /// back up to `2^53`. At 52 it is `0.5`, the offset survives, and the
+    /// extreme draws are `2^-53` and `1 - 2^-53`. One draw in `2^53` either way,
+    /// so this was never reachable in practice; it is fixed because the
+    /// alternative is a documented guarantee that is not one.
+    ///
     /// ### Returns
     ///
-    /// The variate, never zero.
+    /// The variate, never zero and never one.
     #[inline]
     pub(crate) fn uniform_nonzero(&mut self) -> f64 {
-        let bits = self.next_u64() >> (64 - MANTISSA_BITS);
-        (bits as f64 + 1.0) / (1u64 << MANTISSA_BITS) as f64
+        let bits = self.next_u64() >> (64 - OPEN_MANTISSA_BITS);
+        (bits as f64 + 0.5) / (1u64 << OPEN_MANTISSA_BITS) as f64
     }
 
     /// Draw a standard normal variate by Box-Muller.
@@ -195,4 +212,94 @@ impl SplitMix64 {
 #[inline]
 pub fn splitmix64_at(index: u64) -> f64 {
     SplitMix64::new(index).uniform()
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Invert `y = x ^ (x >> s)`.
+    ///
+    /// ### Params
+    ///
+    /// * `y` - The xor-shifted value
+    /// * `s` - Shift it was made with
+    ///
+    /// ### Returns
+    ///
+    /// The `x` that produces `y`.
+    fn unxorshift(y: u64, s: u32) -> u64 {
+        let mut x = y;
+        let mut done = s;
+        while done < 64 {
+            x = y ^ (x >> s);
+            done += s;
+        }
+        x
+    }
+
+    /// Multiplicative inverse modulo `2^64`, by Newton iteration.
+    ///
+    /// ### Params
+    ///
+    /// * `a` - An odd multiplier
+    ///
+    /// ### Returns
+    ///
+    /// The `b` with `a * b == 1` in wrapping arithmetic.
+    fn inverse(a: u64) -> u64 {
+        let mut x = 1u64;
+        for _ in 0..6 {
+            x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        }
+        x
+    }
+
+    /// The seed whose first raw draw is a given word.
+    ///
+    /// Splitmix64's mixing is a bijection, so the corners of the mantissa are
+    /// reachable by inverting it rather than by searching for a seed.
+    ///
+    /// ### Params
+    ///
+    /// * `out` - Wanted first draw
+    ///
+    /// ### Returns
+    ///
+    /// The seed.
+    fn seed_for(out: u64) -> u64 {
+        let mut z = unxorshift(out, 31);
+        z = z.wrapping_mul(inverse(SPLITMIX_MIX_B));
+        z = unxorshift(z, 27);
+        z = z.wrapping_mul(inverse(SPLITMIX_MIX_A));
+        z = unxorshift(z, 30);
+        z.wrapping_sub(SPLITMIX_GAMMA)
+    }
+
+    #[test]
+    fn test_the_open_uniform_never_reaches_either_end() {
+        // Adversarial review 2026-08-27, N14. `(bits + 1) / 2^53` is exactly
+        // `1.0` on the largest of the `2^53` mantissas, and `ln(1) == 0` makes
+        // `exponential` return zero from a routine documented as strictly
+        // positive. The simulator then divides by the square root of it.
+        for out in [u64::MAX, 0, 2048, u64::MAX - 2047] {
+            let seed = seed_for(out);
+            assert_eq!(
+                SplitMix64::new(seed).next_u64(),
+                out,
+                "the seed inversion is wrong, so this test proves nothing"
+            );
+            let u = SplitMix64::new(seed).uniform_nonzero();
+            assert!(u > 0.0 && u < 1.0, "uniform_nonzero returned {u}");
+            assert!(
+                SplitMix64::new(seed).exponential(2.0) > 0.0,
+                "exponential returned a non-positive variate"
+            );
+            assert!(SplitMix64::new(seed).normal().is_finite());
+        }
+    }
 }

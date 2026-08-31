@@ -26,8 +26,15 @@ use crate::utils::traits::BonsaiFloat;
 /// Wants to be large enough that a node's slice is several cache lines and the
 /// per-call overhead of the kernels is amortised, and small enough that the
 /// block stays cheap to stream. 128 puts a node's `f64` slice at 1 KiB and, at
-/// 16k nodes, a block's two arrays at 32 MiB. Chosen 2026-08-27; see the
-/// `block_size` sweep in `benches/prune_sweep.rs` before changing it.
+/// 16k nodes, a block's two arrays at 32 MiB.
+///
+/// Measured 2026-08-31 on an M1 Max, 8192 leaves by 2000 features, `f64`,
+/// balanced tree, best of five sweeps: 16 gives 11.34 ms, 32 gives 10.16,
+/// 64 gives 9.76, **128 gives 9.37**, 256 gives 9.41, 512 gives 18.80 and 1024
+/// gives 36.45. Flat from 64 to 256 and off a cliff past that, where the two
+/// arrays stop fitting the cache together. `benches/prune_sweep.rs` runs at
+/// `DEFAULT_BLOCK` only and is not that sweep; an earlier version of this
+/// comment cited it as though it were (adversarial review N12).
 pub const DEFAULT_BLOCK: usize = 128;
 
 /// Effective means and precisions, laid out `[block][node][feature]`.
@@ -187,8 +194,23 @@ impl<T: BonsaiFloat> BlockedState<T> {
     /// ### Returns
     ///
     /// The tree loglikelihood, up to the dropped additive constants.
+    ///
+    /// ### Panics
+    ///
+    /// If `tree` has a different node count from the one this state was built
+    /// for, which is a mismatched pair of arguments rather than bad data.
     pub fn prune(&mut self, tree: &Tree) -> f64 {
-        debug_assert_eq!(tree.n_nodes(), self.n_nodes);
+        // A real check, not a `debug_assert`: a state built for one tree and
+        // pruned against another indexes entirely within bounds when the state
+        // is the larger of the two, so release builds would return a
+        // well-formed answer computed from the wrong rows (adversarial review
+        // N17). One comparison against an `O(n * p)` sweep.
+        assert_eq!(
+            tree.n_nodes(),
+            self.n_nodes,
+            "this state was built for a tree of {} nodes",
+            self.n_nodes
+        );
         let (p, block) = (self.p, self.block);
         let starts = &self.block_start;
         let n_blocks = starts.len() - 1;
@@ -255,6 +277,18 @@ mod tests {
                 assert_relative_eq!(blocked.means(node)[g], flat.means(node)[g], epsilon = 1e-12);
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "this state was built for a tree of")]
+    fn test_pruning_a_tree_the_state_was_not_built_for_is_caught() {
+        // Adversarial review 2026-08-31, N17, the blocked half of it.
+        let p = 4usize;
+        let big = Tree::balanced_binary(8, 0.5).expect("big");
+        let small = Tree::balanced_binary(4, 0.5).expect("small");
+        let (m, w) = leaf_data(8, p);
+        let mut state = BlockedState::new(big.n_nodes(), p, &m, &w, 2).expect("state");
+        state.prune(&small);
     }
 
     #[test]

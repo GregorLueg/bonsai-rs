@@ -37,10 +37,21 @@ const BRANCH_TOL: f64 = 1e-12;
 /// transcendentals out of the iteration entirely; positivity comes from the
 /// bracket rather than from a change of variable.
 ///
+/// ### Non-finite input
+///
+/// Every comparison against a `NaN` is false, so an unguarded `NaN` walks
+/// straight through the early return, through both bracket updates and out of
+/// the iteration as a small positive number: the review of 2026-08-27 measured
+/// `optimise_edge(&[1.0, 1.0], &[NaN, 4.0], 3.0)` returning `Ok(6.2e-25)`.
+/// Garbage reported as a branch length is worse than an error, so the bracket
+/// and the derivative at the origin are both checked before the loop. Nothing
+/// downstream can then turn non-finite: `f` and `f'` are sums of ratios of
+/// finite non-negative quantities, and the iterate never leaves the bracket.
+///
 /// ### Params
 ///
 /// * `s` - Summed inverse precisions from `prep_edge`, length `p`
-/// * `d` - Squared separations from `prep_edge`, length `p`
+/// * `d` - Squared separations from `prep_edge`, length `p`, same length as `s`
 /// * `upper` - Upper bracket from `prep_edge`
 ///
 /// ### Returns
@@ -48,13 +59,42 @@ const BRANCH_TOL: f64 = 1e-12;
 /// The branch length maximising the edge's loglikelihood, which is zero when
 /// the two effective leaves are closer together than their own uncertainty
 /// already allows. `RootFindDiverged` if the iteration budget is exhausted,
-/// which would mean the bracket was wrong.
+/// which would mean the bracket was wrong, or if the bracket or the derivative
+/// at the origin is not finite, which is reported with `max_iter: 0` because
+/// the iteration never started.
+///
+/// ### Panics
+///
+/// In a debug build, if `s` and `d` are different lengths. In a release build
+/// that indexes out of range instead. Both come from `prep_edge`, which sizes
+/// them together, so this is an invariant of the caller rather than something
+/// a caller can usefully be handed back.
 pub fn optimise_edge(s: &[f64], d: &[f64], upper: f64) -> Result<f64, BonsaiErrors> {
+    debug_assert_eq!(s.len(), d.len(), "prep_edge sizes s and d together");
+
+    if !upper.is_finite() {
+        return Err(BonsaiErrors::RootFindDiverged {
+            max_iter: 0,
+            last_step: upper,
+        });
+    }
     // A zero-length branch is optimal whenever the data already sit closer than
     // their combined error bars, which is what a non-negative derivative at the
     // origin says. This is the case that creates the polytomies the search then
-    // has to resolve, so it is common rather than exceptional.
-    if upper <= 0.0 || edge_newton(s, d, 0.0).0 >= 0.0 {
+    // has to resolve, so it is common rather than exceptional. Tested before
+    // the derivative is formed, because that is an `O(p)` pass and this is the
+    // hot path of the merge scan.
+    if upper <= 0.0 {
+        return Ok(0.0);
+    }
+    let f0 = edge_newton(s, d, 0.0).0;
+    if !f0.is_finite() {
+        return Err(BonsaiErrors::RootFindDiverged {
+            max_iter: 0,
+            last_step: f0,
+        });
+    }
+    if f0 >= 0.0 {
         return Ok(0.0);
     }
 
@@ -219,6 +259,33 @@ mod tests {
             );
             previous = t;
         }
+    }
+
+    #[test]
+    fn test_a_non_finite_edge_is_an_error_and_not_a_branch_length() {
+        // Adversarial review 2026-08-27, N11. Every comparison against a `NaN`
+        // is false, so a `NaN` used to skip the early return, then send `hi = t`
+        // on every iteration, and come back as `Ok(6.2e-25)`: a garbage branch
+        // length reported as a success.
+        for (s, d, upper) in [
+            (vec![1.0, 1.0], vec![f64::NAN, 4.0], 3.0),
+            (vec![f64::NAN, 1.0], vec![9.0, 4.0], 3.0),
+            (vec![1.0, 1.0], vec![f64::INFINITY, 4.0], 3.0),
+            (vec![1.0, 1.0], vec![9.0, 4.0], f64::NAN),
+            (vec![1.0, 1.0], vec![9.0, 4.0], f64::INFINITY),
+        ] {
+            let out = optimise_edge(&s, &d, upper);
+            assert!(
+                matches!(out, Err(BonsaiErrors::RootFindDiverged { .. })),
+                "s = {s:?}, d = {d:?}, upper = {upper} returned {out:?}"
+            );
+        }
+
+        // The guards are on the input and not on the answer: a well-posed edge
+        // with a large but finite bracket still solves.
+        let (s, d, upper) = edge(64, 2.5, 1.0);
+        assert!(optimise_edge(&s, &d, upper).is_ok());
+        assert_eq!(optimise_edge(&s, &d, 0.0).expect("zero bracket"), 0.0);
     }
 
     #[test]

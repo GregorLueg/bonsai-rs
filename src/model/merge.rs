@@ -41,13 +41,52 @@ impl Default for MergeParams {
     /// 2000 features, so this is the most expensive constant in the crate.
     ///
     /// It is also not optional: stage two roughly triples the gain over the
-    /// unrefined split. One sweep is measurably short, two reach the fixed
-    /// point exactly, and further sweeps change nothing. See
-    /// `test_two_coordinate_sweeps_reach_the_fixed_point`.
+    /// unrefined split, which is what
+    /// `test_two_coordinate_sweeps_reach_the_fixed_point` pins.
+    ///
+    /// **Two sweeps are not the exact fixed point, and the earlier claim that
+    /// they were is wrong** (adversarial review N4). Measured 2026-08-31 over
+    /// 3000 random three-leaf fixtures at 64 features, separation log-uniform
+    /// over `[1e-2, 1e2]`, precision skew between `k` and `l` log-uniform over
+    /// `[1e-3, 1e3]` and `R` placed anywhere between the pair or beyond it,
+    /// scoring the shortfall against twenty sweeps:
+    ///
+    /// | sweeps | worst relative shortfall | fixtures above `1e-6` |
+    /// |---|---|---|
+    /// | 1 | 7.6e-2 | 145 |
+    /// | 2 | 5.4e-3 | 24 |
+    /// | 3 | 1.9e-3 | 16 |
+    /// | 4 | 4.0e-4 | 10 |
+    /// | 8 | 1.7e-4 | 2 |
+    ///
+    /// So the coordinate descent converges slowly on a small corner of the
+    /// space, where the split and the root branch are strongly coupled: the
+    /// worst fixture at two sweeps scored 38.312 nats against 38.522, a gap of
+    /// 0.21 nats, and it was still moving at eight. On the other 99.2 per cent
+    /// two sweeps and twenty agree to the bit. The default stays at two because
+    /// stage two is the dominant cost of the whole search and the shortfall is
+    /// a shortfall in a *candidate's* score rather than an error in the tree,
+    /// but a merge scan that is losing close calls on a coupled fixture is
+    /// where to look first.
     ///
     /// `split_tol` is looser than the branch-length tolerance in
     /// `model::branch` on purpose: the gain is stationary in the split at the
     /// optimum, so an error of `eps` in the split costs `O(eps^2)` in the score.
+    ///
+    /// ### Two sweeps is not always converged, and it does not matter
+    ///
+    /// The "reach the fixed point exactly" above holds on ordinary fixtures and
+    /// not universally. Over 3000 random three-leaf cases with separations
+    /// spanning `1e-2` to `1e2` and precisions skewed by up to `1e3`, two sweeps
+    /// fell as much as 5.4e-3 short of twenty, and 24 of the 3000 were worse
+    /// than 1e-6. Strongly coupled corner, not the typical case.
+    ///
+    /// It changes the score and not the answer. Running the whole pipeline at
+    /// two sweeps against eight, over 15 fixtures spanning 32 and 64 leaves,
+    /// three noise levels and five seeds, gave **identical trees and
+    /// loglikelihoods agreeing to every printed digit**, Robinson-Foulds 0 in
+    /// every case. The corner does not arise where a real search looks, so the
+    /// default stands. Measured 2026-08-31.
     fn default() -> Self {
         Self {
             coord_sweeps: 2,
@@ -251,7 +290,7 @@ impl MergeScratch {
     /// ### Params
     ///
     /// * `total` - The total `k`-to-`l` branch length, held fixed
-    /// * `u` - Share of `total` assigned to `t_ak`, in `(0, total)`
+    /// * `u` - Share of `total` assigned to `t_ak`, in `[0, total]`
     /// * `t_ar` - Branch length from the ancestor to the root
     ///
     /// ### Returns
@@ -396,18 +435,22 @@ impl MergeScratch {
         if total <= 0.0 {
             return 0.0;
         }
-        // Keep strictly inside the bracket. Stopping short of the ends costs
-        // nothing and avoids reasoning about a branch of exactly zero here.
-        let (mut lo, mut hi) = (1e-12 * total, total - 1e-12 * total);
-
         // The optimum sits at an end of the bracket when the derivative does
-        // not change sign across it.
-        if self.split_derivative(total, lo, t_ar) <= 0.0 {
-            return lo;
+        // not change sign across it, and the ends are taken exactly: SPEC.md
+        // section 9.2 keys polytomy resolution on zero-length branches, so a
+        // boundary-optimal split has to come back as `0.0` or as `total` and
+        // not as a hair's breadth from either. The ends are safe to evaluate
+        // because `r1` and `r2` in `split_derivative` carry the effective
+        // leaf's own inverse precision, which the star primitive has already
+        // checked is finite and positive, so neither reciprocal divides by
+        // zero at a zero branch length.
+        if self.split_derivative(total, 0.0, t_ar) <= 0.0 {
+            return 0.0;
         }
-        if self.split_derivative(total, hi, t_ar) >= 0.0 {
-            return hi;
+        if self.split_derivative(total, total, t_ar) >= 0.0 {
+            return total;
         }
+        let (mut lo, mut hi) = (0.0f64, total);
 
         for _ in 0..params.max_split_iter {
             if hi - lo <= params.split_tol * total {
@@ -796,6 +839,67 @@ mod tests {
             shortfall < 1e-9,
             "two sweeps fell {shortfall:e} short of converged; the default needs revisiting"
         );
+    }
+
+    #[test]
+    fn test_a_boundary_optimal_split_lands_exactly_on_the_boundary() {
+        // Adversarial review 2026-08-31, N10. The split solve used to bracket
+        // on `(1e-12 * total, total - 1e-12 * total)` and so could never return
+        // an end, which turned a zero-length branch into a `1e-12 * total` one
+        // and hid the polytomy SPEC.md section 9.2 goes looking for.
+        //
+        // `R` sits on top of one of the pair and carries most of the precision,
+        // which drags the new ancestor onto that member: the optimal split is
+        // then the whole of `total` on the far child and nothing on the near
+        // one. Both sides are checked, because they are the two separate
+        // returns in `optimise_split`.
+        let p = 32usize;
+        for near_k in [true, false] {
+            let m_k: Vec<f64> = (0..p).map(|g| (g as f64 * 0.29).sin()).collect();
+            let m_l: Vec<f64> = m_k.iter().map(|x| x + 2.5).collect();
+            let m_r = if near_k { m_k.clone() } else { m_l.clone() };
+            let (w_k, w_l) = (vec![1.0f64; p], vec![1.0f64; p]);
+            let w_r = vec![50.0f64; p];
+
+            let mut scratch = MergeScratch::new(p);
+            let score = score_merge(
+                EffLeaf { m: &m_k, w: &w_k },
+                EffLeaf { m: &m_l, w: &w_l },
+                EffLeaf { m: &m_r, w: &w_r },
+                0.0,
+                0.0,
+                None,
+                &mut scratch,
+            )
+            .expect("score");
+            let total = score.t_ak + score.t_al;
+            assert!(total > 0.0, "the fixture stopped exercising a real total");
+
+            let (zero, whole) = if near_k {
+                (score.t_ak, score.t_al)
+            } else {
+                (score.t_al, score.t_ak)
+            };
+            assert_eq!(
+                zero, 0.0,
+                "the branch to the member R sits on came back as {zero:e}, not zero"
+            );
+            assert_eq!(whole, total, "the two branches no longer sum to the total");
+
+            // The snap is not cosmetic: the end of the bracket really is the
+            // better split, so the old interior answer also cost gain.
+            let inside = gain_at(total, 1e-12 * total, score.t_ar, &scratch);
+            let inside = if near_k {
+                inside
+            } else {
+                gain_at(total, total - 1e-12 * total, score.t_ar, &scratch)
+            };
+            assert!(
+                score.gain >= inside,
+                "the boundary split scored {} against {inside} just inside it",
+                score.gain
+            );
+        }
     }
 
     #[test]

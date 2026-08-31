@@ -307,9 +307,17 @@ fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
 /// existing tree collapsed onto that node**: the pruning recursion of SPEC.md
 /// section 4 run with that node as the root, which for a leaf includes the
 /// leaf's own observation. That is a two-sided quantity, one upward and one
-/// downward sweep over the arena, and it belongs to `model::global` rather than
-/// here, so it is passed in. It must be defined for every index in
-/// `0..tree.n_nodes()` and every leaf it returns must have `q`'s feature count.
+/// downward sweep over the arena, so it is passed in rather than built here. It
+/// must be defined for every index in `0..tree.n_nodes()` and every leaf it
+/// returns must have `q`'s feature count.
+///
+/// **Do not reach for [`crate::model::global::UpState`]'s rows directly.** They
+/// are everything outside a node's subtree, positioned at the node's *parent*
+/// and not diffused along the branch above it, so a caller who passes them
+/// straight in is wrong on two counts (adversarial review N8). The composition
+/// that is right is written once, in `search::spr`, which diffuses the up row
+/// down the branch and then combines it with the down row; that is the provider
+/// the crate's own caller of this function uses.
 ///
 /// A plain closure is used rather than a trait because the provider is free to
 /// store the sweep in whatever layout suits it, needs no wrapper type, and the

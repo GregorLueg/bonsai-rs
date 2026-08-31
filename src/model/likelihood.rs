@@ -138,9 +138,18 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// invariant makes a valid post-order.
     ///
     /// Per-node contributions are summed within a level and only then added to
-    /// the running total. Floating-point addition is not associative, so fixing
-    /// the association to the tree rather than to the traversal is what makes
-    /// the two implementations comparable at all.
+    /// the running total, which keeps the association fixed to the tree so that
+    /// this routine's own answer does not depend on how the levels happen to be
+    /// walked. It is **not** what makes this and
+    /// [`crate::model::blocked::BlockedState::prune`] agree: that one sums node
+    /// by node over `internal_postorder` and splits the feature sum across
+    /// blocks as well, so the two associate differently and agree only to
+    /// rounding. Measured 2026-08-31 at 1024 leaves by 1024 features: 1.3e-16
+    /// relative on a balanced tree at block 128, 1.3e-16 on a ladder at block 7,
+    /// 6.7e-15 on a star at block 7, whose single 1024-child polytomy is the
+    /// worst case for it. Anywhere the two are bit-identical it is a
+    /// coincidence of the fixture, and an earlier version of this comment
+    /// claimed otherwise (adversarial review N13).
     ///
     /// ### Params
     ///
@@ -149,8 +158,23 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// ### Returns
     ///
     /// The tree loglikelihood, up to the dropped additive constants.
+    ///
+    /// ### Panics
+    ///
+    /// If `tree` has a different node count from the one this state was built
+    /// for, which is a mismatched pair of arguments rather than bad data.
     pub fn prune(&mut self, tree: &Tree) -> f64 {
-        debug_assert_eq!(tree.n_nodes(), self.n_nodes);
+        // A real check, not a `debug_assert`: a state built for one tree and
+        // pruned against another indexes entirely within bounds when the state
+        // is the larger of the two, so release builds would return a
+        // well-formed answer computed from the wrong rows (adversarial review
+        // N17). One comparison against an `O(n * p)` sweep.
+        assert_eq!(
+            tree.n_nodes(),
+            self.n_nodes,
+            "this state was built for a tree of {} nodes",
+            self.n_nodes
+        );
         let mut total = 0.0f64;
         for level in 0..tree.n_levels() {
             let (start, end) = tree.level(level);
@@ -310,6 +334,150 @@ pub(crate) mod tests {
         // internal rows the sweep will write.
         assert!(NodeState::new(3, p, &[1.0f64; 24], &[1.0f64; 24]).is_ok());
         assert!(NodeState::new(9, p, &vec![1.0f64; 40], &vec![1.0f64; 40]).is_ok());
+    }
+
+    #[test]
+    fn test_the_loglikelihood_is_the_same_at_every_rooting() {
+        // S14, listed in SPEC.md section 13.2 as a required invariant and
+        // untested until the adversarial review wrote it (N6). The root is a
+        // bookkeeping choice: the model is defined on the unrooted tree, so
+        // moving the root along any edge, which splits that edge in two and
+        // reverses the path back to the old root, has to leave the
+        // loglikelihood exactly where it was.
+        use crate::tree::cluster::reroot;
+
+        let p = 12usize;
+        for (name, tree) in [
+            ("balanced", Tree::balanced_binary(8, 0.7).expect("balanced")),
+            ("ladder", Tree::ladder(7, 0.4).expect("ladder")),
+            (
+                "zero branches",
+                Tree::balanced_binary(8, 0.0).expect("zero"),
+            ),
+            (
+                "internal polytomy",
+                Tree::from_parents(
+                    vec![6, 6, 6, 7, 7, 7, 7, NO_NODE],
+                    vec![0.35, 0.8, 1.4, 0.2, 0.6, 1.1, 0.45, 0.0],
+                    6,
+                )
+                .expect("polytomy"),
+            ),
+        ] {
+            let (m, w) = leaf_data(tree.n_leaves(), p);
+            let mut state = NodeState::new(tree.n_nodes(), p, &m, &w).expect("state");
+            let base = state.prune(&tree);
+            assert!(base.is_finite());
+
+            // Every edge of the tree, which is every node but the root.
+            let mut worst = 0.0f64;
+            for node in 0..tree.n_nodes() as u32 {
+                if node == tree.root() {
+                    continue;
+                }
+                let moved = reroot(&tree, node).expect("reroot");
+                // Leaf indices survive a reroot, so the same leaf block still
+                // describes the same cells.
+                let mut state = NodeState::new(moved.n_nodes(), p, &m, &w).expect("state");
+                let here = state.prune(&moved);
+                let error = (here - base).abs() / base.abs().max(1.0);
+                worst = worst.max(error);
+            }
+            // Measured 2026-08-31: 1.9e-16 balanced, 1.3e-16 ladder, 2.9e-16
+            // with zero branches, 1.4e-16 through the polytomy path. The bound
+            // is two orders above that, so it pins the invariant rather than
+            // the summation order.
+            assert!(
+                worst < 1e-14,
+                "{name}: rerooting moved the loglikelihood by {worst:e} relative"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "this state was built for a tree of")]
+    fn test_pruning_a_tree_the_state_was_not_built_for_is_caught() {
+        // Adversarial review 2026-08-31, N17. This was a `debug_assert`, so a
+        // release build indexed happily inside the larger state's rows and
+        // returned a well-formed loglikelihood computed from the wrong ones.
+        let p = 4usize;
+        let big = Tree::balanced_binary(8, 0.5).expect("big");
+        let small = Tree::balanced_binary(4, 0.5).expect("small");
+        let (m, w) = leaf_data(8, p);
+        let mut state = NodeState::new(big.n_nodes(), p, &m, &w).expect("state");
+        state.prune(&small);
+    }
+
+    #[test]
+    fn test_the_loglikelihood_is_l_and_not_twice_it() {
+        // SPEC.md section 12: the reference works in `2L` throughout and this
+        // crate works in `L`, so any threshold lifted from the paper has to be
+        // halved. That claim was asserted nowhere (adversarial review N5), and
+        // it is not a claim about the constants, none of which are theirs: it is
+        // a claim about the units the whole crate is denominated in, and the
+        // only place to pin it is against the formula as written.
+        //
+        // S20 transcribed literally, `1/2` and all, in the direct form with the
+        // ancestor's mean formed rather than the pairwise identity, over a tree
+        // with a polytomy in it so both prune kernels are covered.
+        let p = 6usize;
+        let n_leaves = 6usize;
+        let (m, w) = leaf_data(n_leaves, p);
+        // Leaves 0 and 1 under node 6, which is the binary kernel, and
+        // everything else straight onto the root, which is the general one.
+        let parent = vec![6, 6, 7, 7, 7, 7, 7, NO_NODE];
+        let branch = vec![0.35, 0.8, 1.4, 0.2, 0.6, 1.1, 0.45, 0.0];
+        let tree = Tree::from_parents(parent, branch.clone(), n_leaves).expect("tree");
+
+        let mut state = NodeState::new(tree.n_nodes(), p, &m, &w).expect("state");
+        let got = state.prune(&tree);
+
+        // Post-order over the arena, which the invariant makes ascending index.
+        let mut wd = vec![0.0f64; tree.n_nodes() * p];
+        let mut mm = vec![0.0f64; tree.n_nodes() * p];
+        let mut sum = 0.0f64;
+        for node in 0..tree.n_nodes() {
+            let kids = tree.children(node as u32);
+            if kids.is_empty() {
+                for g in 0..p {
+                    let wi = w[node * p + g];
+                    mm[node * p + g] = m[node * p + g];
+                    wd[node * p + g] = wi / (1.0 + branch[node] * wi);
+                }
+                continue;
+            }
+            for g in 0..p {
+                let total: f64 = kids.iter().map(|&k| wd[k as usize * p + g]).sum();
+                let mean: f64 = kids
+                    .iter()
+                    .map(|&k| wd[k as usize * p + g] * mm[k as usize * p + g])
+                    .sum::<f64>()
+                    / total;
+                sum += kids
+                    .iter()
+                    .map(|&k| wd[k as usize * p + g].ln())
+                    .sum::<f64>()
+                    - total.ln()
+                    - kids
+                        .iter()
+                        .map(|&k| {
+                            let d = mean - mm[k as usize * p + g];
+                            wd[k as usize * p + g] * d * d
+                        })
+                        .sum::<f64>();
+                mm[node * p + g] = mean;
+                wd[node * p + g] = total / (1.0 + branch[node] * total);
+            }
+        }
+        let l = 0.5 * sum;
+
+        assert_relative_eq!(got, l, max_relative = 1e-12);
+        // Not vacuous: `L` and `2L` are far apart on this fixture, so a factor
+        // of two anywhere in the recursion would fail the assertion above.
+        assert!(
+            (got - 2.0 * l).abs() > 1.0,
+            "L and 2L are indistinguishable here, so this fixture pins nothing"
+        );
     }
 
     #[test]

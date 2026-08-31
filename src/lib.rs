@@ -34,6 +34,7 @@
 // hoisting the bounds check, throughput.
 #![allow(clippy::needless_range_loop)]
 
+pub mod bonsai;
 pub mod errors;
 pub mod ingest;
 pub mod model;

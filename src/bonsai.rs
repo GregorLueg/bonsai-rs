@@ -177,10 +177,6 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
     };
 
     let mut steps: Vec<StepReport> = Vec::with_capacity(7);
-    let record = |step: &'static str, loglik: f64, steps: &mut Vec<StepReport>| {
-        let gain = steps.last().map_or(0.0, |last| loglik - last.loglik);
-        steps.push(StepReport { step, loglik, gain });
-    };
 
     // Step 1: a star with optimised branch lengths.
     let mut star = star_of(n_cells)?;
@@ -190,7 +186,7 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
 
     // Step 2: greedily add ancestors. The star's optimised branch lengths carry
     // over as the members' branches to the centre.
-    let (mut tree, _) = star_tree(
+    let (tree, _) = star_tree(
         Star {
             means: leaves.means,
             precisions: leaves.precisions,
@@ -201,15 +197,86 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
     )?;
     record("2 merge", tree_loglik(&tree, leaves)?, &mut steps);
 
-    // Step 3: resolve the polytomies step 2 created with its zero-length
-    // branches.
+    refine_from(tree, data, &params, steps)
+}
+
+/// Run the refinement steps on a tree that already exists.
+///
+/// Steps 3 to 7 of SPEC.md section 9: resolve polytomies, optimise the branch
+/// lengths, SPR, NNI, optimise again. Steps 1 and 2 build a tree from nothing;
+/// this improves one that is already there.
+///
+/// That is what backbone mode's final pass needs (SPEC.md section 15), and what
+/// a caller with a tree from elsewhere wants. The reference recommends seeding
+/// the search with cells grouped by an external clustering, which is the same
+/// entry point.
+///
+/// The returned `steps` start at step 3, since 1 and 2 did not happen.
+///
+/// ### Params
+///
+/// * `tree` - Starting tree, whose leaves must be the cells of `data` in order
+/// * `data` - Transformed means and precisions
+/// * `params` - Knobs, `None` for the defaults
+///
+/// ### Returns
+///
+/// As [`bonsai`], but having refined rather than reconstructed.
+pub fn refine<T: BonsaiFloat>(
+    tree: &Tree,
+    data: &PreparedData<T>,
+    params: Option<BonsaiParams>,
+) -> Result<BonsaiResult<T>, BonsaiErrors> {
+    if tree.n_leaves() != data.n_cells {
+        return Err(BonsaiErrors::ShapeMismatch {
+            mean_cells: data.n_cells,
+            mean_features: data.n_features(),
+            sd_cells: tree.n_leaves(),
+            sd_features: data.n_features(),
+        });
+    }
+    let params = params.unwrap_or_default();
+    refine_from(tree.clone(), data, &params, Vec::with_capacity(5))
+}
+
+//////////////
+// Internal //
+//////////////
+
+/// Steps 3 to 7, shared by [`bonsai_prepared`] and [`refine`].
+///
+/// ### Params
+///
+/// * `tree` - Tree to refine, consumed
+/// * `data` - Transformed means and precisions
+/// * `params` - Knobs, already resolved
+/// * `steps` - Step reports so far, appended to
+///
+/// ### Returns
+///
+/// The refined tree with its posteriors.
+fn refine_from<T: BonsaiFloat>(
+    mut tree: Tree,
+    data: &PreparedData<T>,
+    params: &BonsaiParams,
+    mut steps: Vec<StepReport>,
+) -> Result<BonsaiResult<T>, BonsaiErrors> {
+    let leaves = Leaves {
+        means: &data.transformed_means,
+        precisions: &data.transformed_precisions,
+        n_features: data.n_features(),
+    };
+
+    // Step 3: resolve the polytomies that a zero-length branch stands for. The
+    // collapse that finds them lives in `search::polytomy`; without it this step
+    // sees a structurally binary tree and does nothing.
     let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
     tree = resolved.tree;
     record("3 polytomy", tree_loglik(&tree, leaves)?, &mut steps);
 
     // Step 4: all branch lengths at once. Steps 5 and 6 depend on this having
     // happened; see the module docs.
-    let loglik = optimise_all(&mut tree, leaves, &params)?;
+    let loglik = optimise_all(&mut tree, leaves, params)?;
     record("4 branch", loglik, &mut steps);
 
     // Step 5.
@@ -221,7 +288,7 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
     record("6 nni", tree_loglik(&tree, leaves)?, &mut steps);
 
     // Step 7.
-    let loglik = optimise_all(&mut tree, leaves, &params)?;
+    let loglik = optimise_all(&mut tree, leaves, params)?;
     record("7 branch", loglik, &mut steps);
 
     // Rerooting is a display choice and carries no information (S14), so it
@@ -241,9 +308,17 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
     })
 }
 
-//////////////
-// Internal //
-//////////////
+/// Append a step report, computing its gain from the previous one.
+///
+/// ### Params
+///
+/// * `step` - Which of the seven steps
+/// * `loglik` - Loglikelihood after it
+/// * `steps` - Reports so far
+fn record(step: &'static str, loglik: f64, steps: &mut Vec<StepReport>) {
+    let gain = steps.last().map_or(0.0, |last| loglik - last.loglik);
+    steps.push(StepReport { step, loglik, gain });
+}
 
 /// A star tree over `n_leaves` cells, every branch at [`INITIAL_STAR_BRANCH`].
 ///
@@ -390,6 +465,7 @@ fn posteriors<T: BonsaiFloat>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingest::prepare;
     use crate::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
 
     /// A simulated dataset put back on the raw scale, which is what `bonsai`
@@ -524,6 +600,71 @@ mod tests {
         let second = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
         assert_eq!(first.tree.branches(), second.tree.branches());
         assert_eq!(first.loglik.to_bits(), second.loglik.to_bits());
+    }
+
+    #[test]
+    fn test_refining_a_finished_tree_finds_nothing_left() {
+        // `refine` is the entry point backbone mode's final pass uses. Run on a
+        // tree the full pipeline already produced, it should have nothing to do,
+        // which is what says the two paths agree about when the search is done.
+        let (n, p) = (32usize, 128usize);
+        let (means, sds, variances, _) = raw_fixture(n, p, 0.2, 13);
+        let full = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
+
+        let prepared = prepare(&means, &sds, n, p, Some(&variances), None).expect("prepare");
+        let again = refine(&full.tree, &prepared, None).expect("refine");
+
+        assert_relative_eq!(again.loglik, full.loglik, max_relative = 1e-9);
+        assert_eq!(
+            robinson_foulds(&again.tree, &full.tree).expect("rf"),
+            0,
+            "refining a finished tree changed its topology"
+        );
+        assert_eq!(again.steps.len(), 5, "refine should report steps 3 to 7");
+    }
+
+    #[test]
+    fn test_refining_a_bad_tree_improves_it() {
+        // The other half: given a deliberately wrong topology over the right
+        // leaves, refinement has to move it towards the truth.
+        let (n, p) = (32usize, 128usize);
+        let (means, sds, variances, truth) = raw_fixture(n, p, 0.2, 17);
+        let prepared = prepare(&means, &sds, n, p, Some(&variances), None).expect("prepare");
+
+        let ladder = Tree::ladder(n, 1.0).expect("ladder");
+        let before = {
+            let mut state = NodeState::new(
+                ladder.n_nodes(),
+                p,
+                &prepared.transformed_means,
+                &prepared.transformed_precisions,
+            )
+            .expect("state");
+            state.prune(&ladder)
+        };
+        let rf_before = robinson_foulds(&ladder, &truth).expect("rf");
+
+        let out = refine(&ladder, &prepared, None).expect("refine");
+        let rf_after = robinson_foulds(&out.tree, &truth).expect("rf");
+
+        assert!(
+            out.loglik > before,
+            "refinement lost likelihood: {} against {before}",
+            out.loglik
+        );
+        assert!(
+            rf_after < rf_before,
+            "refinement moved away from the truth: {rf_before} to {rf_after}"
+        );
+    }
+
+    #[test]
+    fn test_refine_rejects_a_tree_with_the_wrong_leaves() {
+        let (n, p) = (16usize, 32usize);
+        let (means, sds, variances, _) = raw_fixture(n, p, 0.2, 19);
+        let prepared = prepare(&means, &sds, n, p, Some(&variances), None).expect("prepare");
+        let wrong = Tree::balanced_binary(8, 1.0).expect("balanced");
+        assert!(refine(&wrong, &prepared, None).is_err());
     }
 
     #[test]

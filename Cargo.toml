@@ -59,3 +59,8 @@ harness = false
 [[bench]]
 name = "kernels"
 harness = false
+
+## End-to-end scaling of the whole search. Plain `main`, no criterion.
+[[bench]]
+name = "pipeline"
+harness = false

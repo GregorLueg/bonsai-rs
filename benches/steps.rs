@@ -1,9 +1,32 @@
-//! Which of the seven steps is the cubic one?
+//! Per-step attribution for the seven-step search.
 //!
-//! The end-to-end sweep in `benches/pipeline.rs` shows `O(n^3)`. This times each
-//! step separately so the term can be named rather than guessed at.
+//! `benches/pipeline.rs` gives the total; this says which step owns it. Written
+//! to find a cubic term in the merge, which turned out to be the candidate
+//! restrictions not being wired into the pipeline at all.
 //!
-//! Temporary; delete once the answer is recorded.
+//! Measured 2026-08-31 after that fix, 200 features, seconds at 2048 leaves and
+//! the fitted exponent over 256 to 2048:
+//!
+//! | step | seconds | `n^` |
+//! |---|---|---|
+//! | 1 star | 0.07 | 0.99 |
+//! | 2 merge | 7.66 | 1.64 |
+//! | 3 polytomy | 0.12 | 2.83 |
+//! | 4 branch | 0.36 | 1.01 |
+//! | **5 spr** | **94.13** | **1.98** |
+//! | 6 nni | 1.99 | 2.99 |
+//!
+//! So SPR is 90 per cent of the runtime and quadratic: it sweeps every
+//! candidate subtree each round, and each candidate costs a placement beam
+//! search plus a full `O(n p)` re-prune to accept or reject. The polytomy and
+//! NNI exponents look worse but are fitted on tenths of a second and should not
+//! be trusted until they are measured somewhere they matter.
+//!
+//! **Run on a quiet machine.** Check `uptime` first.
+//!
+//! ```sh
+//! cargo bench --bench steps
+//! ```
 
 use bonsai_rs::model::global::optimise_branch_lengths;
 use bonsai_rs::model::likelihood::NodeState;

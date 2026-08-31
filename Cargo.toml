@@ -64,3 +64,8 @@ harness = false
 [[bench]]
 name = "pipeline"
 harness = false
+
+## Per-step attribution within the search. Plain `main`, no criterion.
+[[bench]]
+name = "steps"
+harness = false

@@ -68,20 +68,38 @@ End to end, `bonsai()` on one M1 Max, simulated data:
 
 | cells | features | seconds |
 |---|---|---|
-| 2048 | 200 | 17.1 |
-| 2048 | 2000 | 70.9 |
+| 512 | 2000 | 9.1 |
+| 2048 | 200 | 15.7 |
+| 2048 | 2000 | 70.6 |
 
-Reproduce with `cargo bench --bench pipeline` on an otherwise idle machine.
+Overall scaling is about `n^1.5`. By step, exponents fitted over 256 to 2048
+leaves: the greedy merge `n^1.65`, subtree pruning and regrafting `n^1.47`,
+branch-length optimisation linear, nearest-neighbour interchange linear per
+round. Polytomy resolution is still `n^2.8`; it is four per cent of the runtime
+and is the last structural item.
 
-Scaling by step, exponents fitted over 256 to 2048 leaves: the greedy merge is
-`n^1.65`, subtree pruning and regrafting `n^1.50`, branch-length optimisation
-linear. Nearest-neighbour interchange is `n^3.05` and is being worked on; it is
-twelve per cent of the runtime at 2048 cells and would dominate at atlas scale.
+Extrapolating `n^1.5` to thirty thousand cells by two thousand features gives
+roughly an hour on one machine. That is an extrapolation over a fourteen-fold
+jump, not a measurement, and the paper reports under a day on ten CPUs for the
+same size. A like-for-like comparison has not been run.
 
-**Extrapolating to thirty thousand cells gives hours, not minutes.** The paper
-reports under a day on ten CPUs for the same size, so on the search this is in
-the same territory as the reference rather than ahead of it. That comparison has
-not been run and the number above is an extrapolation, not a measurement.
+Reproduce with `cargo bench --bench pipeline` on an otherwise idle machine, and
+`--bench steps` for the per-step attribution.
+
+### What the search cost before it was tuned
+
+Same data, same trees, identical loglikelihoods at every stage, 512 cells by
+2000 features:
+
+| | seconds |
+|---|---|
+| exhaustive candidate scan | 1478.8 |
+| with the kNN restriction and ellipsoid bounds | 37.4 |
+| with the lazy SPR proposal and structural NNI filter | 9.1 |
+
+None of that traded accuracy: every step is exact and returns byte-identical
+trees, which is what the correctness gates on SPEC sections 10 and 11 exist to
+guarantee.
 
 ### Where the speed actually is
 

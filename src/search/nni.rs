@@ -30,8 +30,10 @@
 //! edge, performs the best, and repeats until none improves the tree.
 //!
 //! **Monotonicity.** The greedy phase never lowers the tree loglikelihood: a
-//! move is accepted only when a fresh [`NodeState::prune`] of the candidate
-//! beats the incumbent. The random phase gives no such guarantee and is not
+//! move is accepted only when its exact gain over the current tree clears
+//! [`StarParams::min_gain`], and that gain is the difference of two whole-tree
+//! loglikelihoods computed without sweeping either of them (see
+//! [`collapse_delta`]). The random phase gives no such guarantee and is not
 //! meant to; the collapse alone can lose a split that the resampled star does
 //! not put back.
 //!
@@ -53,8 +55,9 @@ use crate::model::global::UpState;
 use crate::model::likelihood::NodeState;
 use crate::search::Leaves;
 use crate::search::polytomy::{CentreStar, Splice, splice_star};
-use crate::search::star::{StarParams, StarSelection};
+use crate::search::star::{StarParams, StarResult, StarSelection, resolve_star};
 use crate::tree::Tree;
+use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::BonsaiFloat;
 
@@ -145,6 +148,11 @@ pub struct NniResult {
     /// The tree the phase finished on.
     pub tree: Tree,
     /// Its loglikelihood, from [`NodeState::prune`] on the tree itself.
+    ///
+    /// The greedy phase settles the tree at the top of every round and stops on
+    /// a round that finds no move, so what comes back is that round's own
+    /// sweep. Only a run truncated by [`NniParams::max_rounds`] returns the
+    /// last sweep plus the accepted gains instead.
     pub loglik: f64,
     /// Number of moves performed.
     pub n_moves: usize,
@@ -274,9 +282,243 @@ pub fn interchange_at<T: BonsaiFloat>(
     }
 }
 
-////////////////////////
+////////////////
+// Exact gain //
+////////////////
+
+/// Scratch for the local peels, reused across the candidates of a round.
+///
+/// [`prune_general`] writes the peeled node's own effective leaf as well as
+/// returning its contribution. Nothing here reads the leaf, so the two
+/// destination rows exist only to be overwritten.
+struct PeelScratch<T> {
+    /// Effective means of the peeled node, written and discarded.
+    means: Vec<T>,
+    /// Its effective precisions, the same.
+    precisions: Vec<T>,
+    /// The kernel's own scratch, `p` per child, grown on demand.
+    work: Vec<f64>,
+}
+
+impl<T: BonsaiFloat> PeelScratch<T> {
+    /// Allocate for a given feature count.
+    ///
+    /// ### Params
+    ///
+    /// * `p` - Number of features
+    ///
+    /// ### Returns
+    ///
+    /// The scratch.
+    fn new(p: usize) -> Self {
+        Self {
+            means: vec![T::default(); p],
+            precisions: vec![T::default(); p],
+            work: Vec::new(),
+        }
+    }
+
+    /// Loglikelihood contribution of one node, given its children's effective
+    /// leaves and the branches down to them.
+    ///
+    /// ### Params
+    ///
+    /// * `children` - Effective means, effective precisions and branch length
+    ///   of each child
+    ///
+    /// ### Returns
+    ///
+    /// The node's contribution, zero for a node with fewer than two children:
+    /// such a node passes its child's effective leaf straight up and adds
+    /// nothing to the loglikelihood.
+    fn peel(&mut self, children: &[(&[T], &[T], f64)]) -> f64 {
+        if children.len() < 2 {
+            return 0.0;
+        }
+        let p = self.means.len();
+        let need = p * children.len();
+        if self.work.len() < need {
+            self.work.resize(need, 0.0);
+        }
+        prune_general(
+            children,
+            &mut self.means,
+            &mut self.precisions,
+            &mut self.work[..need],
+        )
+    }
+}
+
+/// What the collapse alone did to the loglikelihood.
+///
+/// [`Splice::gain`] is exact against the *collapsed* tree, so the gain of the
+/// interchange itself is that plus this. Deleting `k` changes the tree only at
+/// `l`: rooted there, the loglikelihood is the contributions of the members'
+/// own subtrees, plus the contribution of everything outside, plus the
+/// contributions of the nodes of the local topology. The first two are
+/// identical either side of the collapse and cancel, so what is left is three
+/// peels over a handful of members and not two sweeps over the tree.
+///
+/// Before, the local topology is `k` peeling its children and `l` peeling its
+/// own children and its upstream side. After, it is `l` peeling the collapsed
+/// star's members and nothing else.
+///
+/// **The kernel is [`prune_general`] on both sides, deliberately.**
+/// [`NodeState::prune`] would use the binary kernel for a binary `k`, and the
+/// two agree only to rounding. Nothing here is ever differenced against the
+/// tree's own sweep, only against another peel of this routine's, so the
+/// difference is exact in the algebra and loses nothing to the mismatch.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `down` - Down rows, settled against this tree
+/// * `up` - Up rows, settled against the same
+/// * `k` - The node the collapse deletes
+/// * `l` - Its parent, the centre of the star
+/// * `star` - The collapsed star, from [`collapsed_star`]
+/// * `scratch` - Peel scratch, reused across candidates
+///
+/// ### Returns
+///
+/// The loglikelihood of the collapsed tree less that of `tree`, in nats.
+fn collapse_delta<T: BonsaiFloat>(
+    tree: &Tree,
+    down: &NodeState<T>,
+    up: &UpState<T>,
+    k: u32,
+    l: u32,
+    star: &CentreStar<T>,
+    scratch: &mut PeelScratch<T>,
+) -> f64 {
+    let p = star.n_features;
+    let after: Vec<(&[T], &[T], f64)> = (0..star.branch.len())
+        .map(|i| {
+            (
+                &star.means[i * p..(i + 1) * p],
+                &star.precisions[i * p..(i + 1) * p],
+                star.branch[i],
+            )
+        })
+        .collect();
+    let after = scratch.peel(&after);
+
+    let below = |node: u32| (down.means(node), down.precisions(node), tree.branch(node));
+    let at_k: Vec<(&[T], &[T], f64)> = tree.children(k).iter().map(|&c| below(c)).collect();
+    let mut at_l: Vec<(&[T], &[T], f64)> = tree.children(l).iter().map(|&c| below(c)).collect();
+    if tree.parent(l).is_some() {
+        at_l.push((up.means(l), up.precisions(l), tree.branch(l)));
+    }
+    after - scratch.peel(&at_k) - scratch.peel(&at_l)
+}
+
+/////////////////////////
 // Topology comparison //
-////////////////////////
+/////////////////////////
+
+/// Leaves below every node of a tree.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+///
+/// ### Returns
+///
+/// One count per node, indexed by node id.
+fn leaves_below(tree: &Tree) -> Vec<usize> {
+    let mut below = vec![0usize; tree.n_nodes()];
+    for leaf in 0..tree.n_leaves() {
+        below[leaf] = 1;
+    }
+    for node in tree.internal_postorder() {
+        below[node as usize] = tree.children(node).iter().map(|&c| below[c as usize]).sum();
+    }
+    below
+}
+
+/// Whether a resolved star puts back exactly the split the deleted edge
+/// carried, and so proposes no interchange at all.
+///
+/// This is the structural form of the filter the module docs argue for, and it
+/// has to reject exactly what a split fingerprint of the spliced tree would.
+/// The two agree because the star region's splits are enumerable. Every member
+/// contributes the split "my leaves against the rest" on the edge above it, in
+/// the tree the star came from and in every tree the primitive can build from
+/// it. What differs is one split per internal node of the local topology: the
+/// edge `k-l` before, one edge per ancestor after. So the proposal changes
+/// nothing iff its ancestors carry the same bipartitions of the member set as
+/// `k` did.
+///
+/// Distinct ancestors are nested and so carry distinct bipartitions, which
+/// leaves exactly two ways to match: the one ancestor covers `k`'s children, or
+/// it covers all the other members. Both give the same *unrooted* split, and
+/// [`crate::search::split_fingerprint`] canonicalises a split against its
+/// complement, so both have to be rejected. Membership is decided on two counts
+/// rather than on a set: a subset of the members that has `|K|` members of
+/// which `|K|` are in `K` is `K`, and one with `m - |K|` members of which none
+/// are in `K` is its complement.
+///
+/// The triviality test is the fingerprint's: a split with fewer than two leaves
+/// on a side is carried by every tree over these leaves, so it is not part of
+/// the comparison. It can only bite where `k`'s own edge is trivial, which
+/// needs `l` to be a root of degree two with a leaf on its other side.
+///
+/// ### Params
+///
+/// * `result` - What the primitive built from the collapsed star
+/// * `k_lo` - First member index that is a child of `k`
+/// * `k_hi` - One past the last
+/// * `member_leaves` - Leaves standing behind each member, upstream included
+/// * `n_leaves` - Leaves in the whole tree
+///
+/// ### Returns
+///
+/// True when the spliced tree would have the same splits as the tree the star
+/// was built from.
+fn rebuilds_the_same_splits<T>(
+    result: &StarResult<T>,
+    k_lo: usize,
+    k_hi: usize,
+    member_leaves: &[usize],
+    n_leaves: usize,
+) -> bool {
+    let n_members = result.n_members;
+    let n_local = result.parent.len();
+    let mut members = vec![0usize; n_local];
+    let mut in_k = vec![0usize; n_local];
+    let mut leaves = vec![0usize; n_local];
+    for i in 0..n_members {
+        members[i] = 1;
+        in_k[i] = usize::from(i >= k_lo && i < k_hi);
+        leaves[i] = member_leaves[i];
+    }
+    for (j, merge) in result.merges.iter().enumerate() {
+        let a = n_members + j;
+        for child in [merge.left as usize, merge.right as usize] {
+            members[a] += members[child];
+            in_k[a] += in_k[child];
+            leaves[a] += leaves[child];
+        }
+    }
+
+    let k_members = k_hi - k_lo;
+    let k_leaves: usize = member_leaves[k_lo..k_hi].iter().sum();
+    let was_a_split = usize::from(k_leaves.min(n_leaves - k_leaves) >= 2);
+
+    let mut splits = 0usize;
+    let mut all_match = true;
+    for j in 0..result.merges.len() {
+        let a = n_members + j;
+        if leaves[a].min(n_leaves - leaves[a]) < 2 {
+            continue;
+        }
+        splits += 1;
+        let is_k = members[a] == k_members && in_k[a] == k_members;
+        let is_complement = members[a] == n_members - k_members && in_k[a] == 0;
+        all_match &= is_k || is_complement;
+    }
+    splits == was_a_split && all_match
+}
 
 /////////////
 // Phases //
@@ -394,7 +636,7 @@ pub fn nni_random<T: BonsaiFloat>(
 /// The greedy phase: score an interchange at every eligible edge, perform the
 /// best, repeat until none improves the tree.
 ///
-/// Every candidate is scored by a fresh [`NodeState::prune`] of the tree it
+/// Every candidate is scored by the exact loglikelihood gain of the tree it
 /// would produce, so the accepted move is an improvement in the quantity that
 /// actually matters rather than in the star primitive's local gain, which is
 /// measured against the collapsed tree and not against this one. That makes the
@@ -405,6 +647,36 @@ pub fn nni_random<T: BonsaiFloat>(
 /// the round's winner is fixed. The scan is sequential: the parallelism in this
 /// crate lives on the feature axis inside the pruning kernels, and a candidate
 /// scan that forked over edges would nest inside it.
+///
+/// ### A round is linear in the leaf count
+///
+/// Nothing whole-tree happens per candidate. The exact gain is
+/// [`Splice::gain`] plus [`collapse_delta`], both of which read a handful of
+/// members; the topology filter is [`rebuilds_the_same_splits`], which counts
+/// members under the star's own ancestors instead of splicing a tree and
+/// fingerprinting it. Only the winner is ever spliced, once, at the end of the
+/// round. What is left per round is the one settling sweep every candidate
+/// reads its rows from, and the star primitive itself once per edge.
+///
+/// Measured 2026-09-06 at 200 features on the tree search step 5 leaves
+/// behind, on the two sizes where the phase happened to run exactly one round
+/// so that the move count cannot confound the timing: **0.238 s at 1024 leaves
+/// and 1.979 s at 4096 before, `n^1.53`, against 0.125 s and 0.512 s after,
+/// `n^1.02`.** The whole phase was `n^3.05` in `benches/steps.rs` because the
+/// round count grows on top of that.
+///
+/// **What was expensive was not what it looked like.** The `O(n p)` re-prune
+/// per candidate is nearly free at this point in the search, because the
+/// topology filter discards almost everything before it: counted over the same
+/// runs, every one of the 1021 to 4093 eligible edges produced merges and
+/// between zero and one of them per round changed a split. The quadratic was
+/// the filter itself, which spliced a whole tree and fingerprinted it to answer
+/// a question about one star's ancestors. Scoring on the exact gain rather than
+/// on a re-prune is what makes the *other* end of the search cheap, where the
+/// tree is far from converged and a large fraction of proposals do change a
+/// split: over the forty fixtures of 32 to 256 leaves and 16 to 256 features
+/// used for the identical-tree check, the longest of which takes 240 moves from
+/// a ladder, the two phases together are 1.44 times faster.
 ///
 /// ### Params
 ///
@@ -423,20 +695,28 @@ pub fn nni_greedy<T: BonsaiFloat>(
 ) -> Result<NniResult, BonsaiErrors> {
     let params = params.unwrap_or_default();
     let mut tree = tree.clone();
-    let mut best = tree_loglik(&tree, leaves)?;
+    let mut scratch = PeelScratch::<T>::new(leaves.n_features);
+    let mut best: Option<f64> = None;
     let mut n_moves = 0usize;
     let mut rounds = 0usize;
 
     while rounds < params.max_rounds {
         rounds += 1;
-        let (down, up, _) = settle(&tree, leaves)?;
+        let (down, up, loglik) = settle(&tree, leaves)?;
+        best = Some(loglik);
+        let below = leaves_below(&tree);
+        let n_leaves = tree.n_leaves();
 
-        let here = crate::search::split_fingerprint(&tree);
-        let mut winner: Option<(f64, Tree)> = None;
+        let mut winner: Option<(f64, CentreStar<T>)> = None;
         for k in tree.internal_postorder() {
-            let Some(spliced) = interchange_at(&tree, &down, &up, k, Some(params.star))? else {
+            let Some(l) = tree.parent(k) else { continue };
+            let Some(star) = collapsed_star(&tree, &down, &up, k) else {
                 continue;
             };
+            let result = resolve_star(star.view(), Some(params.star))?;
+            if result.merges.is_empty() {
+                continue;
+            }
             // A proposal that puts the same subtrees back where they were is
             // not an interchange: it is a reoptimisation of the three branches
             // the star primitive creates at `l`. Those nearly always gain a
@@ -447,32 +727,54 @@ pub fn nni_greedy<T: BonsaiFloat>(
             // with the Robinson-Foulds distance pinned at zero throughout, so
             // every one of those rounds was branch lengths and none was
             // topology.
-            if spliced.n_merges == 0 || crate::search::split_fingerprint(&spliced.tree) == here {
+            let k_lo = tree.children(l).len() - 1;
+            let k_hi = k_lo + tree.children(k).len();
+            let last = star.member_nodes.len() - 1;
+            let member_leaves: Vec<usize> = star
+                .member_nodes
+                .iter()
+                .enumerate()
+                .map(|(i, &node)| {
+                    if star.has_upstream && i == last {
+                        n_leaves - below[l as usize]
+                    } else {
+                        below[node as usize]
+                    }
+                })
+                .collect();
+            if rebuilds_the_same_splits(&result, k_lo, k_hi, &member_leaves, n_leaves) {
                 continue;
             }
-            let loglik = tree_loglik(&spliced.tree, leaves)?;
+
+            let gain: f64 = result.merges.iter().map(|x| x.gain).sum::<f64>()
+                + collapse_delta(&tree, &down, &up, k, l, &star, &mut scratch);
             let beats = match &winner {
-                None => loglik > best + params.star.min_gain,
-                Some((incumbent, _)) => loglik > *incumbent,
+                None => gain > params.star.min_gain,
+                Some((incumbent, _)) => gain > *incumbent,
             };
             if beats {
-                winner = Some((loglik, spliced.tree));
+                winner = Some((gain, star));
             }
         }
 
         match winner {
             None => break,
-            Some((loglik, next)) => {
-                best = loglik;
-                tree = next;
+            Some((gain, star)) => {
+                tree = splice_star(&tree, &star, Some(params.star))?.tree;
+                best = Some(loglik + gain);
                 n_moves += 1;
             }
         }
     }
 
+    let loglik = match best {
+        Some(loglik) => loglik,
+        // Only reachable at `max_rounds` zero, where the loop never ran.
+        None => tree_loglik(&tree, leaves)?,
+    };
     Ok(NniResult {
         tree,
-        loglik: best,
+        loglik,
         n_moves,
         rounds,
     })
@@ -700,6 +1002,151 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "the fixture had no eligible internal edge");
+    }
+
+    /// Trees to walk every eligible edge of: a binary one and one carrying
+    /// polytomies, so that both the two-child and the many-child collapse are
+    /// exercised.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of leaves
+    /// * `leaves` - The leaf data
+    ///
+    /// ### Returns
+    ///
+    /// The trees.
+    fn fixtures(n: usize, leaves: Leaves<'_, f64>) -> Vec<Tree> {
+        let ladder = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let mut parent = vec![n as u32; n + 1];
+        parent[n] = NO_NODE;
+        let star = Tree::from_parents(parent, vec![0.5; n + 1], n).expect("star tree");
+        let resolved = resolve_polytomies(&star, leaves, None)
+            .expect("resolve")
+            .tree;
+        vec![ladder, resolved]
+    }
+
+    #[test]
+    fn test_the_exact_gain_is_what_a_full_prune_reports() {
+        // The candidate score. `Splice::gain` is measured against the collapsed
+        // tree, `collapse_delta` supplies the rest, and nothing whole-tree is
+        // computed to reach it. If the two do not add up to the difference of
+        // two prunes then the greedy phase is choosing on a different quantity
+        // from the one it claims to.
+        let mut worst = 0.0f64;
+        let mut checked = 0usize;
+        for seed in [1u64, 2, 3] {
+            let (p, n) = (64usize, 32usize);
+            let (data, w) = dataset(n, p, seed);
+            let leaves = Leaves {
+                means: &data.means,
+                precisions: &w,
+                n_features: p,
+            };
+            for tree in fixtures(n, leaves) {
+                let (down, up, before) = settle(&tree, leaves).expect("settle");
+                let mut scratch = PeelScratch::<f64>::new(p);
+                for k in tree.internal_postorder() {
+                    let Some(l) = tree.parent(k) else { continue };
+                    let Some(star) = collapsed_star(&tree, &down, &up, k) else {
+                        continue;
+                    };
+                    let spliced = splice_star(&tree, &star, None).expect("splice");
+                    if spliced.n_merges == 0 {
+                        continue;
+                    }
+                    let want = tree_loglik(&spliced.tree, leaves).expect("loglik") - before;
+                    let got =
+                        spliced.gain + collapse_delta(&tree, &down, &up, k, l, &star, &mut scratch);
+                    worst = worst.max((got - want).abs());
+                    checked += 1;
+                }
+            }
+        }
+        println!("{checked} edges, worst absolute disagreement {worst:e} nats");
+        assert!(checked > 100, "only {checked} edges exercised");
+        // Measured 2026-09-06 at 3.0e-13 nats over these 174 edges, against
+        // tree loglikelihoods of `O(1e3)`. The bound is set three orders above
+        // that and one below the `min_gain` a move has to clear, which is what
+        // it has to stay under for the search's answer not to turn on it.
+        assert!(worst < 1e-10, "worst disagreement {worst:e} nats");
+    }
+
+    #[test]
+    fn test_the_structural_filter_rejects_exactly_what_a_fingerprint_would() {
+        // The greedy phase's topology filter used to splice a tree and
+        // fingerprint it, which is `O(n)` per candidate. `rebuilds_the_same_splits`
+        // reads the star's own ancestors instead, and the two have to agree
+        // edge for edge: a filter that is merely nearly the same one silently
+        // changes both the search's answer and whether it terminates.
+        let (mut same, mut different) = (0usize, 0usize);
+        for seed in [1u64, 2, 3] {
+            let (p, n) = (64usize, 32usize);
+            let (data, w) = dataset(n, p, seed);
+            let leaves = Leaves {
+                means: &data.means,
+                precisions: &w,
+                n_features: p,
+            };
+            for tree in fixtures(n, leaves) {
+                let (down, up, _) = settle(&tree, leaves).expect("settle");
+                let here = crate::search::split_fingerprint(&tree);
+                let below = leaves_below(&tree);
+                for k in tree.internal_postorder() {
+                    let Some(l) = tree.parent(k) else { continue };
+                    let Some(star) = collapsed_star(&tree, &down, &up, k) else {
+                        continue;
+                    };
+                    let result = resolve_star(star.view(), None).expect("resolve");
+                    if result.merges.is_empty() {
+                        continue;
+                    }
+                    let k_lo = tree.children(l).len() - 1;
+                    let k_hi = k_lo + tree.children(k).len();
+                    let last = star.member_nodes.len() - 1;
+                    let member_leaves: Vec<usize> = star
+                        .member_nodes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &node)| {
+                            if star.has_upstream && i == last {
+                                tree.n_leaves() - below[l as usize]
+                            } else {
+                                below[node as usize]
+                            }
+                        })
+                        .collect();
+                    let structural = rebuilds_the_same_splits(
+                        &result,
+                        k_lo,
+                        k_hi,
+                        &member_leaves,
+                        tree.n_leaves(),
+                    );
+
+                    let spliced = splice_star(&tree, &star, None).expect("splice");
+                    let by_fingerprint = crate::search::split_fingerprint(&spliced.tree) == here;
+                    assert_eq!(
+                        structural, by_fingerprint,
+                        "seed {seed}, edge {k}: the structural filter said {structural} and the \
+                         fingerprint said {by_fingerprint}"
+                    );
+                    if structural {
+                        same += 1;
+                    } else {
+                        different += 1;
+                    }
+                }
+            }
+        }
+        // A filter that never fires and one that always does are both useless,
+        // so both outcomes have to be represented.
+        println!("{same} proposals rebuilt the same splits, {different} did not");
+        assert!(
+            same > 0 && different > 0,
+            "{same} same, {different} different"
+        );
     }
 
     #[test]

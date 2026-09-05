@@ -50,7 +50,11 @@ use crate::utils::traits::BonsaiFloat;
 /// as a member is what makes one number serve both the root and an internal
 /// node, so "more than two children" in SPEC.md section 9.2 becomes "more than
 /// three members" here and the root's trifurcation is correctly left alone.
-const RESOLVED_STAR_MEMBERS: usize = 3;
+///
+/// `pub(crate)` because [`crate::search::spr`] keeps its own copy of the same
+/// number with a test pinning the two together, which is one constant with two
+/// homes.
+pub(crate) const RESOLVED_STAR_MEMBERS: usize = 3;
 
 ///////////////////
 // Input, output //
@@ -577,6 +581,33 @@ fn collapse_zero_edges(tree: &Tree) -> Result<Option<Tree>, BonsaiErrors> {
 /// seeds came out with a worse Robinson-Foulds despite a four-fold larger gain,
 /// which is the data's noise rather than the search's doing.
 ///
+/// ### What a sweep costs, and what is left in it
+///
+/// One resolution per sweep and one settling of the whole tree per sweep, so
+/// the step is `O(sweeps * n * p)` and `sweeps` grows with the leaf count.
+/// Measured 2026-09-06 at 200 features on the tree search step 2 leaves behind,
+/// timing `NodeState::prune` and `UpState::sweep` separately against the step
+/// as a whole:
+///
+/// | leaves | sweeps | per sweep | down | up | the two as a share |
+/// |---|---|---|---|---|---|
+/// | 1024 | 8 | 1.82 ms | 1.04 | 0.52 | 86 per cent |
+/// | 2048 | 30 | 3.58 ms | 2.08 | 1.13 | 90 per cent |
+/// | 4096 | 107 | 7.20 ms | 4.26 | 2.63 | 96 per cent |
+///
+/// Everything this module does per sweep is now the remaining 4 per cent, and
+/// the exponent is the two settling sweeps against a resolution count that
+/// grows. Getting it down needs one of two things, both outside this module.
+/// Either [`NodeState`] and [`UpState`] gain a way to settle only the rows a
+/// sweep actually reads, which is the down rows of a polytomy centre's children
+/// and the up row of the centre itself, `O(n_polytomies * depth * p)` rather
+/// than `O(n p)`; or they gain a way to be reused across sweeps, since
+/// `NodeState::prune` asserts on the node count and every sweep therefore
+/// reallocates and refills two `n * p` slabs. Resolving several polytomies per
+/// sweep would do it too and is not available: a resolution changes every up
+/// row in the tree, so the second centre of a sweep would be resolved against
+/// stale rows and the answer would move.
+///
 /// ### Params
 ///
 /// * `tree` - Tree to resolve; not modified
@@ -617,13 +648,26 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
 
         let mut accepted: Option<Splice> = None;
         for node in tree.internal_postorder() {
-            let star = centre_star(&tree, &down, &up, node)?;
-            if !star.is_polytomy() {
+            // The degree test first, off the tree, and the star only for a node
+            // that passes it. `CentreStar::is_polytomy` reads nothing the tree
+            // does not already hold, and building a star copies `O(deg * p)`
+            // rows, so asking it the other way round copied the whole tree's
+            // rows once a sweep to answer a question about node degrees.
+            if !is_polytomy(&tree, node) {
                 continue;
             }
-            let spliced = splice_star(&tree, &star, params)?;
-            if spliced.n_merges > 0 {
-                accepted = Some(spliced);
+            let star = centre_star(&tree, &down, &up, node)?;
+            // Splicing builds a tree, which is `O(n)`; the primitive that
+            // decides whether there is anything to splice is `O(deg^3 p)` over
+            // a handful of members. So resolve first and splice only the
+            // resolution that is kept.
+            let result = resolve_star(star.view(), params)?;
+            if !result.merges.is_empty() {
+                accepted = Some(Splice {
+                    gain: result.merges.iter().map(|x| x.gain).sum(),
+                    n_merges: result.merges.len(),
+                    tree: splice_result(&tree, &star, &result)?,
+                });
                 break;
             }
         }
@@ -646,6 +690,24 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
     })
 }
 
+/// Whether resolving a node's star could change anything, read off the tree.
+///
+/// The same test as [`CentreStar::is_polytomy`] and the reason that one exists
+/// as well: a sweep needs the answer for every node and the star for almost
+/// none of them.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `node` - Internal node to test
+///
+/// ### Returns
+///
+/// True when the node carries more members than the primitive stops at.
+fn is_polytomy(tree: &Tree, node: u32) -> bool {
+    tree.children(node).len() + usize::from(tree.parent(node).is_some()) > RESOLVED_STAR_MEMBERS
+}
+
 /// Count the nodes whose star is bigger than the primitive stops at.
 ///
 /// ### Params
@@ -657,10 +719,7 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
 /// The number of polytomies, the root's trifurcation not among them.
 fn count_polytomies(tree: &Tree) -> usize {
     tree.internal_postorder()
-        .filter(|&node| {
-            tree.children(node).len() + usize::from(tree.parent(node).is_some())
-                > RESOLVED_STAR_MEMBERS
-        })
+        .filter(|&node| is_polytomy(tree, node))
         .count()
 }
 

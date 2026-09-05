@@ -110,15 +110,6 @@ use std::cell::OnceCell;
 /// magnitude of headroom on that.
 const DEFAULT_MAX_ROUNDS: usize = 100;
 
-/// Members a star must exceed before it is worth resolving.
-///
-/// A copy of the threshold [`crate::search::polytomy::CentreStar::is_polytomy`]
-/// applies, which is private to that module. It is needed here to answer, from
-/// the arena alone, whether an attachment left a polytomy behind.
-/// `test_the_polytomy_threshold_matches_the_primitive` pins this copy against
-/// the predicate itself, so the two cannot drift apart silently.
-const RESOLVED_STAR_MEMBERS: usize = 3;
-
 /// Which subtree the sweep considers next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PruneOrder {
@@ -1098,7 +1089,7 @@ fn propose<T: BonsaiFloat>(
     // reads if there is are the ones the regraft left alone plus the centre's
     // own ancestors.
     let members = attached.children(centre).len() + usize::from(attached.parent(centre).is_some());
-    if members <= RESOLVED_STAR_MEMBERS {
+    if members <= crate::search::polytomy::RESOLVED_STAR_MEMBERS {
         return Ok(Some(attached));
     }
     let attached_rows = LazyRows::new(&attached, &to_old, tree, down)?;
@@ -1516,7 +1507,7 @@ mod tests {
                 regraft(&pruned, x, target, best.branch, tree.n_leaves()).expect("regraft");
             let members =
                 attached.children(centre).len() + usize::from(attached.parent(centre).is_some());
-            if members <= RESOLVED_STAR_MEMBERS {
+            if members <= crate::search::polytomy::RESOLVED_STAR_MEMBERS {
                 continue;
             }
             let attached_rows = LazyRows::new(&attached, &to_old, tree, &down).expect("rows");
@@ -1827,9 +1818,9 @@ mod tests {
     fn test_the_polytomy_threshold_matches_the_primitive() {
         // `propose` decides from the arena alone whether an attachment left a
         // polytomy, rather than settling the attached tree and asking the star
-        // it builds. The two have to give the same answer, and the copy of the
-        // threshold that makes them do so is the only thing here that can
-        // drift.
+        // it builds. Both now read the same `RESOLVED_STAR_MEMBERS`, so the
+        // threshold can no longer drift, but the two decision paths are still
+        // independent and this is what says they agree.
         for members in 1..=6usize {
             let star = CentreStar::<f64> {
                 centre: 0,
@@ -1843,7 +1834,7 @@ mod tests {
             };
             assert_eq!(
                 star.is_polytomy(),
-                members > RESOLVED_STAR_MEMBERS,
+                members > crate::search::polytomy::RESOLVED_STAR_MEMBERS,
                 "{members} members"
             );
         }

@@ -7,8 +7,10 @@ Leonardo, Pachkov and van Nimwegen, *Bonsai reconstructs tree representations fo
 distortion-free visualization and exploration of high-dimensional data*, Nature
 Biotechnology 2026, [doi 10.1038/s41587-026-03220-2](https://doi.org/10.1038/s41587-026-03220-2).
 
-**Status: early. The likelihood machinery works and is tested; the tree search
-is being built.**
+**Status: complete against the specification, not yet validated against real
+data.** All seven search steps, ingest, backbone mode, Newick, 2D layouts and
+per-node posteriors are implemented and tested. What has not happened is a run
+on a real dataset or a comparison against the reference implementation.
 
 ## What it does, and why you might want it
 
@@ -62,7 +64,28 @@ when, and by whom. Contributors: read it before opening the editor.
 
 ## Performance
 
-The pruning sweep at 8192 cells by 2000 features, on one M1 Max:
+End to end, `bonsai()` on one M1 Max, simulated data:
+
+| cells | features | seconds |
+|---|---|---|
+| 512 | 2000 | 5.9 |
+| 2048 | 200 | 17.1 |
+| 2048 | 2000 | 70.9 |
+
+Scaling by step, exponents fitted over 256 to 2048 leaves: the greedy merge is
+`n^1.65`, subtree pruning and regrafting `n^1.50`, branch-length optimisation
+linear. Nearest-neighbour interchange is `n^3.05` and is being worked on; it is
+twelve per cent of the runtime at 2048 cells and would dominate at atlas scale.
+
+**Extrapolating to thirty thousand cells gives hours, not minutes.** The paper
+reports under a day on ten CPUs for the same size, so on the search this is in
+the same territory as the reference rather than ahead of it. That comparison has
+not been run and the number above is an extrapolation, not a measurement.
+
+### Where the speed actually is
+
+The likelihood kernel, which everything else calls, at 8192 cells by 2000
+features:
 
 | | time |
 |---|---|
@@ -72,15 +95,37 @@ The pruning sweep at 8192 cells by 2000 features, on one M1 Max:
 | Rust, feature-blocked parallel, `f32` | 5.2 ms |
 
 Loglikelihoods agree with the numpy reference to twelve significant figures. The
-baseline is `reference/bonsai_ref.py`, written independently from the same spec,
-not the published implementation, which has not been run.
+baseline is `reference/bonsai_ref.py`, written independently from the same
+specification; the published implementation has not been run.
 
-That is the likelihood kernel on a fixed topology, which is the thing everything
-else calls. It is not an end-to-end claim.
+**That is the kernel in isolation and not an end-to-end claim.** The search has
+costs the kernel benchmark never touches, which is why the table above it is the
+honest one to quote.
 
 The parallel axis is the feature axis, not the tree level, because the model
 factorises over features. That makes it indifferent to tree shape: a pathological
 ladder tree runs in 9.0 ms where level-parallelism takes 67.7 ms.
+
+## Reconstruction quality
+
+Against simulated data with known ground truth, correlation between tree path
+distance and true squared Euclidean distance, which is the relation the paper's
+Fig. S8 plots and the property the method claims over UMAP and tSNE:
+
+| cells | features | noise | generating tree | this crate | Robinson-Foulds |
+|---|---|---|---|---|---|
+| 64 | 500 | 0.1 | 0.9650 | 0.9804 | 0 |
+| 256 | 500 | 0.5 | 0.9418 | 0.9527 | 0 |
+| 256 | 2000 | 0.1 | 0.9817 | 0.9901 | 0 |
+
+Topology is recovered exactly at these noise levels. Scoring above the
+generating tree is expected rather than suspicious: that tree's branch lengths
+are diffusion times, the *expected* squared displacement, while these are fitted
+to what was realised.
+
+Recovery improves with more features, 0.9418 to 0.9817 at 256 cells going from
+500 to 2000, which is the blessing of dimensionality the paper reports in
+Figs. S12 and S13.
 
 ## Citing
 

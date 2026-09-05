@@ -18,7 +18,7 @@
 //! correlating against unsquared distance would be measuring something the
 //! method never claimed.
 
-use crate::tree::{NO_NODE, Tree};
+use crate::tree::Tree;
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::{BonsaiFloat, wide};
 
@@ -64,11 +64,11 @@ pub fn distances_from(tree: &Tree, source: u32) -> Vec<f64> {
                 queue.push(child);
             }
         }
-        if let Some(up) = tree.parent(node) {
-            if dist[up as usize].is_infinite() {
-                dist[up as usize] = here + tree.branch(node);
-                queue.push(up);
-            }
+        if let Some(up) = tree.parent(node)
+            && dist[up as usize].is_infinite()
+        {
+            dist[up as usize] = here + tree.branch(node);
+            queue.push(up);
         }
     }
     dist
@@ -248,6 +248,7 @@ pub fn distance_recovery<T: BonsaiFloat>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::NO_NODE;
     use crate::tree::simulate::{SimulationParams, simulate_binary};
     use approx::assert_relative_eq;
 

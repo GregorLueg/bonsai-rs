@@ -53,6 +53,17 @@
 //! interchanges of [`crate::search::nni`] take the same discipline for the same
 //! reason.
 //!
+//! That prune is `O(n p)` and it stays, because it is what makes the sweep
+//! monotone in the quantity that matters. It is affordable because almost
+//! nothing reaches it: a proposal whose splits match the current tree's is
+//! discarded first, and on a searched tree that is all but a handful of the
+//! candidates. Measured 2026-08-31 at 512 leaves and 200 features, it was 0.03
+//! per cent of step 5's running time. **What was expensive was proposing**, not
+//! accepting: settling the tree the cut leaves behind and the tree the regraft
+//! builds, and collapsing the first onto every node, five `O(n p)` sweeps per
+//! candidate for rows of which a few dozen are ever read. [`LazyRows`] forms
+//! the ones that are read and no others, which is what took step 5 off `n^1.9`.
+//!
 //! ### This is a topology search and only a topology search
 //!
 //! A regraft that puts the subtree back on the split it came off is not a move.
@@ -69,16 +80,18 @@
 //! independently and for the same reason.
 
 use crate::errors::BonsaiErrors;
-use crate::model::global::UpState;
 use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place};
 use crate::search::Leaves;
-use crate::search::polytomy::{centre_star, splice_star};
+use crate::search::polytomy::{CentreStar, splice_star};
 use crate::search::star::StarParams;
 use crate::tree::{NO_NODE, Tree};
+use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
+use crate::utils::simd::prune_binary;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
+use std::cell::OnceCell;
 
 ////////////////
 // Parameters //
@@ -96,6 +109,15 @@ use crate::utils::traits::{BonsaiFloat, narrow, wide};
 /// two to four rounds and never more. A hundred is more than an order of
 /// magnitude of headroom on that.
 const DEFAULT_MAX_ROUNDS: usize = 100;
+
+/// Members a star must exceed before it is worth resolving.
+///
+/// A copy of the threshold [`crate::search::polytomy::CentreStar::is_polytomy`]
+/// applies, which is private to that module. It is needed here to answer, from
+/// the arena alone, whether an attachment left a polytomy behind.
+/// `test_the_polytomy_threshold_matches_the_primitive` pins this copy against
+/// the predicate itself, so the two cannot drift apart silently.
+const RESOLVED_STAR_MEMBERS: usize = 3;
 
 /// Which subtree the sweep considers next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,17 +361,17 @@ fn can_prune(tree: &Tree, x: u32) -> bool {
 /// A detached subtree and the tree left behind.
 ///
 /// The remaining tree is a real arena with its own leaf numbering, because
-/// everything downstream of pruning wants one: [`NodeState::new`] needs the
-/// leaves at `0..k` and [`place`] needs a [`Tree`]. The original-space arrays
-/// are kept alongside it, because the regraft has to be assembled in the
-/// numbering the detached subtree is still expressed in.
-struct Pruned<T> {
+/// [`place`] needs a [`Tree`]. The original-space arrays are kept alongside it,
+/// because the regraft has to be assembled in the numbering the detached
+/// subtree is still expressed in.
+///
+/// The leaf data is **not** copied over. It used to be, to build a
+/// [`NodeState`] for the remaining tree, and that copy was `O(n p)` per
+/// candidate subtree for a state whose rows are almost all equal to rows the
+/// original tree already holds; [`LazyRows`] reads those instead.
+struct Pruned {
     /// The remaining tree, leaves renumbered into `0..k`.
     tree: Tree,
-    /// Its leaf means, `[leaf][feature]`, row-major.
-    means: Vec<T>,
-    /// Its leaf precisions, same layout.
-    precisions: Vec<T>,
     /// Original node index of each node of `tree`.
     to_old: Vec<u32>,
     /// Detached parent array in the original index space: [`NO_NODE`] at the
@@ -368,23 +390,17 @@ struct Pruned<T> {
 /// ### Params
 ///
 /// * `tree` - The tree; not modified
-/// * `leaves` - The leaf data the tree is scored against
 /// * `x` - Node to detach
 ///
 /// ### Returns
 ///
 /// The remaining tree and the maps back, `None` if `x` may not be pruned, or
 /// the error the arena failed with.
-fn prune_subtree<T: BonsaiFloat>(
-    tree: &Tree,
-    leaves: Leaves<'_, T>,
-    x: u32,
-) -> Result<Option<Pruned<T>>, BonsaiErrors> {
+fn prune_subtree(tree: &Tree, x: u32) -> Result<Option<Pruned>, BonsaiErrors> {
     let Some(par) = tree.parent(x).filter(|_| can_prune(tree, x)) else {
         return Ok(None);
     };
     let n = tree.n_nodes();
-    let p = leaves.n_features;
     let mut parent: Vec<u32> = (0..n)
         .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
         .collect();
@@ -430,18 +446,8 @@ fn prune_subtree<T: BonsaiFloat>(
             to_old[new as usize] = old as u32;
         }
     }
-    let mut means = Vec::with_capacity(remaining.n_leaves() * p);
-    let mut precisions = Vec::with_capacity(remaining.n_leaves() * p);
-    for &old in to_old.iter().take(remaining.n_leaves()) {
-        let lo = old as usize * p;
-        means.extend_from_slice(&leaves.means[lo..lo + p]);
-        precisions.extend_from_slice(&leaves.precisions[lo..lo + p]);
-    }
-
     Ok(Some(Pruned {
         tree: remaining,
-        means,
-        precisions,
         to_old,
         parent,
         branch,
@@ -449,68 +455,488 @@ fn prune_subtree<T: BonsaiFloat>(
     }))
 }
 
-//////////////////////
-// Effective leaves //
-//////////////////////
+//////////////////
+// Settled rows //
+//////////////////
 
-/// The whole tree collapsed onto every node, which is what [`place`] scores
-/// against.
+/// One node's settled row, means and precisions.
 ///
-/// Two rows meet at a node: the subtree below it, which [`NodeState::prune`]
-/// leaves in place, and everything outside that subtree, which [`UpState`]
-/// leaves sitting at the node's *parent* and which therefore has to be diffused
-/// down the branch above the node before the two can be combined. The root has
-/// no up-part at all, so its row is its down row untouched.
+/// Owned and boxed rather than written into a slab, because the beam search's
+/// provider hands out a borrow that has to stay valid for the whole search
+/// while later rows are still being formed behind it.
+type Row<T> = (Box<[T]>, Box<[T]>);
+
+/// A tree's settled rows, computed only where they are read.
+///
+/// One proposal used to settle two whole trees, the one the cut leaves behind
+/// and the one the regraft builds, and to collapse every node of the first into
+/// an effective leaf for the beam search to score against. Five `O(n p)` sweeps
+/// per candidate subtree and `O(n)` candidate subtrees a round is where step
+/// 5's quadratic term lived.
+///
+/// Almost none of it is read. The beam search scores a few dozen nodes of a
+/// balanced tree, not all of them ([`PlacementParams::tolerance`] records 13 of
+/// 127 and 18 of 511), and the resolution that follows reads a handful of rows
+/// at one node. So the rows are computed on demand and remembered, and the ones
+/// nobody asks for are never formed.
+///
+/// ### Why on-demand is the same arithmetic and not an approximation of it
+///
+/// **Down rows.** Cutting a subtree out and hanging it back somewhere else
+/// leaves most subtrees alone, and a node whose subtree did not change keeps
+/// the down row it had bit for bit, because [`NodeState::prune`] would walk the
+/// same children in the same order with the same branch lengths and the kernels
+/// are deterministic. `inherited` marks those and points them at the rows of
+/// the tree the move started from; the rest are the ancestors of the cut and of
+/// the attachment, `O(depth)` of them, and are recomputed here bottom-up
+/// through the same kernels [`NodeState::prune`] dispatches to.
+///
+/// The test deciding which is which compares the children one for one and in
+/// order, so a node the arena renumbered into a different child order fails it
+/// and is recomputed. That is the conservative direction, and it is what makes
+/// this safe on the regrafted tree, whose attachment raises its ancestors'
+/// heights and so can reorder them among their siblings.
+///
+/// **Up rows.** [`crate::model::global::UpState::sweep`] writes a node's
+/// children from the node's own up row, working down from the root, so the up
+/// row at one node depends only on the chain of nodes above it. Filling that
+/// chain and nothing else gives the same numbers as sweeping the whole arena,
+/// which is why this is a different traversal of the same recursion rather
+/// than a different recursion.
+/// The chain is filled from the top down and not by recursing, so a ladder does
+/// not put its depth on the stack.
+///
+/// `test_the_lazy_rows_match_a_full_settle` pins every row of both against a
+/// full [`NodeState::prune`], a full [`crate::model::global::UpState::sweep`]
+/// and a collapse of every node, bit for bit, at every node of both trees a
+/// proposal builds. That is the gate this is allowed through on.
+struct LazyRows<'a, T> {
+    /// The tree the rows describe.
+    tree: &'a Tree,
+    /// Number of features.
+    p: usize,
+    /// Down rows of the tree the move started from.
+    base: &'a NodeState<T>,
+    /// Per node, the node of that tree whose down row it still has, or
+    /// [`NO_NODE`] where the move changed it.
+    inherited: Vec<u32>,
+    /// Per node, its row in `fresh_m` and `fresh_w`, or [`NO_NODE`].
+    slot: Vec<u32>,
+    /// Recomputed down means, `[slot][feature]`, row-major.
+    fresh_m: Vec<T>,
+    /// Recomputed down precisions, same layout.
+    fresh_w: Vec<T>,
+    /// Up rows, filled a chain at a time.
+    up: Vec<OnceCell<Row<T>>>,
+    /// Effective leaves, filled as the beam search asks for them.
+    eff: Vec<OnceCell<Row<T>>>,
+}
+
+impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
+    /// Mark what the move changed and recompute exactly that.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - The tree the rows are to describe
+    /// * `to_old` - Per node of `tree`, its index in `was`, or [`NO_NODE`] for
+    ///   a node the move created
+    /// * `was` - The tree the move started from
+    /// * `base` - Down rows settled against `was`
+    ///
+    /// ### Returns
+    ///
+    /// The rows, ready to be read, or `MalformedTree` if `to_old` sends a leaf
+    /// anywhere but to a leaf. [`assemble`] never does, because it numbers the
+    /// leaves it keeps out of the leaves it was given, but a row read through a
+    /// map that did would silently be the wrong node's.
+    fn new(
+        tree: &'a Tree,
+        to_old: &[u32],
+        was: &Tree,
+        base: &'a NodeState<T>,
+    ) -> Result<Self, BonsaiErrors> {
+        let p = base.n_features();
+        let n = tree.n_nodes();
+
+        // A node keeps its row when the cut left its whole subtree alone, which
+        // is a local test once the children have been tested: same children, in
+        // the same order, on the same branches, and each of them keeping its
+        // own row. The arena orders children ascending and puts every child
+        // below its parent, so one pass over `0..n` settles all of them.
+        let mut inherited = vec![NO_NODE; n];
+        for v in 0..n {
+            let old = to_old[v];
+            if old == NO_NODE || old as usize >= was.n_nodes() {
+                continue;
+            }
+            if v < tree.n_leaves() {
+                // A leaf's row is its own observation, so it is always
+                // inherited and never recomputed; nothing here would know how.
+                if old as usize >= was.n_leaves() {
+                    return Err(BonsaiErrors::MalformedTree {
+                        reason: format!("leaf {v} maps to node {old}, which is not a leaf"),
+                    });
+                }
+                inherited[v] = old;
+                continue;
+            }
+            let kids = tree.children(v as u32);
+            let before = was.children(old);
+            let same = kids.len() == before.len()
+                && kids
+                    .iter()
+                    .zip(before)
+                    .all(|(&c, &b)| inherited[c as usize] == b && tree.branch(c) == was.branch(b));
+            if same {
+                inherited[v] = old;
+            }
+        }
+
+        let dirty: Vec<u32> = (tree.n_leaves()..n)
+            .filter(|&v| inherited[v] == NO_NODE)
+            .map(|v| v as u32)
+            .collect();
+        let mut slot = vec![NO_NODE; n];
+        for (i, &v) in dirty.iter().enumerate() {
+            slot[v as usize] = i as u32;
+        }
+
+        let mut rows = Self {
+            tree,
+            p,
+            base,
+            inherited,
+            slot,
+            fresh_m: vec![T::zero(); dirty.len() * p],
+            fresh_w: vec![T::zero(); dirty.len() * p],
+            up: (0..n).map(|_| OnceCell::new()).collect(),
+            eff: (0..n).map(|_| OnceCell::new()).collect(),
+        };
+
+        // Ascending node index is a valid post-order on the arena, so a dirty
+        // node's dirty children are already done when it is reached.
+        let mut scratch: Vec<f64> = Vec::new();
+        for &v in &dirty {
+            let here = rows.slot[v as usize] as usize * p;
+            let kids = rows.tree.children(v);
+            let children: Vec<(&[T], &[T], f64)> = kids
+                .iter()
+                .map(|&c| {
+                    let (m, w) = read_down(&rows, c);
+                    (m, w, rows.tree.branch(c))
+                })
+                .collect();
+            // Written aside and copied in, because the children borrow the
+            // slab the answer goes into whenever one of them is dirty too.
+            let mut m_out = vec![T::zero(); p];
+            let mut w_out = vec![T::zero(); p];
+            if children.len() == 2 {
+                prune_binary(
+                    children[0].0,
+                    children[0].1,
+                    children[0].2,
+                    children[1].0,
+                    children[1].1,
+                    children[1].2,
+                    &mut m_out,
+                    &mut w_out,
+                );
+            } else {
+                if scratch.len() < p * children.len() {
+                    scratch.resize(p * children.len(), 0.0);
+                }
+                prune_general(
+                    &children,
+                    &mut m_out,
+                    &mut w_out,
+                    &mut scratch[..p * children.len()],
+                );
+            }
+            drop(children);
+            rows.fresh_m[here..here + p].copy_from_slice(&m_out);
+            rows.fresh_w[here..here + p].copy_from_slice(&w_out);
+        }
+        Ok(rows)
+    }
+
+    /// The down row of one node.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node of the pruned tree
+    ///
+    /// ### Returns
+    ///
+    /// Its effective means and precisions.
+    fn down_row(&self, node: u32) -> (&[T], &[T]) {
+        read_down(self, node)
+    }
+
+    /// The up row of one node, filling the chain above it if it is not there.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node of the pruned tree
+    ///
+    /// ### Returns
+    ///
+    /// Everything outside the node's subtree, positioned at its parent and not
+    /// diffused along the branch above it, which is the up sweep's convention.
+    fn up_row(&self, node: u32) -> &Row<T> {
+        let mut chain: Vec<u32> = Vec::new();
+        let mut here = node;
+        while self.up[here as usize].get().is_none() {
+            chain.push(here);
+            match self.tree.parent(here) {
+                None => break,
+                Some(a) => here = a,
+            }
+        }
+        for &v in chain.iter().rev() {
+            let row = self.compute_up(v);
+            let _ = self.up[v as usize].set(row);
+        }
+        // Filled by the loop above, so the initialiser never runs; it is here
+        // because `get` returns an option and this module does not unwrap.
+        self.up[node as usize].get_or_init(|| self.compute_up(node))
+    }
+
+    /// One node's up row, from its parent's.
+    ///
+    /// A transcription of [`crate::model::global::UpState::sweep`]'s per-node
+    /// step, for one child rather than for all of them at once. Both arms are
+    /// the same expressions in the same order, which is what makes the answer
+    /// the same bits.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node of the pruned tree whose parent's up row is settled
+    ///
+    /// ### Returns
+    ///
+    /// The node's up row.
+    fn compute_up(&self, node: u32) -> Row<T> {
+        let p = self.p;
+        let Some(a) = self.tree.parent(node) else {
+            // The root has nothing outside it.
+            return (
+                vec![T::zero(); p].into_boxed_slice(),
+                vec![T::zero(); p].into_boxed_slice(),
+            );
+        };
+        let mut m_out = vec![T::zero(); p];
+        let mut w_out = vec![T::zero(); p];
+
+        let is_root = self.tree.parent(a).is_none();
+        let t_a = self.tree.branch(a);
+        let above = self.up_row(a);
+        let (up_m, up_w) = (&above.0, &above.1);
+        let kids = self.tree.children(a);
+        let t_c = self.tree.branch(node);
+        let (m_c, w_c) = self.down_row(node);
+
+        if kids.len() == 2 {
+            let other = if kids[0] == node { kids[1] } else { kids[0] };
+            let t_o = self.tree.branch(other);
+            let (m_o, w_o) = self.down_row(other);
+            for g in 0..p {
+                let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
+                let wo = wide(w_o[g]);
+                let wdo = wo / (1.0 + t_o * wo);
+                let mo = wide(m_o[g]);
+                let tot = wdo + w_up;
+                w_out[g] = narrow(tot);
+                m_out[g] = narrow(mo + (m_up - mo) * (w_up / tot));
+            }
+            return (m_out.into_boxed_slice(), w_out.into_boxed_slice());
+        }
+
+        let (m_a, w_a) = self.down_row(a);
+        for g in 0..p {
+            let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
+            let ma = wide(m_a[g]);
+            let tot = wide(w_a[g]) + w_up;
+            let m_tot = ma + (m_up - ma) * (w_up / tot);
+            let wc = wide(w_c[g]);
+            let wdc = wc / (1.0 + t_c * wc);
+            let rest = tot - wdc;
+            let mc = wide(m_c[g]);
+            w_out[g] = narrow(rest);
+            m_out[g] = narrow(m_tot + (m_tot - mc) * (wdc / rest));
+        }
+        (m_out.into_boxed_slice(), w_out.into_boxed_slice())
+    }
+
+    /// The whole tree collapsed onto one node.
+    ///
+    /// Two rows meet at a node: the subtree below it, which
+    /// [`NodeState::prune`] leaves in place, and everything outside that
+    /// subtree, which the up sweep leaves sitting at the node's *parent* and
+    /// which therefore has to be diffused down the branch above the node
+    /// before the two can be combined. The root has no up part at all, so its row is
+    /// its down row untouched, and that is guarded on the root rather than on a
+    /// zero up precision because the root's own branch entry is not part of the
+    /// tree and is allowed to hold anything at all, a NaN included.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node of the pruned tree
+    ///
+    /// ### Returns
+    ///
+    /// The effective leaf the beam search scores an attachment against.
+    fn eff_leaf(&self, node: u32) -> EffLeaf<'_, T> {
+        let rows = self.eff[node as usize].get_or_init(|| {
+            let p = self.p;
+            let is_root = self.tree.parent(node).is_none();
+            let t = self.tree.branch(node);
+            let (m_down, w_down) = self.down_row(node);
+            let above = self.up_row(node);
+            let (m_up, w_up) = (&above.0, &above.1);
+            let mut m = vec![T::zero(); p];
+            let mut w = vec![T::zero(); p];
+            for g in 0..p {
+                let w_above = if is_root {
+                    0.0
+                } else {
+                    let wu = wide(w_up[g]);
+                    wu / (1.0 + t * wu)
+                };
+                let below = wide(w_down[g]);
+                let total = below + w_above;
+                let md = wide(m_down[g]);
+                m[g] = narrow(md + (wide(m_up[g]) - md) * (w_above / total));
+                w[g] = narrow(total);
+            }
+            (m.into_boxed_slice(), w.into_boxed_slice())
+        });
+        EffLeaf {
+            m: &rows.0,
+            w: &rows.1,
+        }
+    }
+}
+
+/// The star around a node, read off rows rather than off a settled tree.
+///
+/// The same star [`centre_star`] builds, member for member and in the same
+/// order, which matters because the primitive's pair scan and its tie-breaking
+/// both read the member order.
 ///
 /// ### Params
 ///
 /// * `tree` - The tree
-/// * `down` - Down rows, settled by [`NodeState::prune`] against this tree
-/// * `up` - Up rows, settled by [`UpState::sweep`] against the same
+/// * `rows` - Its rows
+/// * `centre` - Internal node to build the star around
 ///
 /// ### Returns
 ///
-/// The means and precisions, `[node][feature]` row-major.
-fn collapse<T: BonsaiFloat>(tree: &Tree, down: &NodeState<T>, up: &UpState<T>) -> (Vec<T>, Vec<T>) {
-    let p = down.n_features();
-    let n = tree.n_nodes();
-    let mut means = vec![T::zero(); n * p];
-    let mut precisions = vec![T::zero(); n * p];
-
-    for a in 0..n {
-        let node = a as u32;
-        let is_root = tree.parent(node).is_none();
-        let t = tree.branch(node);
-        let (m_down, w_down) = (down.means(node), down.precisions(node));
-        let (m_up, w_up) = (up.means(node), up.precisions(node));
-        let base = a * p;
-        for g in 0..p {
-            // Guarded on the root rather than on a zero up precision: the
-            // root's own branch entry is not part of the tree and is allowed to
-            // hold anything at all, a NaN included.
-            let w_above = if is_root {
-                0.0
-            } else {
-                let w = wide(w_up[g]);
-                w / (1.0 + t * w)
-            };
-            let below = wide(w_down[g]);
-            let total = below + w_above;
-            let m = wide(m_down[g]);
-            // A convex combination, so the result is pinned between the two
-            // means it interpolates and cannot cancel.
-            means[base + g] = narrow(m + (wide(m_up[g]) - m) * (w_above / total));
-            precisions[base + g] = narrow(total);
-        }
+/// The star, or `NodeOutOfRange` for an index outside the arena, or
+/// `MalformedTree` if the centre is a leaf.
+fn lazy_centre_star<T: BonsaiFloat>(
+    tree: &Tree,
+    rows: &LazyRows<'_, T>,
+    centre: u32,
+) -> Result<CentreStar<T>, BonsaiErrors> {
+    if centre as usize >= tree.n_nodes() {
+        return Err(BonsaiErrors::NodeOutOfRange {
+            index: centre as usize,
+            n_nodes: tree.n_nodes(),
+        });
     }
-    (means, precisions)
+    let kids = tree.children(centre);
+    if kids.is_empty() {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!("node {centre} is a leaf and has no star around it"),
+        });
+    }
+
+    let p = rows.p;
+    let parent = tree.parent(centre);
+    let n = kids.len() + usize::from(parent.is_some());
+    let mut star = CentreStar {
+        centre,
+        member_nodes: Vec::with_capacity(n),
+        has_upstream: parent.is_some(),
+        deleted: Vec::new(),
+        means: Vec::with_capacity(n * p),
+        precisions: Vec::with_capacity(n * p),
+        branch: Vec::with_capacity(n),
+        n_features: p,
+    };
+    for &child in kids {
+        let (m, w) = rows.down_row(child);
+        star.member_nodes.push(child);
+        star.means.extend_from_slice(m);
+        star.precisions.extend_from_slice(w);
+        star.branch.push(tree.branch(child));
+    }
+    if let Some(par) = parent {
+        let above = rows.up_row(centre);
+        star.member_nodes.push(par);
+        star.means.extend_from_slice(&above.0);
+        star.precisions.extend_from_slice(&above.1);
+        star.branch.push(tree.branch(centre));
+    }
+    Ok(star)
+}
+
+/// One node's down row, from wherever it lives.
+///
+/// A free function rather than a method so the constructor can call it while it
+/// is still filling the slab the dirty rows live in.
+///
+/// ### Params
+///
+/// * `rows` - The rows
+/// * `node` - Node of the pruned tree
+///
+/// ### Returns
+///
+/// Its effective means and precisions.
+fn read_down<'r, T: BonsaiFloat>(rows: &'r LazyRows<'_, T>, node: u32) -> (&'r [T], &'r [T]) {
+    let old = rows.inherited[node as usize];
+    if old != NO_NODE {
+        return (rows.base.means(old), rows.base.precisions(old));
+    }
+    let lo = rows.slot[node as usize] as usize * rows.p;
+    (
+        &rows.fresh_m[lo..lo + rows.p],
+        &rows.fresh_w[lo..lo + rows.p],
+    )
+}
+
+/// The up part of a node's own row, diffused down the branch above it.
+///
+/// A transcription of the private helper of the same name in
+/// [`crate::model::global`], which the up sweep applies before combining.
+///
+/// ### Params
+///
+/// * `is_root` - Whether the node is the root, which has no up part at all
+/// * `t_a` - Branch above the node
+/// * `w_up` - The node's up precision
+/// * `m_up` - The node's up mean
+///
+/// ### Returns
+///
+/// The diffused precision and the mean.
+fn up_part<T: BonsaiFloat>(is_root: bool, t_a: f64, w_up: T, m_up: T) -> (f64, f64) {
+    if is_root {
+        (0.0, 0.0)
+    } else {
+        (1.0 / (t_a + 1.0 / wide(w_up)), wide(m_up))
+    }
 }
 
 //////////////
 // One move //
 //////////////
 
-/// Settle a tree's down and up rows.
+/// Settle a tree's down rows alone.
+///
+/// [`spr_round`] wants the down rows and not the up ones, and the up sweep is
+/// the more expensive half of settling a tree.
 ///
 /// ### Params
 ///
@@ -519,22 +945,19 @@ fn collapse<T: BonsaiFloat>(tree: &Tree, down: &NodeState<T>, up: &UpState<T>) -
 ///
 /// ### Returns
 ///
-/// The settled rows and the tree loglikelihood, or the error the state
-/// allocation failed with.
-fn settle<T: BonsaiFloat>(
+/// The settled rows, or the error the state allocation failed with.
+fn settled_down<T: BonsaiFloat>(
     tree: &Tree,
     leaves: Leaves<'_, T>,
-) -> Result<(NodeState<T>, UpState<T>, f64), BonsaiErrors> {
+) -> Result<NodeState<T>, BonsaiErrors> {
     let mut down = NodeState::new(
         tree.n_nodes(),
         leaves.n_features,
         leaves.means,
         leaves.precisions,
     )?;
-    let loglik = down.prune(tree);
-    let mut up = UpState::new(tree.n_nodes(), leaves.n_features);
-    up.sweep(tree, &down);
-    Ok((down, up, loglik))
+    down.prune(tree);
+    Ok(down)
 }
 
 /// Loglikelihood of a tree, from the leaf data alone.
@@ -575,15 +998,19 @@ fn tree_loglik<T: BonsaiFloat>(tree: &Tree, leaves: Leaves<'_, T>) -> Result<f64
 ///
 /// ### Returns
 ///
-/// The reassembled tree and the node the attachment centred on, or the error
-/// the arena failed with.
-fn regraft<T>(
-    pruned: &Pruned<T>,
+/// The reassembled tree, the node the attachment centred on, and the original
+/// index of each of its nodes, or the error the arena failed with.
+///
+/// The fresh node an attachment below a leaf creates has no original index and
+/// is [`NO_NODE`] in the map, which is what [`LazyRows`] reads as a node the
+/// move made and has to settle.
+fn regraft(
+    pruned: &Pruned,
     x: u32,
     target: u32,
     branch: f64,
     n_leaves: usize,
-) -> Result<(Tree, u32), BonsaiErrors> {
+) -> Result<(Tree, u32, Vec<u32>), BonsaiErrors> {
     let mut par = pruned.parent.clone();
     let mut len = pruned.branch.clone();
     // A root always has children, so it is never a leaf and this arm never
@@ -603,23 +1030,34 @@ fn regraft<T>(
         target
     };
     let (tree, map) = assemble(&par, &len, pruned.root, n_leaves)?;
-    Ok((tree, map[centre as usize]))
+    let mut to_old = vec![NO_NODE; tree.n_nodes()];
+    for (old, &new) in map.iter().enumerate() {
+        if new != NO_NODE {
+            to_old[new as usize] = old as u32;
+        }
+    }
+    let centre = map[centre as usize];
+    Ok((tree, centre, to_old))
 }
 
 /// Propose the move that prunes `x` and regrafts it wherever the beam search
 /// likes best.
 ///
-/// The subtree is summarised by its own down row, which pruning does not touch,
-/// so nothing about the subtree is recomputed to propose a move. The attachment
+/// A proposal never touches the leaf data. Everything it reads is either the
+/// arena or a row of the tree it starts from, which is what
+/// [`crate::search::spr::LazyRows`] is for: the subtree is summarised by its
+/// own down row, which pruning does not touch, and the two trees the move
+/// builds are settled only at the nodes their own rows are asked for. The attachment
 /// is followed by the polytomy resolution SPEC.md section 7.3 asks for, at the
 /// attachment point and nowhere else: pruning only ever lowers a node's degree
 /// and the ancestors a resolution creates are binary, so the attachment point
-/// is the only node whose degree the move raised.
+/// is the only node whose degree the move raised. That resolution reads six
+/// rows and used to be handed them by settling the whole attached tree; see
+/// [`attachment_star`] for where they come from instead.
 ///
 /// ### Params
 ///
 /// * `tree` - The tree; not modified
-/// * `leaves` - The leaf data
 /// * `down` - Down rows, settled against `tree`
 /// * `x` - Node to prune
 /// * `params` - Knobs
@@ -630,22 +1068,14 @@ fn regraft<T>(
 /// placement, the primitive or the arena failed with.
 fn propose<T: BonsaiFloat>(
     tree: &Tree,
-    leaves: Leaves<'_, T>,
     down: &NodeState<T>,
     x: u32,
     params: &SprParams,
 ) -> Result<Option<Tree>, BonsaiErrors> {
-    let Some(pruned) = prune_subtree(tree, leaves, x)? else {
+    let Some(pruned) = prune_subtree(tree, x)? else {
         return Ok(None);
     };
-    let p = leaves.n_features;
-    let rest = Leaves {
-        means: &pruned.means,
-        precisions: &pruned.precisions,
-        n_features: p,
-    };
-    let (rest_down, rest_up, _) = settle(&pruned.tree, rest)?;
-    let (eff_m, eff_w) = collapse(&pruned.tree, &rest_down, &rest_up);
+    let rows = LazyRows::new(&pruned.tree, &pruned.to_old, tree, down)?;
 
     let q = EffLeaf {
         m: down.means(x),
@@ -654,24 +1084,25 @@ fn propose<T: BonsaiFloat>(
     let best = place(
         &pruned.tree,
         q,
-        |node: u32| {
-            let lo = node as usize * p;
-            EffLeaf {
-                m: &eff_m[lo..lo + p],
-                w: &eff_w[lo..lo + p],
-            }
-        },
+        |node: u32| rows.eff_leaf(node),
         Some(params.placement),
     )?;
 
     let target = pruned.to_old[best.node as usize];
-    let (attached, centre) = regraft(&pruned, x, target, best.branch, tree.n_leaves())?;
+    let (attached, centre, to_old) = regraft(&pruned, x, target, best.branch, tree.n_leaves())?;
 
-    let (attached_down, attached_up, _) = settle(&attached, leaves)?;
-    let star = centre_star(&attached, &attached_down, &attached_up, centre)?;
-    if !star.is_polytomy() {
+    // Settling the attached tree was the single most expensive thing a proposal
+    // did, and the only thing it fed was this resolution. Neither is needed:
+    // whether there is a resolution to do is a question about the centre's
+    // degree, which the arena answers on its own, and the handful of rows it
+    // reads if there is are the ones the regraft left alone plus the centre's
+    // own ancestors.
+    let members = attached.children(centre).len() + usize::from(attached.parent(centre).is_some());
+    if members <= RESOLVED_STAR_MEMBERS {
         return Ok(Some(attached));
     }
+    let attached_rows = LazyRows::new(&attached, &to_old, tree, down)?;
+    let star = lazy_centre_star(&attached, &attached_rows, centre)?;
     Ok(Some(splice_star(&attached, &star, Some(params.star))?.tree))
 }
 
@@ -716,7 +1147,8 @@ fn candidate_order(tree: &Tree, params: &SprParams, rng: &mut SplitMix64) -> Vec
 /// changes under it: an accepted move renumbers the arena, so each candidate is
 /// looked up by its [`leaf_words`] entry in the tree as it stands, and one
 /// whose word no longer names a node has been swallowed by an earlier move and
-/// is skipped.
+/// is skipped. Everything the scan reads off the tree is settled once and
+/// resettled only where a move actually moved it.
 ///
 /// Each candidate is scored by a fresh [`NodeState::prune`] of the tree it
 /// would produce, so an accepted move is an improvement in the quantity that
@@ -748,14 +1180,18 @@ pub fn spr_round<T: BonsaiFloat>(
     let mut best = tree_loglik(&tree, leaves)?;
     let mut gains = Vec::new();
 
+    // All three describe the tree as it stands, and a rejected candidate leaves
+    // it exactly as it stands, so they are settled once and again only when a
+    // move is accepted. The scan is sequential, which is what makes that safe.
+    let mut down = settled_down(&tree, leaves)?;
+    let mut word = crate::search::leaf_words(&tree);
+    let mut here = crate::search::split_fingerprint(&tree);
+
     for want in candidate_order(&tree, &params, &mut rng) {
-        let word = crate::search::leaf_words(&tree);
         let Some(x) = (0..tree.n_nodes() as u32).find(|&i| word[i as usize] == want) else {
             continue;
         };
-        let here = crate::search::split_fingerprint(&tree);
-        let (down, _, _) = settle(&tree, leaves)?;
-        let Some(candidate) = propose(&tree, leaves, &down, x, &params)? else {
+        let Some(candidate) = propose(&tree, &down, x, &params)? else {
             continue;
         };
         // Not a move at all, only a reoptimisation of the branches the cut
@@ -772,6 +1208,9 @@ pub fn spr_round<T: BonsaiFloat>(
             });
             best = loglik;
             tree = candidate;
+            down = settled_down(&tree, leaves)?;
+            word = crate::search::leaf_words(&tree);
+            here = crate::search::split_fingerprint(&tree);
         }
     }
 
@@ -838,12 +1277,108 @@ pub fn spr<T: BonsaiFloat>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::global::UpState;
     use crate::model::global::optimise_branch_lengths;
     use crate::model::place::attachment_score;
+    use crate::search::polytomy::{CentreStar, centre_star};
     use crate::tree::simulate::{
         SimulatedData, SimulationParams, robinson_foulds, simulate_binary, splits,
     };
     use approx::assert_relative_eq;
+
+    /// The whole tree collapsed onto every node, over the whole arena.
+    ///
+    /// The independent reference [`LazyRows`] is checked against, and nothing
+    /// else: the search reads a few dozen of these rows per candidate subtree,
+    /// and forming all `n` of them was a large part of what made step 5
+    /// quadratic.
+    ///
+    /// Two rows meet at a node: the subtree below it, which
+    /// [`NodeState::prune`] leaves in place, and everything outside that
+    /// subtree, which the up sweep leaves sitting at the node's *parent* and
+    /// which therefore has to be diffused down the branch above the node
+    /// before the two can be combined. The root has no up-part at all, so its
+    /// row is its down row untouched.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - The tree
+    /// * `down` - Down rows, settled by [`NodeState::prune`] against this tree
+    /// * `up` - Up rows, settled by the up sweep against the same
+    ///
+    /// ### Returns
+    ///
+    /// The means and precisions, `[node][feature]` row-major.
+    fn collapse<T: BonsaiFloat>(
+        tree: &Tree,
+        down: &NodeState<T>,
+        up: &UpState<T>,
+    ) -> (Vec<T>, Vec<T>) {
+        let p = down.n_features();
+        let n = tree.n_nodes();
+        let mut means = vec![T::zero(); n * p];
+        let mut precisions = vec![T::zero(); n * p];
+
+        for a in 0..n {
+            let node = a as u32;
+            let is_root = tree.parent(node).is_none();
+            let t = tree.branch(node);
+            let (m_down, w_down) = (down.means(node), down.precisions(node));
+            let (m_up, w_up) = (up.means(node), up.precisions(node));
+            let base = a * p;
+            for g in 0..p {
+                // Guarded on the root rather than on a zero up precision: the
+                // root's own branch entry is not part of the tree and is allowed to
+                // hold anything at all, a NaN included.
+                let w_above = if is_root {
+                    0.0
+                } else {
+                    let w = wide(w_up[g]);
+                    w / (1.0 + t * w)
+                };
+                let below = wide(w_down[g]);
+                let total = below + w_above;
+                let m = wide(m_down[g]);
+                // A convex combination, so the result is pinned between the two
+                // means it interpolates and cannot cancel.
+                means[base + g] = narrow(m + (wide(m_up[g]) - m) * (w_above / total));
+                precisions[base + g] = narrow(total);
+            }
+        }
+        (means, precisions)
+    }
+
+    /// Settle a tree's down and up rows, over the whole arena.
+    ///
+    /// The independent reference [`LazyRows`] is checked against, and nothing else:
+    /// the search reads a few dozen of these rows per candidate subtree and
+    /// sweeping all `n` of them, twice per proposal, was most of what made step 5
+    /// quadratic.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - The tree
+    /// * `leaves` - The leaf data
+    ///
+    /// ### Returns
+    ///
+    /// The settled rows and the tree loglikelihood, or the error the state
+    /// allocation failed with.
+    fn settle<T: BonsaiFloat>(
+        tree: &Tree,
+        leaves: Leaves<'_, T>,
+    ) -> Result<(NodeState<T>, UpState<T>, f64), BonsaiErrors> {
+        let mut down = NodeState::new(
+            tree.n_nodes(),
+            leaves.n_features,
+            leaves.means,
+            leaves.precisions,
+        )?;
+        let loglik = down.prune(tree);
+        let mut up = UpState::new(tree.n_nodes(), leaves.n_features);
+        up.sweep(tree, &down);
+        Ok((down, up, loglik))
+    }
 
     /// A small simulated dataset.
     ///
@@ -890,6 +1425,134 @@ mod tests {
         .expect("state");
         optimise_branch_lengths(&mut tree, &mut state, None).expect("branch lengths");
         tree
+    }
+
+    /// The tree search steps 1 to 4 leave for step 5.
+    ///
+    /// The generating tree with its branch lengths optimised is not that shape.
+    /// The merge scan numbers the arena its own way and leaves polytomies
+    /// behind that step 3 does not always clear, and both of those are what the
+    /// proposals here have to cope with.
+    ///
+    /// ### Params
+    ///
+    /// * `n_leaves` - Number of leaves
+    /// * `leaves` - The leaf data
+    ///
+    /// ### Returns
+    ///
+    /// The tree, with its branch lengths optimised.
+    fn searched(n_leaves: usize, leaves: Leaves<'_, f64>) -> Tree {
+        use crate::search::bounds::EllipsoidBounds;
+        use crate::search::candidates::KnnCandidates;
+        use crate::search::polytomy::resolve_polytomies;
+        use crate::search::star::{Star, star_tree_with};
+
+        let p = leaves.n_features;
+        let mut parent = vec![n_leaves as u32; n_leaves];
+        parent.push(NO_NODE);
+        let mut branch = vec![1.0f64; n_leaves];
+        branch.push(0.0);
+        let mut star = Tree::from_parents(parent, branch, n_leaves).expect("star");
+        let mut state =
+            NodeState::new(star.n_nodes(), p, leaves.means, leaves.precisions).expect("state");
+        optimise_branch_lengths(&mut star, &mut state, None).expect("step 1");
+        let mut candidates = EllipsoidBounds::new(KnnCandidates::new(None), None);
+        let (tree, _) = star_tree_with(
+            Star {
+                means: leaves.means,
+                precisions: leaves.precisions,
+                branch: &star.branches()[..n_leaves],
+                n_features: p,
+            },
+            None,
+            &mut candidates,
+        )
+        .expect("step 2");
+        let tree = resolve_polytomies(&tree, leaves, None)
+            .expect("step 3")
+            .tree;
+        optimised(&tree, leaves)
+    }
+
+    /// Every proposal step 5 would make from `tree`, with everything needed to
+    /// check the star it built.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - The tree to propose from
+    /// * `leaves` - The leaf data
+    ///
+    /// ### Returns
+    ///
+    /// Per prunable subtree, the regrafted tree, the attachment point, the star
+    /// read off rows and the star a settled attached tree gives.
+    #[allow(clippy::type_complexity)]
+    fn proposals(
+        tree: &Tree,
+        leaves: Leaves<'_, f64>,
+    ) -> Vec<(Tree, u32, CentreStar<f64>, CentreStar<f64>)> {
+        let down = settled_down(tree, leaves).expect("down");
+        let params = SprParams::default();
+        let mut out = Vec::new();
+        for x in 0..tree.n_nodes() as u32 {
+            let Some(pruned) = prune_subtree(tree, x).expect("prune") else {
+                continue;
+            };
+            let rows = LazyRows::new(&pruned.tree, &pruned.to_old, tree, &down).expect("rows");
+            let q = EffLeaf {
+                m: down.means(x),
+                w: down.precisions(x),
+            };
+            let best = place(
+                &pruned.tree,
+                q,
+                |node: u32| rows.eff_leaf(node),
+                Some(params.placement),
+            )
+            .expect("place");
+            let target = pruned.to_old[best.node as usize];
+            let (attached, centre, to_old) =
+                regraft(&pruned, x, target, best.branch, tree.n_leaves()).expect("regraft");
+            let members =
+                attached.children(centre).len() + usize::from(attached.parent(centre).is_some());
+            if members <= RESOLVED_STAR_MEMBERS {
+                continue;
+            }
+            let attached_rows = LazyRows::new(&attached, &to_old, tree, &down).expect("rows");
+            let cheap = lazy_centre_star(&attached, &attached_rows, centre).expect("lazy star");
+            let (a_down, a_up, _) = settle(&attached, leaves).expect("settle attached");
+            let settled = centre_star(&attached, &a_down, &a_up, centre).expect("centre star");
+            out.push((attached, centre, cheap, settled));
+        }
+        out
+    }
+
+    /// The leaf data of the remaining tree, in its own leaf numbering.
+    ///
+    /// [`prune_subtree`] used to gather this and no longer does, because the
+    /// search does not settle the remaining tree any more. The tests that
+    /// settle it as an independent reference still need it.
+    ///
+    /// ### Params
+    ///
+    /// * `pruned` - What [`prune_subtree`] left
+    /// * `leaves` - The original leaf data
+    ///
+    /// ### Returns
+    ///
+    /// The means and precisions, `[leaf][feature]` row-major.
+    fn pruned_leaves(pruned: &Pruned, leaves: Leaves<'_, f64>) -> (Vec<f64>, Vec<f64>) {
+        let p = leaves.n_features;
+        let n = pruned.tree.n_leaves();
+        let mut means = Vec::with_capacity(n * p);
+        let mut precisions = Vec::with_capacity(n * p);
+        for &old in pruned.to_old.iter().take(n) {
+            let lo = old as usize * p;
+            means.extend_from_slice(&leaves.means[lo..lo + p]);
+            precisions.extend_from_slice(&leaves.precisions[lo..lo + p]);
+        }
+        (means, precisions)
     }
 
     /// Every node of the subtree rooted at `x`, `x` itself included.
@@ -997,11 +1660,11 @@ mod tests {
         let before = tree_loglik(&tree, leaves).expect("loglik");
 
         let x = 6u32;
-        let pruned = prune_subtree(&tree, leaves, x)
+        let pruned = prune_subtree(&tree, x)
             .expect("prune")
             .expect("node 6 is prunable");
         assert_eq!(pruned.tree.n_leaves(), 4);
-        let (back, _) = regraft(&pruned, x, tree.root(), tree.branch(x), n).expect("regraft");
+        let (back, _, _) = regraft(&pruned, x, tree.root(), tree.branch(x), n).expect("regraft");
 
         assert_eq!(back.n_nodes(), tree.n_nodes());
         assert_eq!(splits(&back), splits(&tree));
@@ -1014,6 +1677,222 @@ mod tests {
     }
 
     #[test]
+    fn test_the_lazy_rows_match_a_full_settle() {
+        // The gate the whole optimisation rests on. Every row `LazyRows`
+        // hands out has to be the row a full settle of the remaining tree
+        // followed by a full collapse would hand out, bit for bit at every
+        // node, on shapes with polytomies and without, and for both storage
+        // types. Anything looser and the beam search could pick a different
+        // attachment point and step 5 would quietly find different trees.
+        for (n_leaves, seed, pipeline) in [
+            (16usize, 3u64, false),
+            (32, 5, false),
+            (64, 7, true),
+            (64, 11, true),
+            (128, 13, true),
+        ] {
+            let p = 24usize;
+            let (data, w) = dataset(n_leaves, p, seed);
+            let leaves = Leaves {
+                means: &data.means,
+                precisions: &w,
+                n_features: p,
+            };
+            let tree = if pipeline {
+                searched(n_leaves, leaves)
+            } else {
+                optimised(&data.tree, leaves)
+            };
+            let down = settled_down(&tree, leaves).expect("down");
+
+            let mut checked = 0usize;
+            let mut dirty_seen = 0usize;
+            for x in 0..tree.n_nodes() as u32 {
+                let Some(pruned) = prune_subtree(&tree, x).expect("prune") else {
+                    continue;
+                };
+                let (rest_m, rest_w) = pruned_leaves(&pruned, leaves);
+                let rest = Leaves {
+                    means: &rest_m,
+                    precisions: &rest_w,
+                    n_features: p,
+                };
+                let (ref_down, ref_up, _) = settle(&pruned.tree, rest).expect("settle");
+                let (eff_m, eff_w) = collapse(&pruned.tree, &ref_down, &ref_up);
+                let rows = LazyRows::new(&pruned.tree, &pruned.to_old, &tree, &down).expect("rows");
+
+                for v in 0..pruned.tree.n_nodes() as u32 {
+                    if rows.inherited[v as usize] == NO_NODE {
+                        dirty_seen += 1;
+                    }
+                    let (m, w) = rows.down_row(v);
+                    assert_eq!(m, ref_down.means(v), "down mean, pruned {x}, node {v}");
+                    assert_eq!(
+                        w,
+                        ref_down.precisions(v),
+                        "down precision, pruned {x}, node {v}"
+                    );
+                    let up = rows.up_row(v);
+                    assert_eq!(&up.0[..], ref_up.means(v), "up mean, pruned {x}, node {v}");
+                    assert_eq!(
+                        &up.1[..],
+                        ref_up.precisions(v),
+                        "up precision, pruned {x}, node {v}"
+                    );
+                    let lo = v as usize * p;
+                    let e = rows.eff_leaf(v);
+                    assert_eq!(e.m, &eff_m[lo..lo + p], "effective mean, node {v}");
+                    assert_eq!(e.w, &eff_w[lo..lo + p], "effective precision, node {v}");
+                }
+
+                // And again on the tree the regraft builds, which is settled
+                // from the same base and whose ancestors the arena is free to
+                // renumber.
+                let target = pruned.to_old[pruned.tree.root() as usize];
+                let (attached, _, to_old) =
+                    regraft(&pruned, x, target, 0.25, tree.n_leaves()).expect("regraft");
+                let a_rows = LazyRows::new(&attached, &to_old, &tree, &down).expect("rows");
+                let (a_down, a_up, _) = settle(&attached, leaves).expect("settle attached");
+                for v in 0..attached.n_nodes() as u32 {
+                    let (m, w) = a_rows.down_row(v);
+                    assert_eq!(m, a_down.means(v), "attached down mean, node {v}");
+                    assert_eq!(w, a_down.precisions(v), "attached down precision, node {v}");
+                    let up = a_rows.up_row(v);
+                    assert_eq!(&up.0[..], a_up.means(v), "attached up mean, node {v}");
+                    assert_eq!(
+                        &up.1[..],
+                        a_up.precisions(v),
+                        "attached up precision, node {v}"
+                    );
+                }
+                checked += 1;
+            }
+            assert!(checked > n_leaves, "only {checked} subtrees were prunable");
+            // The inherited rows are the point, but the recomputed ones are
+            // where a mistake would live, so the fixtures have to reach them.
+            assert!(dirty_seen > 0, "no row was ever recomputed");
+        }
+    }
+
+    #[test]
+    fn test_the_lazy_rows_only_form_what_is_asked_for() {
+        // The saving is the rows that are never formed, so it is worth a test
+        // of its own that they are not: a proposal on a balanced tree of 512
+        // nodes must touch a small fraction of them, not all of them. This is
+        // the measurement `PlacementParams::tolerance` records from the other
+        // side, and it is what turned the sweep's `O(n p)` per candidate into
+        // something that grows with the depth and the beam instead.
+        let p = 24usize;
+        let (data, w) = dataset(256, p, 17);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let tree = optimised(&data.tree, leaves);
+        let down = settled_down(&tree, leaves).expect("down");
+
+        let mut total = 0usize;
+        let mut formed = 0usize;
+        for x in 0..tree.n_nodes() as u32 {
+            let Some(pruned) = prune_subtree(&tree, x).expect("prune") else {
+                continue;
+            };
+            let rows = LazyRows::new(&pruned.tree, &pruned.to_old, &tree, &down).expect("rows");
+            let q = EffLeaf {
+                m: down.means(x),
+                w: down.precisions(x),
+            };
+            place(
+                &pruned.tree,
+                q,
+                |node: u32| rows.eff_leaf(node),
+                Some(PlacementParams::default()),
+            )
+            .expect("place");
+            total += rows.eff.len();
+            formed += rows.eff.iter().filter(|c| c.get().is_some()).count();
+        }
+        assert!(total > 0);
+        // Not an invariant, a measurement, recorded 2026-09-05: a twentieth of
+        // the arena. A regression here is a regression in the running time even
+        // though every answer is still right, which no other test would catch.
+        assert!(
+            formed * 10 < total,
+            "the beam formed {formed} of {total} effective leaves"
+        );
+    }
+
+    #[test]
+    fn test_the_polytomy_threshold_matches_the_primitive() {
+        // `propose` decides from the arena alone whether an attachment left a
+        // polytomy, rather than settling the attached tree and asking the star
+        // it builds. The two have to give the same answer, and the copy of the
+        // threshold that makes them do so is the only thing here that can
+        // drift.
+        for members in 1..=6usize {
+            let star = CentreStar::<f64> {
+                centre: 0,
+                member_nodes: (0..members as u32).collect(),
+                has_upstream: false,
+                deleted: Vec::new(),
+                means: Vec::new(),
+                precisions: Vec::new(),
+                branch: Vec::new(),
+                n_features: 0,
+            };
+            assert_eq!(
+                star.is_polytomy(),
+                members > RESOLVED_STAR_MEMBERS,
+                "{members} members"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_star_read_off_rows_matches_a_settled_one() {
+        // The gate on the whole optimisation. The star the resolution is handed
+        // has to be the star a freshly settled attached tree gives, bit for bit
+        // and not merely close: the primitive picks its pair by a strict
+        // comparison, so a difference in the last place can pick a different
+        // pair and hand back a different tree.
+        let mut checked = 0usize;
+        for (n_leaves, seed, pipeline) in [
+            (16usize, 3u64, false),
+            (32, 5, false),
+            (64, 7, false),
+            (16, 3, true),
+            (32, 5, true),
+            (64, 7, true),
+            (64, 11, true),
+        ] {
+            let p = 32usize;
+            let (data, w) = dataset(n_leaves, p, seed);
+            let leaves = Leaves {
+                means: &data.means,
+                precisions: &w,
+                n_features: p,
+            };
+            let tree = if pipeline {
+                searched(n_leaves, leaves)
+            } else {
+                optimised(&data.tree, leaves)
+            };
+            for (_, centre, cheap, settled) in proposals(&tree, leaves) {
+                assert_eq!(cheap.centre, settled.centre);
+                assert_eq!(cheap.member_nodes, settled.member_nodes);
+                assert_eq!(cheap.has_upstream, settled.has_upstream);
+                assert_eq!(cheap.branch, settled.branch);
+                assert_eq!(cheap.n_features, settled.n_features);
+                assert_eq!(cheap.means, settled.means, "centre {centre}");
+                assert_eq!(cheap.precisions, settled.precisions, "centre {centre}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "only {checked} proposals were checked");
+    }
+
+    #[test]
     fn test_degree_two_suppression_preserves_the_loglikelihood() {
         // Pruning leaf 0 leaves node 5 with one child, which the arena cannot
         // hold. The suppression has to join leaf 1 to node 6 with `b1 + b5`;
@@ -1022,18 +1901,11 @@ mod tests {
         let (data, w) = dataset(8, p, 12);
         let means: Vec<f64> = data.means[..5 * p].to_vec();
         let precisions: Vec<f64> = w[..5 * p].to_vec();
-        let leaves = Leaves {
-            means: &means,
-            precisions: &precisions,
-            n_features: p,
-        };
         let b: Vec<f64> = (1..=8).map(|i| 0.15 * i as f64).collect();
         let tree =
             Tree::from_parents(vec![5, 5, 6, 7, 7, 6, 7, NO_NODE], b.clone(), 5).expect("fixture");
 
-        let pruned = prune_subtree(&tree, leaves, 0)
-            .expect("prune")
-            .expect("prunable");
+        let pruned = prune_subtree(&tree, 0).expect("prune").expect("prunable");
         assert_eq!(pruned.tree.n_leaves(), 4);
         assert_eq!(pruned.tree.n_nodes(), 6);
 
@@ -1082,19 +1954,12 @@ mod tests {
         let (data, w) = dataset(8, p, 13);
         let means: Vec<f64> = data.means[..5 * p].to_vec();
         let precisions: Vec<f64> = w[..5 * p].to_vec();
-        let leaves = Leaves {
-            means: &means,
-            precisions: &precisions,
-            n_features: p,
-        };
         let b: Vec<f64> = (1..=8).map(|i| 0.15 * i as f64).collect();
         // Root 7 holds leaf 4, node 5 and node 6; node 5 holds leaves 0 and 1;
         // node 6 holds leaves 2 and 3.
         let tree =
             Tree::from_parents(vec![5, 5, 6, 6, 7, 7, 7, NO_NODE], b.clone(), 5).expect("fixture");
-        let pruned = prune_subtree(&tree, leaves, 4)
-            .expect("prune")
-            .expect("prunable");
+        let pruned = prune_subtree(&tree, 4).expect("prune").expect("prunable");
 
         // Four leaves, two internal nodes: the old root is gone rather than
         // left behind with two children.
@@ -1138,7 +2003,7 @@ mod tests {
 
         let mut checked = 0usize;
         for x in 0..tree.n_nodes() as u32 {
-            let Some(pruned) = prune_subtree(&tree, leaves, x).expect("prune") else {
+            let Some(pruned) = prune_subtree(&tree, x).expect("prune") else {
                 continue;
             };
             let inside = subtree_nodes(&tree, x);
@@ -1173,7 +2038,7 @@ mod tests {
         let tree = optimised(&Tree::balanced_binary(n, 1.0).expect("balanced"), leaves);
 
         for x in 0..tree.n_nodes() as u32 {
-            let Some(pruned) = prune_subtree(&tree, leaves, x).expect("prune") else {
+            let Some(pruned) = prune_subtree(&tree, x).expect("prune") else {
                 continue;
             };
             for node in 0..pruned.tree.n_nodes() as u32 {
@@ -1210,12 +2075,13 @@ mod tests {
 
         let mut checked = 0usize;
         for x in 0..tree.n_nodes() as u32 {
-            let Some(pruned) = prune_subtree(&tree, leaves, x).expect("prune") else {
+            let Some(pruned) = prune_subtree(&tree, x).expect("prune") else {
                 continue;
             };
+            let (rest_m, rest_w) = pruned_leaves(&pruned, leaves);
             let rest = Leaves {
-                means: &pruned.means,
-                precisions: &pruned.precisions,
+                means: &rest_m,
+                precisions: &rest_w,
                 n_features: p,
             };
             let (rest_down, rest_up, _) = settle(&pruned.tree, rest).expect("settle");
@@ -1239,7 +2105,7 @@ mod tests {
                     &mut d,
                 )
                 .expect("score");
-                let (built, _) = regraft(
+                let (built, _, _) = regraft(
                     &pruned,
                     x,
                     pruned.to_old[node as usize],
@@ -1337,7 +2203,7 @@ mod tests {
         };
         let tree = Tree::from_parents(vec![2, 2, NO_NODE], vec![0.4, 0.6, 0.0], 2).expect("pair");
         for x in 0..3u32 {
-            assert!(prune_subtree(&tree, leaves, x).expect("prune").is_none());
+            assert!(prune_subtree(&tree, x).expect("prune").is_none());
         }
         let out = spr(&tree, leaves, None).expect("spr");
         assert_eq!(out.n_moves(), 0);
@@ -1388,11 +2254,11 @@ mod tests {
             if !can_prune(&tree, leaf) {
                 continue;
             }
-            let pruned = prune_subtree(&tree, leaves, leaf)
+            let pruned = prune_subtree(&tree, leaf)
                 .expect("prune")
                 .expect("prunable");
             assert_eq!(pruned.tree.n_leaves(), tree.n_leaves() - 1);
-            let candidate = propose(&tree, leaves, &down, leaf, &SprParams::default())
+            let candidate = propose(&tree, &down, leaf, &SprParams::default())
                 .expect("propose")
                 .expect("prunable");
             assert_eq!(candidate.n_leaves(), tree.n_leaves());

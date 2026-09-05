@@ -69,3 +69,8 @@ harness = false
 [[bench]]
 name = "steps"
 harness = false
+
+## Distance recovery, the paper's Fig. S8 metric. Plain `main`, no criterion.
+[[bench]]
+name = "recovery"
+harness = false

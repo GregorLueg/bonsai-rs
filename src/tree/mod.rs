@@ -19,6 +19,8 @@
 //! never supplied, so no caller-held data is indexed by an internal node.
 
 pub mod cluster;
+pub mod distance;
+pub mod export;
 pub mod layout;
 pub mod newick;
 pub mod simulate;

@@ -68,9 +68,10 @@ End to end, `bonsai()` on one M1 Max, simulated data:
 
 | cells | features | seconds |
 |---|---|---|
-| 512 | 2000 | 5.9 |
 | 2048 | 200 | 17.1 |
 | 2048 | 2000 | 70.9 |
+
+Reproduce with `cargo bench --bench pipeline` on an otherwise idle machine.
 
 Scaling by step, exponents fitted over 256 to 2048 leaves: the greedy merge is
 `n^1.65`, subtree pruning and regrafting `n^1.50`, branch-length optimisation

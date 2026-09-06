@@ -172,7 +172,14 @@ pub struct StarParams {
     /// the ancestor's own diffusion-corrected contribution, which is exactly
     /// what changed.
     ///
-    /// Off by default, and the question is drift. The update differences
+    /// Off by default. Note that the shipped pipeline always composes the
+    /// bounds of section 10 (`bonsai::bonsai_prepared`), so it runs permanently
+    /// in the combination the paragraph above argues for turning this **on**.
+    /// That is deliberate for now: the recompute it would save is not where the
+    /// pipeline's time goes, and the drift below is a real cost. Revisit with a
+    /// measurement, not with this comment.
+    ///
+    /// The question is drift. The update differences
     /// quantities of similar magnitude, so it loses digits where the exact
     /// recompute does not, and the error compounds across a whole star. An
     /// exact recompute every `CENTRE_EXACT_EVERY` rounds caps that.

@@ -22,9 +22,14 @@
 //! Placement is a beam search with a tolerance, not an exhaustive scan, and a
 //! cell placed early cannot see cells placed after it. So this is an
 //! approximation and its trees are not guaranteed identical to the standard
-//! algorithm's, unlike SPEC sections 10 and 11 whose whole point is that they
-//! are. The paper is explicit that backbone mode trades accuracy for time. What
-//! that costs is measured in the tests rather than assumed.
+//! algorithm's. The paper is explicit that backbone mode trades accuracy for
+//! time. What that costs is measured in the tests rather than assumed.
+//!
+//! This used to add "unlike SPEC sections 10 and 11 whose whole point is that
+//! they are", which overstated both. Neither is a guarantee: `candidates` can
+//! miss a best pair that is in no neighbour list, and `bounds` says in its own
+//! docs that section 10.2's bound is not strict. Both are very good in practice
+//! rather than exact, and the numbers are in their modules.
 
 use crate::bonsai::{BonsaiParams, BonsaiResult, bonsai_prepared, refine};
 use crate::errors::BonsaiErrors;

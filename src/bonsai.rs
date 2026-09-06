@@ -89,7 +89,12 @@ pub struct StepReport {
     /// Tree loglikelihood after the step, up to the constants SPEC.md section 3
     /// drops.
     pub loglik: f64,
-    /// Change from the previous step. Never negative, and that is asserted.
+    /// Change from the previous step.
+    ///
+    /// Non-negative on every measured run, and `test_every_step_is_monotone`
+    /// checks it, but `record` does not assert it: a step that lost ground
+    /// should surface as a visible negative here rather than as a panic
+    /// crossing an FFI boundary.
     pub gain: f64,
 }
 

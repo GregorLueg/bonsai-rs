@@ -31,9 +31,11 @@
 //! and features at ingest. The feature-axis kernels are sequential by design, so
 //! nothing here nests.
 //!
-//! The tree sweeps are not parallel. `model::blocked` holds a feature-blocked
-//! sweep that is, and nothing in the pipeline calls it; every prune the search
-//! runs goes through the sequential `model::likelihood::NodeState`.
+//! The tree sweeps are not parallel, and on measurement they do not need to be:
+//! the whole prune is 2.4 per cent of a run and the up-sweep another 0.5, with
+//! the share flat in feature count. A feature-blocked parallel sweep existed
+//! until 2026-09-06 and was deleted once that was measured; it had never been
+//! wired in. Every prune goes through `model::likelihood::NodeState`.
 
 #![warn(missing_docs)]
 // Indexed loops are what the numeric kernels want. Rewriting them as zipped

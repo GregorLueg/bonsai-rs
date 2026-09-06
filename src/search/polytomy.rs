@@ -55,6 +55,22 @@ use crate::utils::traits::BonsaiFloat;
 /// regraft left a polytomy behind that needs resolving.
 pub(crate) const RESOLVED_STAR_MEMBERS: usize = 3;
 
+/// Runaway guard on the fixed-point loop, not a working limit.
+///
+/// The loop's termination argument is the loglikelihood, not the sweep count,
+/// so this should never bind: measured 2026-09-06 across zero-branch stars of
+/// 6 to 12 leaves by 4 to 64 features at precisions from `1e0` to `1e14`, the
+/// loop settled in 1 to 4 sweeps every time. The same role as `MAX_NEWTON_ITER`
+/// in [`crate::model::branch`].
+///
+/// It exists because that argument is only sound while `min_gain` clears the
+/// per-feature rounding floor of a merge gain. [`resolve_polytomies`] now
+/// rejects a non-positive `min_gain`, which is the case that actually span, but
+/// a floor merely *too small* for the feature count is a caller error this
+/// cannot detect, and an unbounded loop crossing an FFI boundary takes the
+/// session with no interrupt point.
+const MAX_SWEEPS: usize = 64;
+
 ///////////////////
 // Input, output //
 ///////////////////
@@ -622,6 +638,23 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
     leaves: Leaves<'_, T>,
     params: Option<StarParams>,
 ) -> Result<PolytomyResult, BonsaiErrors> {
+    // The primitive itself terminates structurally, one merge a round down to
+    // three members, so it takes any floor including a negative one. This loop
+    // does not: it rests on every accepted resolution raising the loglikelihood
+    // by more than `min_gain`. At zero the primitive accepts a merge whose gain
+    // is a rounding artefact, the resolution lands the ancestor at zero distance
+    // from its centre, the next sweep's collapse folds it back, and the same
+    // merge is found again. Adversarial review 2026-09-06 watched that run for
+    // four and a half minutes on a six-leaf star.
+    let min_gain = params.unwrap_or_default().min_gain;
+    if !min_gain.is_finite() || min_gain <= 0.0 {
+        return Err(BonsaiErrors::BadParameter {
+            name: "StarParams::min_gain",
+            value: min_gain,
+            expected: "a finite value strictly greater than zero when resolving polytomies; see \
+                       DEFAULT_MIN_GAIN for the per-feature rounding floor it must clear",
+        });
+    }
     let mut tree = match collapse_zero_edges(tree)? {
         Some(collapsed) => collapsed,
         None => tree.clone(),
@@ -673,6 +706,9 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
                 n_resolved += 1;
                 tree = spliced.tree;
             }
+        }
+        if sweeps >= MAX_SWEEPS {
+            break;
         }
     }
 
@@ -1259,6 +1295,40 @@ mod tests {
             after < before,
             "distance to truth went from {before} to {after}"
         );
+    }
+
+    /// A zero-branch star at `min_gain = 0` used to spin forever: the primitive
+    /// accepted a rounding-artefact merge, the next sweep's collapse folded it
+    /// back, and the same merge was found again. Adversarial review 2026-09-06,
+    /// which watched this exact fixture run for four and a half minutes.
+    #[test]
+    fn test_a_non_positive_min_gain_is_rejected_rather_than_spun_on() {
+        let (p, n) = (4usize, 8usize);
+        let (_, m, w) = dataset(n, p, 3);
+        let leaves = Leaves {
+            means: &m,
+            precisions: &w,
+            n_features: p,
+        };
+        let star = star_shaped(n, 0.0);
+
+        for bad in [0.0, -1e-9, f64::NAN, f64::INFINITY] {
+            let params = StarParams {
+                min_gain: bad,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    resolve_polytomies(&star, leaves, Some(params)),
+                    Err(BonsaiErrors::BadParameter { .. })
+                ),
+                "min_gain = {bad} should be rejected"
+            );
+        }
+
+        // The floor that ships still resolves the same fixture.
+        let out = resolve_polytomies(&star, leaves, None).expect("default min_gain");
+        assert!(out.sweeps <= MAX_SWEEPS, "the guard should not bind here");
     }
 
     #[test]

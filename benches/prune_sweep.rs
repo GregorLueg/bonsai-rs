@@ -13,13 +13,18 @@
 //! Two tree shapes are swept. Balanced binary is the friendly case: sibling
 //! rows sit next to each other and the sweep streams. The ladder is the
 //! pathological one, one node per level and maximally deep, which is what bounds
-//! the damage when a real dataset produces a deep laddery tree. The blocked
-//! sweep is meant to be indifferent to the difference; the row-major one is not.
+//! the damage when a real dataset produces a deep laddery tree.
+//!
+//! Both storage widths are timed because `f32` is the fastest path and the one
+//! most likely to be used at scale, so it needs a measurement at scale of its
+//! own rather than an extrapolation from the `f64` column. This bench used to
+//! carry two `BlockedState` columns as well; that type was deleted on
+//! 2026-09-06 once measurement showed the whole prune is 2.4 per cent of the
+//! pipeline, so parallelising it could not matter.
 //!
 //! Plain `main`, no criterion. The sweep is deterministic and long enough that
 //! best-of-N over a handful of repeats is stable.
 
-use bonsai_rs::model::blocked::{BlockedState, DEFAULT_BLOCK};
 use bonsai_rs::model::likelihood::NodeState;
 use bonsai_rs::tree::Tree;
 use bonsai_rs::utils::rng::splitmix64_at;
@@ -82,8 +87,8 @@ fn time<F: FnMut() -> f64>(mut f: F) -> (f64, f64) {
 fn main() {
     println!("threads {}", rayon::current_num_threads());
     println!(
-        "{:>9} {:>7} {:>6} {:>9} {:>9} {:>9} {:>7} {:>22}",
-        "shape", "leaves", "feat", "seq_ms", "blk_ms", "blk32_ms", "blk_x", "loglik_f64"
+        "{:>9} {:>7} {:>6} {:>9} {:>9} {:>7} {:>22}",
+        "shape", "leaves", "feat", "f64_ms", "f32_ms", "f32_x", "loglik_f64"
     );
 
     for &n_leaves in LEAF_COUNTS.iter() {
@@ -102,25 +107,22 @@ fn main() {
                 let n = tree.n_nodes();
                 let mut flat = NodeState::new(n, n_features, &means, &precisions).unwrap();
                 let (seq, loglik) = time(|| flat.prune(&tree));
-                let mut blk =
-                    BlockedState::new(n, n_features, &means, &precisions, DEFAULT_BLOCK).unwrap();
-                let (blocked, blk_loglik) = time(|| blk.prune(&tree));
-                assert!((blk_loglik - loglik).abs() <= 1e-9 * loglik.abs());
 
-                let mut blk32 =
-                    BlockedState::new(n, n_features, &means32, &precisions32, DEFAULT_BLOCK)
-                        .unwrap();
-                let (blocked32, _) = time(|| blk32.prune(&tree));
+                let mut flat32 = NodeState::new(n, n_features, &means32, &precisions32).unwrap();
+                let (seq32, loglik32) = time(|| flat32.prune(&tree));
+                // `f32` storage still accumulates in `f64`, so the two agree far
+                // better than `f32` epsilon; loose enough to pass, tight enough
+                // that a storage path gone wrong fails.
+                assert!((loglik32 - loglik).abs() <= 1e-4 * loglik.abs());
 
                 println!(
-                    "{:>9} {:>7} {:>6} {:>9.3} {:>9.3} {:>9.3} {:>7.2} {:>22.12e}",
+                    "{:>9} {:>7} {:>6} {:>9.3} {:>9.3} {:>7.2} {:>22.12e}",
                     shape,
                     n_leaves,
                     n_features,
                     seq * 1e3,
-                    blocked * 1e3,
-                    blocked32 * 1e3,
-                    seq / blocked,
+                    seq32 * 1e3,
+                    seq / seq32,
                     loglik
                 );
             }

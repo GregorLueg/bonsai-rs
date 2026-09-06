@@ -9,8 +9,7 @@
 //!    every feature by signal-to-noise (S6, S10, S11), drops the features that
 //!    fail the threshold, and divides the survivors by `sqrt(v[g])` (S21).
 //! 3. The result is handed straight to
-//!    [`crate::model::likelihood::NodeState::new`] or
-//!    [`crate::model::blocked::BlockedState::new`].
+//!    [`crate::model::likelihood::NodeState::new`].
 //!
 //! ### Units, which are the thing to get right here
 //!
@@ -43,9 +42,7 @@ use rayon::prelude::*;
 /// feature column, so columns are gathered a chunk at a time rather than one at
 /// a time: 128 consecutive `f32` features span eight cache lines, so a chunk
 /// reads each line once and uses all of it, where one feature at a time touches
-/// one line per cell per feature. Matches
-/// [`crate::model::blocked::DEFAULT_BLOCK`] for no deeper reason than that both
-/// are chunking the same axis.
+/// one line per cell per feature.
 const INGEST_BLOCK: usize = 128;
 
 /// Iteration budget for the per-feature variance solve.
@@ -186,8 +183,7 @@ impl Default for IngestParams {
 ///
 /// Both matrices are row-major `[cell][retained feature]` with stride
 /// `features.len()`, the layout
-/// [`crate::model::likelihood::NodeState::new`] and
-/// [`crate::model::blocked::BlockedState::new`] take. The feature axis is the
+/// [`crate::model::likelihood::NodeState::new`] takes. The feature axis is the
 /// *retained* one, so column `k` is original feature `features[k]`.
 #[derive(Clone, Debug)]
 pub struct PreparedData<T> {

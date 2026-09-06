@@ -49,9 +49,16 @@
 //! On a fresh [`NodeState::prune`] of the candidate tree, never on an
 //! incremental figure. [`crate::search::polytomy::Splice::gain`] is exact only
 //! against the tree its star was built from, and by the time a move has been
-//! proposed the tree has been cut, rebuilt and possibly re-rooted; the
-//! interchanges of [`crate::search::nni`] take the same discipline for the same
-//! reason.
+//! proposed the tree has been cut, rebuilt and possibly re-rooted.
+//!
+//! [`crate::search::nni`] does **not** do this, contrary to what this paragraph
+//! claimed until 2026-09-06: it accepts on the merge gains plus its collapse
+//! delta and never re-prunes the candidate. That is sound there because an
+//! interchange edits one internal edge and the star it resolves summarises the
+//! rest of the tree exactly, so the accounting closes; measured over 144 runs
+//! its reported loglikelihood matches a fresh prune of its output to better
+//! than `1e-9` relative. The difference is that a regraft moves a subtree
+//! across the tree, which no single star summarises.
 //!
 //! That prune is `O(n p)` and it stays, because it is what makes the sweep
 //! monotone in the quantity that matters. It is affordable because almost

@@ -30,6 +30,12 @@ pub struct NodeState<T> {
     p: usize,
     /// Number of nodes, leaves included.
     n_nodes: usize,
+    /// Leaf rows the caller actually supplied.
+    ///
+    /// Kept so `prune` can tell a state built for this tree from one built for
+    /// a smaller leaf set: the constructor takes a node count, so it cannot
+    /// check this itself.
+    n_leaf_rows: usize,
     /// Scratch for the polytomy path, grown on demand.
     scratch: Vec<f64>,
 }
@@ -75,6 +81,7 @@ impl<T: BonsaiFloat> NodeState<T> {
                 sd_features: p,
             });
         }
+        let n_leaf_rows = leaf_means.len() / p;
         let mut m = vec![T::zero(); n_nodes * p];
         let mut w = vec![T::zero(); n_nodes * p];
         m[..leaf_means.len()].copy_from_slice(leaf_means);
@@ -84,6 +91,7 @@ impl<T: BonsaiFloat> NodeState<T> {
             w,
             p,
             n_nodes,
+            n_leaf_rows,
             scratch: Vec::new(),
         })
     }
@@ -131,25 +139,18 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// Run the pruning recursion over the whole tree and return its
     /// loglikelihood.
     ///
-    /// Sequential, and deliberately so: this is the straightforward reference
-    /// that [`crate::model::blocked::BlockedState`] is checked against, and the
-    /// layout that makes a whole node row contiguous. Walks levels from the
-    /// leaves up and, within a level, ascending node index, which the arena
-    /// invariant makes a valid post-order.
+    /// Sequential, and measurement says it should stay that way: the whole
+    /// prune is 2.4 per cent of a pipeline run, so parallelising it cannot
+    /// matter. Walks levels from the leaves up and, within a level, ascending
+    /// node index, which the arena invariant makes a valid post-order.
     ///
     /// Per-node contributions are summed within a level and only then added to
     /// the running total, which keeps the association fixed to the tree so that
     /// this routine's own answer does not depend on how the levels happen to be
-    /// walked. It is **not** what makes this and
-    /// [`crate::model::blocked::BlockedState::prune`] agree: that one sums node
-    /// by node over `internal_postorder` and splits the feature sum across
-    /// blocks as well, so the two associate differently and agree only to
-    /// rounding. Measured 2026-08-31 at 1024 leaves by 1024 features: 1.3e-16
-    /// relative on a balanced tree at block 128, 1.3e-16 on a ladder at block 7,
-    /// 6.7e-15 on a star at block 7, whose single 1024-child polytomy is the
-    /// worst case for it. Anywhere the two are bit-identical it is a
-    /// coincidence of the fixture, and an earlier version of this comment
-    /// claimed otherwise (adversarial review N13).
+    /// walked. That mattered most when a second, feature-blocked implementation
+    /// had to agree with this one; it was deleted on 2026-09-06, but the fixed
+    /// association is still what makes this routine's answer a property of the
+    /// tree rather than of the traversal.
     ///
     /// ### Params
     ///
@@ -162,7 +163,9 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// ### Panics
     ///
     /// If `tree` has a different node count from the one this state was built
-    /// for, which is a mismatched pair of arguments rather than bad data.
+    /// for, or a different leaf count from the number of leaf rows supplied to
+    /// [`NodeState::new`]. Both are a mismatched pair of arguments rather than
+    /// bad data.
     pub fn prune(&mut self, tree: &Tree) -> f64 {
         // A real check, not a `debug_assert`: a state built for one tree and
         // pruned against another indexes entirely within bounds when the state
@@ -174,6 +177,17 @@ impl<T: BonsaiFloat> NodeState<T> {
             self.n_nodes,
             "this state was built for a tree of {} nodes",
             self.n_nodes
+        );
+        // Same reasoning as above, for the other half of the shape. An
+        // under-filled leaf block leaves zero-precision rows, which the first
+        // logarithm turns into `-inf`: a finite-looking `Ok` carrying a
+        // meaningless number, since `Leaves` has public fields and nothing ties
+        // its length to the tree (adversarial review 2026-09-06).
+        assert_eq!(
+            tree.n_leaves(),
+            self.n_leaf_rows,
+            "this state was filled with {} leaf rows",
+            self.n_leaf_rows
         );
         let mut total = 0.0f64;
         for level in 0..tree.n_levels() {
@@ -201,12 +215,11 @@ impl<T: BonsaiFloat> NodeState<T> {
 
 /// Prune one internal node into a slab, reading its children's settled rows.
 ///
-/// The two node-state layouts differ in what a "row" is: `[node][feature]` over
-/// all `p` features here, `[block][node][feature]` over one block's features in
-/// [`crate::model::blocked::BlockedState`]. Both are a slab of equal-length
-/// rows indexed by node, so the dispatch between the binary and polytomy
-/// kernels is the same code for both, and is written once here rather than
-/// twice. The traversal order, the parallel axis and the order the per-node
+/// A "row" here is `[node][feature]` over all `p` features. This is written
+/// against a slab of equal-length rows indexed by node rather than against
+/// `NodeState` itself, which is what let a second layout share it; that layout
+/// is gone, but the shape is still the right one to write the dispatch between
+/// the binary and polytomy kernels against. The traversal order and the order the per-node
 /// contributions are summed in stay each module's own business, which is what
 /// makes the two independent enough to cross-check.
 ///
@@ -281,8 +294,6 @@ pub(crate) mod tests {
     /// Deterministic pseudo-random leaf data, so tests do not need an rng
     /// dependency and always describe the same scenario.
     ///
-    /// Shared with `blocked`, whose tests cross-check against this module and
-    /// so must see byte-identical input.
     ///
     /// ### Params
     ///

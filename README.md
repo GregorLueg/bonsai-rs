@@ -109,9 +109,8 @@ features:
 | | time |
 |---|---|
 | numpy reference, same equations | 468 ms |
-| Rust, single-threaded, `f64` | 67 ms |
-| Rust, feature-blocked parallel, `f64` | 9.3 ms |
-| Rust, feature-blocked parallel, `f32` | 5.2 ms |
+| Rust, `f64` storage | 67 ms |
+| Rust, `f32` storage | 40 ms |
 
 Loglikelihoods agree with the numpy reference to twelve significant figures. The
 baseline is `reference/bonsai_ref.py`, written independently from the same

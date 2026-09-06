@@ -315,7 +315,7 @@ fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
 /// are everything outside a node's subtree, positioned at the node's *parent*
 /// and not diffused along the branch above it, so a caller who passes them
 /// straight in is wrong on two counts. The composition that is right is
-/// [`crate::model::global::collapse_onto_every_node`], which is what
+/// `model::global::collapse_onto_every_node`, which is what
 /// `backbone` hands in; `search::spr` forms the same rows one node at a time
 /// rather than all at once, because a proposal reads a few dozen of them.
 ///

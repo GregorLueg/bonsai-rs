@@ -334,8 +334,7 @@ mod tests {
         // The lane count is part of the bug, not incidental to it: `p % 8`
         // decides which features take the vector path and which fall to the
         // scalar tail, so the same per-element data gave different answers at
-        // different feature counts, and through `BlockedState` the block size
-        // decided it too. Hence the p = 7 against p = 8 comparison.
+        // different feature counts. Hence the p = 7 against p = 8 comparison.
         for (precision, branch) in [(1e-25f32, 1.0f64), (1e30f32, 1e-30f64)] {
             let mut previous: Option<f64> = None;
             for p in [7usize, 8, 15, 16, 64] {

@@ -9,9 +9,9 @@
 //! The pruning recursion in [`crate::model::likelihood`] supplies one side: for
 //! every node `k`, the subtree below `k`. This module supplies the other, the
 //! "up" value: for a non-root node `k` with parent `a`, the effective leaf at
-//! `a` of everything except `k`'s own subtree. Down values settle in post-order,
-//! up values in pre-order, and the arena invariant makes both a bare linear
-//! scan, the second one backwards.
+//! `a` of everything except `k`'s own subtree. Down values settle in
+//! post-order, up values in pre-order, and the arena invariant makes both a
+//! bare linear scan, the second one backwards.
 //!
 //! Optimising one edge moves the effective leaves every other edge sees, so the
 //! two are iterated. The proposal is computed for all edges from one pair of
@@ -188,30 +188,17 @@ impl<T: BonsaiFloat> UpState<T> {
                 let wdl = wl / (1.0 + t_l * wl);
                 let (mk, ml) = (wide(m_k[g]), wide(m_l[g]));
 
-                // Two children is the common case, so each leave-one-out total
-                // is formed directly rather than as `Wtot - Wd[c]`: the two are
-                // similar in magnitude whenever one child dominates, and the
-                // subtraction would then lose the leading digits of the answer.
                 let tot_k = wdl + w_up;
                 let tot_l = wdk + w_up;
                 out_w_k[g] = narrow(tot_k);
                 out_w_l[g] = narrow(tot_l);
-                // Convex combinations, for the reason given in
-                // `prune_binary_scalar`: the weight lies in `[0, 1]`, so the
-                // mean is pinned between the two it interpolates and cannot
-                // cancel. At the root the weight is exactly zero and the answer
-                // is the sibling's mean untouched.
+
                 out_m_k[g] = narrow(ml + (m_up - ml) * (w_up / tot_k));
                 out_m_l[g] = narrow(mk + (m_up - mk) * (w_up / tot_l));
             }
             return;
         }
 
-        // Polytomy. Here there is no leave-one-out total that avoids a
-        // subtraction without carrying a prefix and a suffix scan per feature,
-        // which costs more memory traffic than the case is worth: polytomies
-        // are what the search is actively removing, and the subtraction is
-        // benign unless one child holds nearly all the precision at `a`.
         if self.scratch.len() < 2 * p {
             self.scratch.resize(2 * p, 0.0);
         }
@@ -219,8 +206,6 @@ impl<T: BonsaiFloat> UpState<T> {
         let (m_a, w_a) = (down.means(a), down.precisions(a));
         for g in 0..p {
             let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
-            // The down sweep has already summed the children's diffused
-            // precisions into `W[a]`, so the total costs one addition.
             let ma = wide(m_a[g]);
             let tot = wide(w_a[g]) + w_up;
             w_tot[g] = tot;
@@ -235,9 +220,6 @@ impl<T: BonsaiFloat> UpState<T> {
                 let wc = wide(w_c[g]);
                 let wdc = wc / (1.0 + t_c * wc);
                 let rest = w_tot[g] - wdc;
-                // `m_tot` is the convex combination of `M[c]` and the answer,
-                // so extrapolating away from `M[c]` recovers the answer exactly
-                // and never forms a ratio of sums.
                 let mc = wide(m_c[g]);
                 lo_w[base + g] = narrow(rest);
                 lo_m[base + g] = narrow(m_tot[g] + (m_tot[g] - mc) * (wdc / rest));
@@ -279,8 +261,8 @@ pub(crate) fn up_part<T: BonsaiFloat>(is_root: bool, t_a: f64, w_up: T, m_up: T)
 /// For node `i`, the effective leaf you get by rooting there and marginalising
 /// everything else, which is the same object as the posterior at `i`: the
 /// likelihood does not depend on the root (S14), so it is the product of two
-/// Gaussians the sweeps already hold, the subtree below `i` and everything above
-/// it seen across `i`'s own branch. Precisions add, means combine
+/// Gaussians the sweeps already hold, the subtree below `i` and everything
+/// above it seen across `i`'s own branch. Precisions add, means combine
 /// precision-weighted. Two sweeps give it for every node at once, which is what
 /// makes both a placement search and a whole-tree posterior affordable.
 ///
@@ -349,16 +331,17 @@ pub(crate) fn collapse_onto_every_node<T: BonsaiFloat>(
 // Global optimisation //
 /////////////////////////
 
+////////////
+// Consts //
+////////////
+
 /// Backtracking budget for one iteration.
 ///
 /// The proposal is an ascent direction (see [`optimise_branch_lengths`]), so
 /// some step size along it improves the tree unless the tree is already
 /// stationary. Twenty halvings take the step to `1e-6` of its length, far below
 /// the point at which a failure to improve means stationarity rather than an
-/// overlong step. Measured on this module's fixtures, 2026-08-27: about one
-/// iteration in five takes a single halving and the rest take the full step,
-/// and the budget is only ever exhausted on the last iteration of all, which is
-/// how the loop discovers it has converged.
+/// overlong step.
 const MAX_BACKTRACK: usize = 20;
 
 /// Factor by which a rejected step is shrunk.

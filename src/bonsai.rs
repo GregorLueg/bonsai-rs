@@ -53,6 +53,10 @@ pub struct BonsaiParams {
     /// Feature selection and the scale transform (SPEC.md section 3).
     pub ingest: IngestParams,
     /// The greedy star primitive (section 9.1) and polytomy resolution (9.2).
+    ///
+    /// Steps 2 and 3 only. Steps 5 and 6 run the same primitive but take their
+    /// settings from `spr.star` and `nni.star`, so raising `min_gain` here
+    /// leaves their move-acceptance floor at the default.
     pub star: StarParams,
     /// Candidate-pair restriction (section 11).
     ///

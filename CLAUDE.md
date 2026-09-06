@@ -70,11 +70,15 @@ Leaves occupy `0..n_leaves`. Internal nodes follow, ordered by height above the 
 
 ### Two layouts, on purpose
 
-`NodeState` is row-major `[node][feature]`. It is the straightforward reference and the oracle `BlockedState` is tested against. Sequential.
+`NodeState` is row-major `[node][feature]`, sequential, and **is what the pipeline actually runs**. Every prune in `bonsai`, `backbone`, `spr`, `nni` and `polytomy` goes through it.
 
-`BlockedState` is `[block][node][feature]` and is the production path. The model factorises over features, so a feature is independent of every other through the whole recursion: blocking the feature axis gives a parallel decomposition with no synchronisation that does not care what shape the tree is. Measured at 8192 leaves by 2000 features, feature-blocked runs a ladder tree in 11.2 ms against level-parallelism's 67.7 ms, while tying on a balanced tree. Level-parallelism was tried and removed.
+`BlockedState` is `[block][node][feature]` and parallelises the feature axis. The model factorises over features, so a feature is independent of every other through the whole recursion, which gives a decomposition with no synchronisation that does not care what shape the tree is. Measured at 8192 leaves by 2000 features it runs a ladder tree in 11.2 ms against level-parallelism's 67.7 ms, tying on a balanced tree. Level-parallelism was tried and removed.
 
-When adding anything that sweeps the tree, put the parallelism on the feature axis.
+**It is not wired into the pipeline, and on measurement it should not be.** This file claimed it was "the production path" from the day it was written until 2026-09-06, when the claim was checked: `BlockedState` is constructed only in `benches/prune_sweep.rs` and its own tests. Instrumenting the whole search then settled whether that was a missed win. It is not. Prune is 2.1 to 2.4 per cent of `bonsai_prepared` and the up-sweep another 0.5, and the share is flat in feature count (512 by 2000 gives the same 2.3 per cent as 512 by 200), so it will not grow with the data. A perfect ten-times speedup on the blocked path would buy under 3 per cent of wall time. The pipeline's cost is elsewhere: the merge pair scan and SPR's proposal generation.
+
+So `BlockedState` is a tested alternative implementation and a benchmark subject, not a production path. Either wire it and accept a rounding-level change in summation order for no measurable gain, or delete it; do not leave a third doc claiming it is live.
+
+When adding anything that sweeps the tree, measure its share before parallelising it. Twice on this project a module was built, tested, benchmarked and never called: the kNN and ellipsoid restrictions, which mattered, and this one, which does not.
 
 ### Numeric policy
 

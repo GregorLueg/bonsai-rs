@@ -10,11 +10,11 @@
 //! uv run --with numpy reference/bonsai_ref.py --leaves 8192 --features 2000
 //! ```
 //!
-//! Two tree shapes are swept. Balanced binary is the friendly case: every level
-//! is wide, so the fan-out has work and sibling rows sit next to each other.
-//! The ladder is the pathological one, one node per level and therefore no
-//! parallelism at all, which is what bounds the damage when a real dataset
-//! produces a deep laddery tree.
+//! Two tree shapes are swept. Balanced binary is the friendly case: sibling
+//! rows sit next to each other and the sweep streams. The ladder is the
+//! pathological one, one node per level and maximally deep, which is what bounds
+//! the damage when a real dataset produces a deep laddery tree. The blocked
+//! sweep is meant to be indifferent to the difference; the row-major one is not.
 //!
 //! Plain `main`, no criterion. The sweep is deterministic and long enough that
 //! best-of-N over a handful of repeats is stable.

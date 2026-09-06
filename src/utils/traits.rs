@@ -13,7 +13,9 @@ use std::ops::{AddAssign, DivAssign, MulAssign, SubAssign};
 /// kernel performs before it accumulates (see the note on precision below).
 /// `BonsaiSimd` carries the vectorised feature-axis kernels, so algorithm code
 /// never names a lane width. `Send`/`Sync`/`'static` are needed because the
-/// pair scan and the gene-blocked sweeps fan out under rayon. The `*Assign`
+/// merge-round pair scan, the bound scan of `search::bounds` and the
+/// feature-blocked sweep of `model::blocked` all fan out under rayon. The
+/// `*Assign`
 /// family keeps the in-place accumulation loops readable. `Debug` is there so
 /// assertion failures in the tests print something useful.
 ///

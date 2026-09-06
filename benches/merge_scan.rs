@@ -1,15 +1,16 @@
 //! Timing harness for one full round of candidate-pair scoring.
 //!
-//! This is the cost that decides whether the tree search is viable. The naive
-//! search scores every pair of the root's children every round, which SPEC.md
-//! section 10 gives as `O(n^3 p)`. Restricting candidates to a `k`-nearest
-//! neighbour graph (SPEC.md section 11) cuts a round to `n * k` pairs; the
-//! upper-bound machinery (section 10) then means only a handful of those get
-//! rescored in a typical later round, with a full rescan at each ellipsoid
-//! epoch boundary.
+//! This is the per-pair cost that decides whether the tree search is viable.
+//! The naive search scores every pair of the root's children every round, which
+//! SPEC.md section 10 gives as `O(n^3 p)`. `search::candidates` cuts a round to
+//! `n * k` pairs and `search::bounds` leaves only a handful of those rescored in
+//! a typical later round, with a full rescan when the ellipsoid is redrawn. So
+//! the number to know is the wall time of one full `n * k` scan: a run pays it
+//! once up front and once per redraw.
 //!
-//! So the number to know is the wall time of one full `n * k` scan. A run pays
-//! it once up front and once per epoch.
+//! The *phase* total, which is this plus the graph builds, the bound
+//! bookkeeping and the round loop, is what `benches/steps.rs` and
+//! `benches/pipeline.rs` report. This is only the kernel underneath it.
 //!
 //! ```sh
 //! cargo bench --bench merge_scan
@@ -28,9 +29,11 @@ const STAR_SIZES: [usize; 3] = [1024, 4096, 8192];
 /// Feature counts swept.
 const FEATURE_COUNTS: [usize; 2] = [500, 2000];
 
-/// Neighbours per node. The paper reports 5 to 10 working well; the value this
-/// crate ships is ours to pick once the search exists, so the scan is measured
-/// at the top of that range.
+/// Neighbours per node, which fixes the `n * k` pair count.
+///
+/// `KnnCandidatesParams::default` ships 16. This is deliberately measured at 10,
+/// the top of the paper's reported range, so the number stays comparable to
+/// earlier runs of this bench. Scale it linearly for any other `k`.
 const NEIGHBOURS: usize = 10;
 
 /// Repeats per configuration; the reported time is the best of these.

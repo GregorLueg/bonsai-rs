@@ -53,9 +53,9 @@
 use crate::errors::BonsaiErrors;
 use crate::model::global::UpState;
 use crate::model::likelihood::NodeState;
-use crate::search::Leaves;
 use crate::search::polytomy::{CentreStar, Splice, splice_star};
 use crate::search::star::{StarParams, StarResult, StarSelection, resolve_star};
+use crate::search::{Leaves, leaves_below, settle, tree_loglik};
 use crate::tree::Tree;
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
@@ -416,26 +416,6 @@ fn collapse_delta<T: BonsaiFloat>(
 // Topology comparison //
 /////////////////////////
 
-/// Leaves below every node of a tree.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-///
-/// ### Returns
-///
-/// One count per node, indexed by node id.
-fn leaves_below(tree: &Tree) -> Vec<usize> {
-    let mut below = vec![0usize; tree.n_nodes()];
-    for leaf in 0..tree.n_leaves() {
-        below[leaf] = 1;
-    }
-    for node in tree.internal_postorder() {
-        below[node as usize] = tree.children(node).iter().map(|&c| below[c as usize]).sum();
-    }
-    below
-}
-
 /// Whether a resolved star puts back exactly the split the deleted edge
 /// carried, and so proposes no interchange at all.
 ///
@@ -524,53 +504,6 @@ fn rebuilds_the_same_splits<T>(
 // Phases //
 /////////////
 
-/// Settle a tree's down and up rows.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `leaves` - The leaf data
-///
-/// ### Returns
-///
-/// The settled rows and the tree loglikelihood, or the error the state
-/// allocation failed with.
-fn settle<T: BonsaiFloat>(
-    tree: &Tree,
-    leaves: Leaves<'_, T>,
-) -> Result<(NodeState<T>, UpState<T>, f64), BonsaiErrors> {
-    let mut down = NodeState::new(
-        tree.n_nodes(),
-        leaves.n_features,
-        leaves.means,
-        leaves.precisions,
-    )?;
-    let loglik = down.prune(tree);
-    let mut up = UpState::new(tree.n_nodes(), leaves.n_features);
-    up.sweep(tree, &down);
-    Ok((down, up, loglik))
-}
-
-/// Loglikelihood of a tree, from the leaf data alone.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `leaves` - The leaf data
-///
-/// ### Returns
-///
-/// The tree loglikelihood, or the error the state allocation failed with.
-fn tree_loglik<T: BonsaiFloat>(tree: &Tree, leaves: Leaves<'_, T>) -> Result<f64, BonsaiErrors> {
-    let mut state = NodeState::new(
-        tree.n_nodes(),
-        leaves.n_features,
-        leaves.means,
-        leaves.precisions,
-    )?;
-    Ok(state.prune(tree))
-}
-
 /// The random phase: `n_random` interchanges with the merge sampled rather than
 /// chosen, accepted whatever they do to the tree.
 ///
@@ -644,9 +577,11 @@ pub fn nni_random<T: BonsaiFloat>(
 /// tree's is discarded before it is scored; see the module docs.
 ///
 /// Edges are visited in ascending node order and ties go to the lower node, so
-/// the round's winner is fixed. The scan is sequential: the parallelism in this
-/// crate lives on the feature axis inside the pruning kernels, and a candidate
-/// scan that forked over edges would nest inside it.
+/// the round's winner is fixed. The scan is sequential, and it is the one place
+/// in the search that could be parallel and is not: every candidate reads the
+/// same settled rows and writes nothing, so only the reduction over gains would
+/// need ordering. It has not been worth it since the topology filter took a
+/// round to linear in the leaf count.
 ///
 /// ### A round is linear in the leaf count
 ///

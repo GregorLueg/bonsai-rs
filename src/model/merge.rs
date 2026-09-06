@@ -69,24 +69,16 @@ impl Default for MergeParams {
     /// but a merge scan that is losing close calls on a coupled fixture is
     /// where to look first.
     ///
+    /// The shortfall changes the score and not the answer. Running the whole
+    /// pipeline at two sweeps against eight, over 15 fixtures spanning 32 and 64
+    /// leaves, three noise levels and five seeds, gave **identical trees and
+    /// loglikelihoods agreeing to every printed digit**, Robinson-Foulds 0 in
+    /// every case. The coupled corner does not arise where a real search looks,
+    /// so the default stands. Measured 2026-08-31.
+    ///
     /// `split_tol` is looser than the branch-length tolerance in
     /// `model::branch` on purpose: the gain is stationary in the split at the
     /// optimum, so an error of `eps` in the split costs `O(eps^2)` in the score.
-    ///
-    /// ### Two sweeps is not always converged, and it does not matter
-    ///
-    /// The "reach the fixed point exactly" above holds on ordinary fixtures and
-    /// not universally. Over 3000 random three-leaf cases with separations
-    /// spanning `1e-2` to `1e2` and precisions skewed by up to `1e3`, two sweeps
-    /// fell as much as 5.4e-3 short of twenty, and 24 of the 3000 were worse
-    /// than 1e-6. Strongly coupled corner, not the typical case.
-    ///
-    /// It changes the score and not the answer. Running the whole pipeline at
-    /// two sweeps against eight, over 15 fixtures spanning 32 and 64 leaves,
-    /// three noise levels and five seeds, gave **identical trees and
-    /// loglikelihoods agreeing to every printed digit**, Robinson-Foulds 0 in
-    /// every case. The corner does not arise where a real search looks, so the
-    /// default stands. Measured 2026-08-31.
     fn default() -> Self {
         Self {
             coord_sweeps: 2,
@@ -278,14 +270,14 @@ impl MergeScratch {
     /// `a = 1 / (t + c)` the chain rule needs only `da/dt = -a^2`, so both
     /// partials fall out of the same pass that evaluates the score.
     ///
-    /// Neither partial has a production consumer today: the split is solved by
+    /// Neither partial has a production consumer: the split is solved by
     /// [`MergeScratch::split_derivative`] and `t_ar` by the edge solve, so
-    /// [`score_merge`] and [`gain_at`] both call this for the gain alone. They
-    /// are kept because they are what pins the two gradient copies against
-    /// central differences, and they are nearly free: this runs once per
-    /// candidate pair, against the tens of `split_derivative` calls the
-    /// bisection makes. `d_dtar` is also what SPEC.md section 10's upper-bound
-    /// machinery will want when it is written.
+    /// [`score_merge`] and [`gain_at`] both call this for the gain alone.
+    /// [`crate::search::bounds`] differentiates the score too but does it with
+    /// respect to the centre, through its own chain rule. These are kept because
+    /// they are what pins the two gradient copies against central differences,
+    /// and they are nearly free: this runs once per candidate pair, against the
+    /// tens of `split_derivative` calls the bisection makes.
     ///
     /// ### Params
     ///
@@ -531,9 +523,11 @@ pub fn score_merge<T: BonsaiFloat>(
 
 /// The gain of a merge at explicitly given branch lengths, without optimising.
 ///
-/// For tests and for the upper-bound machinery of SPEC.md section 10, which
-/// needs the score as a function of the root's position rather than at its
-/// optimum.
+/// The score as a function of where the ancestor sits rather than at its
+/// optimum, which is what a central difference against
+/// [`MergeScratch::gain_and_gradient`] needs. Both this module's gradient tests
+/// and `search::bounds`'s use it for exactly that; nothing in the pipeline
+/// calls it.
 ///
 /// ### Params
 ///

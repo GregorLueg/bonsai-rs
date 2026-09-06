@@ -2,9 +2,9 @@
 //!
 //! Each function here corresponds to one equation in `docs/SPEC.md` and is
 //! written as a single fused pass over the feature axis. They are deliberately
-//! sequential: parallelism in this crate lives one level up, over independent
-//! nodes in a level or over candidate pairs in a merge round, so a nested rayon
-//! fan-out here would only oversubscribe.
+//! sequential: parallelism in this crate lives one level up, over candidate
+//! pairs in a merge round, so a nested rayon fan-out here would only
+//! oversubscribe.
 //!
 //! Storage is `T`, accumulation is always `f64`. See `BonsaiFloat`.
 //!

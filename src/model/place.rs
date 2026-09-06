@@ -314,10 +314,10 @@ fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
 /// **Do not reach for [`crate::model::global::UpState`]'s rows directly.** They
 /// are everything outside a node's subtree, positioned at the node's *parent*
 /// and not diffused along the branch above it, so a caller who passes them
-/// straight in is wrong on two counts (adversarial review N8). The composition
-/// that is right is written once, in `search::spr`, which diffuses the up row
-/// down the branch and then combines it with the down row; that is the provider
-/// the crate's own caller of this function uses.
+/// straight in is wrong on two counts. The composition that is right is
+/// [`crate::model::global::collapse_onto_every_node`], which is what
+/// `backbone` hands in; `search::spr` forms the same rows one node at a time
+/// rather than all at once, because a proposal reads a few dozen of them.
 ///
 /// A plain closure is used rather than a trait because the provider is free to
 /// store the sweep in whatever layout suits it, needs no wrapper type, and the
@@ -416,8 +416,7 @@ mod tests {
 
     /// A tree with data simulated on it, plus the two-sided effective leaves.
     ///
-    /// Stands in for what `model::global` will provide. Everything is `f64` and
-    /// flat, `[node][feature]`.
+    /// Everything is `f64` and flat, `[node][feature]`.
     struct Fixture {
         tree: Tree,
         p: usize,
@@ -578,9 +577,10 @@ mod tests {
     /// `from` cut, onto `x`.
     ///
     /// The two-sided sweep written the slow, obvious, recursive way: `O(n)` per
-    /// node rather than `O(1)` amortised. This is the reference the effective
-    /// leaves in the fixture come from, so the placement tests do not depend on
-    /// `model::global` existing yet.
+    /// node rather than `O(1)` amortised. The independent reference the
+    /// effective leaves in the fixture come from, so these tests share no code
+    /// with [`crate::model::global::collapse_onto_every_node`], which is what a
+    /// production caller passes in.
     ///
     /// ### Params
     ///

@@ -80,12 +80,13 @@
 //! independently and for the same reason.
 
 use crate::errors::BonsaiErrors;
+use crate::model::global::up_part;
 use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place};
-use crate::search::Leaves;
 use crate::search::polytomy::{CentreStar, splice_star};
 use crate::search::star::StarParams;
+use crate::search::{Leaves, settled_down, tree_loglik};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
@@ -897,79 +898,9 @@ fn read_down<'r, T: BonsaiFloat>(rows: &'r LazyRows<'_, T>, node: u32) -> (&'r [
     )
 }
 
-/// The up part of a node's own row, diffused down the branch above it.
-///
-/// A transcription of the private helper of the same name in
-/// [`crate::model::global`], which the up sweep applies before combining.
-///
-/// ### Params
-///
-/// * `is_root` - Whether the node is the root, which has no up part at all
-/// * `t_a` - Branch above the node
-/// * `w_up` - The node's up precision
-/// * `m_up` - The node's up mean
-///
-/// ### Returns
-///
-/// The diffused precision and the mean.
-fn up_part<T: BonsaiFloat>(is_root: bool, t_a: f64, w_up: T, m_up: T) -> (f64, f64) {
-    if is_root {
-        (0.0, 0.0)
-    } else {
-        (1.0 / (t_a + 1.0 / wide(w_up)), wide(m_up))
-    }
-}
-
 //////////////
 // One move //
 //////////////
-
-/// Settle a tree's down rows alone.
-///
-/// [`spr_round`] wants the down rows and not the up ones, and the up sweep is
-/// the more expensive half of settling a tree.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `leaves` - The leaf data
-///
-/// ### Returns
-///
-/// The settled rows, or the error the state allocation failed with.
-fn settled_down<T: BonsaiFloat>(
-    tree: &Tree,
-    leaves: Leaves<'_, T>,
-) -> Result<NodeState<T>, BonsaiErrors> {
-    let mut down = NodeState::new(
-        tree.n_nodes(),
-        leaves.n_features,
-        leaves.means,
-        leaves.precisions,
-    )?;
-    down.prune(tree);
-    Ok(down)
-}
-
-/// Loglikelihood of a tree, from the leaf data alone.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `leaves` - The leaf data
-///
-/// ### Returns
-///
-/// The tree loglikelihood, or the error the state allocation failed with.
-fn tree_loglik<T: BonsaiFloat>(tree: &Tree, leaves: Leaves<'_, T>) -> Result<f64, BonsaiErrors> {
-    let mut state = NodeState::new(
-        tree.n_nodes(),
-        leaves.n_features,
-        leaves.means,
-        leaves.precisions,
-    )?;
-    Ok(state.prune(tree))
-}
 
 /// Hang a detached subtree back onto the remaining tree below `target`.
 ///
@@ -1145,10 +1076,10 @@ fn candidate_order(tree: &Tree, params: &SprParams, rng: &mut SplitMix64) -> Vec
 /// would produce, so an accepted move is an improvement in the quantity that
 /// actually matters and the sweep is monotone in the loglikelihood by
 /// construction. A candidate whose splits match the current tree's is discarded
-/// before it is scored; see the module docs. The scan is sequential: the
-/// parallelism in this crate lives on the feature axis inside the pruning
-/// kernels, and a candidate scan that forked over subtrees would nest inside
-/// it.
+/// before it is scored; see the module docs. The scan is sequential because it
+/// has to be: an accepted move resettles the rows every later candidate is
+/// proposed against, so a candidate cannot be scored until the one before it has
+/// been decided.
 ///
 /// ### Params
 ///
@@ -1174,7 +1105,7 @@ pub fn spr_round<T: BonsaiFloat>(
     // All three describe the tree as it stands, and a rejected candidate leaves
     // it exactly as it stands, so they are settled once and again only when a
     // move is accepted. The scan is sequential, which is what makes that safe.
-    let mut down = settled_down(&tree, leaves)?;
+    let mut down = settled_down(&tree, leaves)?.0;
     let mut word = crate::search::leaf_words(&tree);
     let mut here = crate::search::split_fingerprint(&tree);
 
@@ -1199,7 +1130,7 @@ pub fn spr_round<T: BonsaiFloat>(
             });
             best = loglik;
             tree = candidate;
-            down = settled_down(&tree, leaves)?;
+            down = settled_down(&tree, leaves)?.0;
             word = crate::search::leaf_words(&tree);
             here = crate::search::split_fingerprint(&tree);
         }
@@ -1483,7 +1414,7 @@ mod tests {
         tree: &Tree,
         leaves: Leaves<'_, f64>,
     ) -> Vec<(Tree, u32, CentreStar<f64>, CentreStar<f64>)> {
-        let down = settled_down(tree, leaves).expect("down");
+        let down = settled_down(tree, leaves).expect("down").0;
         let params = SprParams::default();
         let mut out = Vec::new();
         for x in 0..tree.n_nodes() as u32 {
@@ -1694,7 +1625,7 @@ mod tests {
             } else {
                 optimised(&data.tree, leaves)
             };
-            let down = settled_down(&tree, leaves).expect("down");
+            let down = settled_down(&tree, leaves).expect("down").0;
 
             let mut checked = 0usize;
             let mut dirty_seen = 0usize;
@@ -1781,7 +1712,7 @@ mod tests {
             n_features: p,
         };
         let tree = optimised(&data.tree, leaves);
-        let down = settled_down(&tree, leaves).expect("down");
+        let down = settled_down(&tree, leaves).expect("down").0;
 
         let mut total = 0usize;
         let mut formed = 0usize;

@@ -11,7 +11,9 @@
 //! regardless. The tree loglikelihood is a sum over thousands of features whose
 //! interesting differences are `O(1)` while the sum is `O(p)`, so `f32`
 //! accumulation would turn the convergence criterion into noise. `f32` storage
-//! is still worth having: the kernels are memory bound.
+//! is still worth having: it halves the working set the search streams, and it
+//! is the only tier where the vector logarithm the kernels are bound on exists.
+//! See `utils::simd`.
 //!
 //! ### Units
 //!
@@ -24,9 +26,14 @@
 //!
 //! ### Parallelism
 //!
-//! Rayon fans out over independent nodes within a tree level and over candidate
-//! pairs within a merge round. The feature-axis kernels are sequential by
-//! design, so nothing here nests.
+//! Three axes, and only three: candidate pairs within a merge round
+//! (`search::star`), the pairs whose bounds are being rebuilt (`search::bounds`)
+//! and features at ingest. The feature-axis kernels are sequential by design, so
+//! nothing here nests.
+//!
+//! The tree sweeps are not parallel. `model::blocked` holds a feature-blocked
+//! sweep that is, and nothing in the pipeline calls it; every prune the search
+//! runs goes through the sequential `model::likelihood::NodeState`.
 
 #![warn(missing_docs)]
 // Indexed loops are what the numeric kernels want. Rewriting them as zipped

@@ -247,12 +247,8 @@ impl Layout {
             // trip. `atan2` followed by `sin_cos` would cost two transcendental
             // calls and perturb an angle the projection is supposed to leave
             // exactly alone.
-            // `r.hypot(1.0)`, not `(1.0 + r * r).sqrt()`. Squaring first
-            // overflows above r = 1.3e154, at which point the scale collapses
-            // to zero and the point lands on the origin rather than near the
-            // rim, inverting radial order exactly where the doc above promises
-            // it survives. `hypot` is overflow-safe and gives 0.5 at r = 0, so
-            // the zero case needs no branch of its own.
+            // `r.hypot(1.0)`, not `(1.0 + r * r).sqrt()`; see the doc above. It
+            // also gives 0.5 at r = 0, so the zero case needs no branch.
             let scale = 1.0 / (1.0 + r.hypot(1.0));
             x.push(u * scale);
             y.push(v * scale);
@@ -1116,12 +1112,8 @@ pub fn equal_daylight(
 
     for _ in 0..p.daylight_max_sweeps {
         let mut accepted = false;
-        // Backtracking line search on the rotation size. A full-strength sweep
-        // is clean and improving on trees with uniform branch lengths and is
-        // neither on trees without them: at 512 leaves with lengths spread
-        // over a factor of forty, a sweep at damping 0.1 crosses while the
-        // same sweep at 0.005 does not. Halving until a step lands is what
-        // makes the refinement do anything at all on realistic trees.
+        // Backtracking line search on the rotation size; see the doc above for
+        // why a full-strength sweep is not enough on realistic branch lengths.
         for _ in 0..DAYLIGHT_MAX_BACKTRACKS {
             let mut candidate = best.clone();
             let mut moved = 0.0f64;

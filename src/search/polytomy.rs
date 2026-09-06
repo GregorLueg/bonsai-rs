@@ -51,9 +51,8 @@ use crate::utils::traits::BonsaiFloat;
 /// node, so "more than two children" in SPEC.md section 9.2 becomes "more than
 /// three members" here and the root's trifurcation is correctly left alone.
 ///
-/// `pub(crate)` because [`crate::search::spr`] keeps its own copy of the same
-/// number with a test pinning the two together, which is one constant with two
-/// homes.
+/// `pub(crate)` because [`crate::search::spr`] reads it to decide whether a
+/// regraft left a polytomy behind that needs resolving.
 pub(crate) const RESOLVED_STAR_MEMBERS: usize = 3;
 
 ///////////////////
@@ -623,7 +622,6 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
     leaves: Leaves<'_, T>,
     params: Option<StarParams>,
 ) -> Result<PolytomyResult, BonsaiErrors> {
-    let p = leaves.n_features;
     let mut tree = match collapse_zero_edges(tree)? {
         Some(collapsed) => collapsed,
         None => tree.clone(),
@@ -641,10 +639,7 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
         if let Some(collapsed) = collapse_zero_edges(&tree)? {
             tree = collapsed;
         }
-        let mut down = NodeState::new(tree.n_nodes(), p, leaves.means, leaves.precisions)?;
-        down.prune(&tree);
-        let mut up = UpState::new(tree.n_nodes(), p);
-        up.sweep(&tree, &down);
+        let (down, up, _) = crate::search::settle(&tree, leaves)?;
 
         let mut accepted: Option<Splice> = None;
         for node in tree.internal_postorder() {
@@ -746,17 +741,7 @@ mod tests {
     ///
     /// The settled down rows, the settled up rows and the tree loglikelihood.
     fn settle(tree: &Tree, leaves: Leaves<'_, f64>) -> (NodeState<f64>, UpState<f64>, f64) {
-        let mut down = NodeState::new(
-            tree.n_nodes(),
-            leaves.n_features,
-            leaves.means,
-            leaves.precisions,
-        )
-        .expect("state");
-        let loglik = down.prune(tree);
-        let mut up = UpState::new(tree.n_nodes(), leaves.n_features);
-        up.sweep(tree, &down);
-        (down, up, loglik)
+        crate::search::settle(tree, leaves).expect("state")
     }
 
     /// Loglikelihood of a tree, computed from nothing but the leaf data.
@@ -770,14 +755,7 @@ mod tests {
     ///
     /// The tree loglikelihood.
     fn loglik(tree: &Tree, leaves: Leaves<'_, f64>) -> f64 {
-        let mut state = NodeState::new(
-            tree.n_nodes(),
-            leaves.n_features,
-            leaves.means,
-            leaves.precisions,
-        )
-        .expect("state");
-        state.prune(tree)
+        crate::search::tree_loglik(tree, leaves).expect("state")
     }
 
     /// Branch length below which the fixtures collapse an internal edge.

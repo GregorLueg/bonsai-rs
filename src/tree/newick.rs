@@ -122,12 +122,9 @@ pub fn write_newick_labelled<S: AsRef<str>, T: AsRef<str>>(
 ) -> Result<String, BonsaiErrors> {
     let n_leaves = tree.n_leaves();
     let n_internal = tree.n_nodes() - n_leaves;
-    // The arena holds a lone leaf, deliberately, because `tree::cluster` has a
-    // use for one. Newick cannot: the string for it is a bare label, which
-    // `parse_newick` rejects as not a tree and which no other reader treats as
-    // one either. Refusing to write it is what keeps the writer and the reader
-    // agreed on what a tree is (adversarial review N15); the alternative would
-    // be a parser that accepts `";"`.
+    // A lone leaf, which the arena holds and Newick has no form for; see the
+    // module docs. Refusing here is what keeps the writer and the reader agreed
+    // on what a tree is.
     if n_leaves < 2 {
         return Err(BonsaiErrors::MalformedTree {
             reason: format!(

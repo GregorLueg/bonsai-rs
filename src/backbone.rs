@@ -29,13 +29,13 @@
 use crate::bonsai::{BonsaiParams, BonsaiResult, bonsai_prepared, refine};
 use crate::errors::BonsaiErrors;
 use crate::ingest::PreparedData;
-use crate::model::global::{UpState, optimise_branch_lengths};
+use crate::model::global::{collapse_onto_every_node, optimise_branch_lengths};
 use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::rng::SplitMix64;
-use crate::utils::traits::{BonsaiFloat, narrow, wide};
+use crate::utils::traits::{BonsaiFloat, narrow};
 
 /// Cells in the initial backbone, when the caller does not say.
 ///
@@ -334,7 +334,8 @@ impl<T: BonsaiFloat> Growing<T> {
         // what `place` documents as its contract. That is the same quantity as
         // the posterior at that node: the subtree below combined with
         // everything above, reached across the node's own branch.
-        let (eff_m, eff_w) = collapsed_onto_every_node(&tree, &self.means, &self.precisions, p)?;
+        let (eff_m, eff_w) = collapse_onto_every_node(&tree, &self.means, &self.precisions, p)?;
+        let eff_w: Vec<T> = eff_w.iter().map(|&x| narrow(x)).collect();
 
         let lo = cell * p;
         let q = EffLeaf {
@@ -539,59 +540,6 @@ impl<T: BonsaiFloat> Growing<T> {
         }
         Tree::from_parents(parent, branch, n_cells)
     }
-}
-
-/// The whole tree collapsed onto each node in turn.
-///
-/// This is `place`'s contract: for node `a`, the effective leaf you get by
-/// rooting there and marginalising everything else. Two sweeps give it for every
-/// node at once, which is what makes a placement search affordable.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `means` - Leaf means, row-major
-/// * `precisions` - Leaf precisions, same layout
-/// * `p` - Features per row
-///
-/// ### Returns
-///
-/// Means and precisions, row-major `[node][feature]`.
-fn collapsed_onto_every_node<T: BonsaiFloat>(
-    tree: &Tree,
-    means: &[T],
-    precisions: &[T],
-    p: usize,
-) -> Result<(Vec<T>, Vec<T>), BonsaiErrors> {
-    let n_nodes = tree.n_nodes();
-    let mut down = NodeState::new(n_nodes, p, means, precisions)?;
-    down.prune(tree);
-    let mut up = UpState::new(n_nodes, p);
-    up.sweep(tree, &down);
-
-    let mut m = vec![T::zero(); n_nodes * p];
-    let mut w = vec![T::zero(); n_nodes * p];
-    for node in 0..n_nodes as u32 {
-        let lo = node as usize * p;
-        let (m_down, w_down) = (down.means(node), down.precisions(node));
-        if tree.parent(node).is_none() {
-            m[lo..lo + p].copy_from_slice(m_down);
-            w[lo..lo + p].copy_from_slice(w_down);
-            continue;
-        }
-        let (m_up, w_up) = (up.means(node), up.precisions(node));
-        let t = tree.branch(node);
-        for g in 0..p {
-            let w_u = wide(w_up[g]);
-            let up_here = w_u / (1.0 + t * w_u);
-            let w_d = wide(w_down[g]);
-            let total = w_d + up_here;
-            let md = wide(m_down[g]);
-            m[lo + g] = narrow(md + (wide(m_up[g]) - md) * (up_here / total));
-            w[lo + g] = narrow(total);
-        }
-    }
-    Ok((m, w))
 }
 
 ///////////

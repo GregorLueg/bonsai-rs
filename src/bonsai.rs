@@ -22,18 +22,18 @@
 
 use crate::errors::BonsaiErrors;
 use crate::ingest::{IngestParams, PreparedData, prepare};
-use crate::model::global::{GlobalBranchParams, UpState, optimise_branch_lengths};
+use crate::model::global::{GlobalBranchParams, collapse_onto_every_node, optimise_branch_lengths};
 use crate::model::likelihood::NodeState;
-use crate::search::Leaves;
 use crate::search::bounds::{EllipsoidBounds, EllipsoidBoundsParams};
 use crate::search::candidates::{KnnCandidates, KnnCandidatesParams};
 use crate::search::nni::{NniParams, nni};
 use crate::search::polytomy::resolve_polytomies;
 use crate::search::spr::{SprParams, spr};
 use crate::search::star::{Star, StarParams, star_tree_with};
+use crate::search::{Leaves, tree_loglik};
 use crate::tree::Tree;
 use crate::tree::cluster::reroot_for_display;
-use crate::utils::traits::{BonsaiFloat, narrow, wide};
+use crate::utils::traits::{BonsaiFloat, narrow};
 
 /// Branch length the initial star hangs every leaf on, before step 1 optimises
 /// it.
@@ -359,26 +359,6 @@ fn star_of(n_leaves: usize) -> Result<Tree, BonsaiErrors> {
     Tree::from_parents(parent, branch, n_leaves)
 }
 
-/// Score a tree.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `leaves` - Transformed leaf data
-///
-/// ### Returns
-///
-/// The tree loglikelihood.
-fn tree_loglik<T: BonsaiFloat>(tree: &Tree, leaves: Leaves<'_, T>) -> Result<f64, BonsaiErrors> {
-    let mut state = NodeState::new(
-        tree.n_nodes(),
-        leaves.n_features,
-        leaves.means,
-        leaves.precisions,
-    )?;
-    Ok(state.prune(tree))
-}
-
 /// Optimise every branch length in place.
 ///
 /// ### Params
@@ -406,15 +386,9 @@ fn optimise_all<T: BonsaiFloat>(
 
 /// Posterior mean and standard deviation for every node, in raw units.
 ///
-/// The likelihood is independent of the root (S14), so the posterior for node
-/// `i` is what you get by rooting there and marginalising everything else. That
-/// is the product of two Gaussians already computed by the sweeps: the subtree
-/// below `i`, and everything above it seen across `i`'s own branch. Precisions
-/// add, means combine precision-weighted.
-///
-/// The mean is formed as a convex combination rather than a ratio of sums, for
-/// the reason given in `utils::kernels::prune_binary_scalar`: the result is
-/// pinned between the two inputs and cannot cancel.
+/// The posterior at a node is the whole tree collapsed onto it, which is what
+/// [`collapse_onto_every_node`] computes; this turns its precisions into
+/// standard deviations and both blocks back into the caller's units.
 ///
 /// ### Params
 ///
@@ -430,46 +404,8 @@ fn posteriors<T: BonsaiFloat>(
     leaves: Leaves<'_, T>,
     data: &PreparedData<T>,
 ) -> Result<(Vec<T>, Vec<T>), BonsaiErrors> {
-    let p = leaves.n_features;
-    let n_nodes = tree.n_nodes();
-
-    let mut down = NodeState::new(n_nodes, p, leaves.means, leaves.precisions)?;
-    down.prune(tree);
-    let mut up = UpState::new(n_nodes, p);
-    up.sweep(tree, &down);
-
-    let mut means = vec![T::zero(); n_nodes * p];
-    let mut precisions = vec![0.0f64; n_nodes * p];
-    for node in 0..n_nodes as u32 {
-        let lo = node as usize * p;
-        let (m_down, w_down) = (down.means(node), down.precisions(node));
-
-        if tree.parent(node).is_none() {
-            // The root has nothing above it, so its posterior is the whole tree
-            // seen from below.
-            for g in 0..p {
-                means[lo + g] = m_down[g];
-                precisions[lo + g] = wide(w_down[g]);
-            }
-            continue;
-        }
-
-        let (m_up, w_up) = (up.means(node), up.precisions(node));
-        let t = tree.branch(node);
-        for g in 0..p {
-            // The up-part sits at the parent, so it reaches this node across
-            // this node's own branch.
-            let w_u = wide(w_up[g]);
-            let w_up_here = w_u / (1.0 + t * w_u);
-            let w_d = wide(w_down[g]);
-            let total = w_d + w_up_here;
-
-            let md = wide(m_down[g]);
-            means[lo + g] = narrow(md + (wide(m_up[g]) - md) * (w_up_here / total));
-            precisions[lo + g] = total;
-        }
-    }
-
+    let (means, precisions) =
+        collapse_onto_every_node(tree, leaves.means, leaves.precisions, leaves.n_features)?;
     let sds: Vec<T> = precisions.iter().map(|&w| narrow(1.0 / w.sqrt())).collect();
     Ok((data.restore_scale(&means)?, data.restore_scale(&sds)?))
 }

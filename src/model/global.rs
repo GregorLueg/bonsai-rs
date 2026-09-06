@@ -249,6 +249,10 @@ impl<T: BonsaiFloat> UpState<T> {
 /// The up-part of a node as its children see it: its own up value diffused
 /// along the branch above it.
 ///
+/// `pub(crate)` because [`crate::search::spr`]'s lazy rows fill one node's up
+/// row at a time and have to apply the identical expression, in the identical
+/// order, to get the identical bits.
+///
 /// ### Params
 ///
 /// * `is_root` - Whether the node is the root, which has no up-part at all
@@ -262,12 +266,83 @@ impl<T: BonsaiFloat> UpState<T> {
 /// precision at the root, where the mean is arbitrary and is returned as zero
 /// so that the convex combinations downstream stay finite.
 #[inline]
-fn up_part<T: BonsaiFloat>(is_root: bool, t_a: f64, w_up: T, m_up: T) -> (f64, f64) {
+pub(crate) fn up_part<T: BonsaiFloat>(is_root: bool, t_a: f64, w_up: T, m_up: T) -> (f64, f64) {
     if is_root {
         (0.0, 0.0)
     } else {
         (1.0 / (t_a + 1.0 / wide(w_up)), wide(m_up))
     }
+}
+
+/// The whole tree collapsed onto every node in turn.
+///
+/// For node `i`, the effective leaf you get by rooting there and marginalising
+/// everything else, which is the same object as the posterior at `i`: the
+/// likelihood does not depend on the root (S14), so it is the product of two
+/// Gaussians the sweeps already hold, the subtree below `i` and everything above
+/// it seen across `i`'s own branch. Precisions add, means combine
+/// precision-weighted. Two sweeps give it for every node at once, which is what
+/// makes both a placement search and a whole-tree posterior affordable.
+///
+/// The mean is formed as a convex combination rather than a ratio of sums, for
+/// the reason given in [`crate::utils::kernels::prune_binary_scalar`]: the
+/// result is pinned between the two inputs and cannot cancel.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `means` - Leaf means, row-major `[leaf][feature]`
+/// * `precisions` - Leaf precisions, same layout
+/// * `p` - Features per row
+///
+/// ### Returns
+///
+/// Means, row-major `[node][feature]` in the storage type, and precisions in
+/// `f64`, which is what a caller wanting standard deviations needs and what a
+/// caller wanting an effective leaf narrows.
+pub(crate) fn collapse_onto_every_node<T: BonsaiFloat>(
+    tree: &Tree,
+    means: &[T],
+    precisions: &[T],
+    p: usize,
+) -> Result<(Vec<T>, Vec<f64>), BonsaiErrors> {
+    let n_nodes = tree.n_nodes();
+    let mut down = NodeState::new(n_nodes, p, means, precisions)?;
+    down.prune(tree);
+    let mut up = UpState::new(n_nodes, p);
+    up.sweep(tree, &down);
+
+    let mut m = vec![T::zero(); n_nodes * p];
+    let mut w = vec![0.0f64; n_nodes * p];
+    for node in 0..n_nodes as u32 {
+        let lo = node as usize * p;
+        let (m_down, w_down) = (down.means(node), down.precisions(node));
+
+        if tree.parent(node).is_none() {
+            // The root has nothing above it, so its row is the whole tree seen
+            // from below.
+            for g in 0..p {
+                m[lo + g] = m_down[g];
+                w[lo + g] = wide(w_down[g]);
+            }
+            continue;
+        }
+
+        let (m_up, w_up) = (up.means(node), up.precisions(node));
+        let t = tree.branch(node);
+        for g in 0..p {
+            // The up part sits at the parent, so it reaches this node across
+            // this node's own branch.
+            let w_u = wide(w_up[g]);
+            let up_here = w_u / (1.0 + t * w_u);
+            let w_d = wide(w_down[g]);
+            let total = w_d + up_here;
+            let md = wide(m_down[g]);
+            m[lo + g] = narrow(md + (wide(m_up[g]) - md) * (up_here / total));
+            w[lo + g] = total;
+        }
+    }
+    Ok((m, w))
 }
 
 /////////////////////////

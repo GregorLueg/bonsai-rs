@@ -358,8 +358,8 @@ fn validate<T: BonsaiFloat>(
 ///
 /// ### Returns
 ///
-/// `Ok(())`, or `ShapeMismatch` on a length disagreement, or `NonPositiveVariance`
-/// standing in for a non-positive variance.
+/// `Ok(())`, or `ShapeMismatch` on a length disagreement, or
+/// `NonPositiveVariance`.
 fn validate_variances(variances: &[f64], n_features: usize) -> Result<(), BonsaiErrors> {
     if variances.len() != n_features {
         return Err(BonsaiErrors::ShapeMismatch {
@@ -641,11 +641,11 @@ fn score_features<T: BonsaiFloat>(
 /// ### Returns
 ///
 /// The transformed data and everything needed to map it back, or an error:
-/// `EmptyInput` for an empty dataset or for a threshold that retains nothing,
-/// `ShapeMismatch` for disagreeing lengths, `NonPositiveSd` for a standard
-/// deviation that is not strictly positive and finite, `MalformedTree` standing
-/// in for a non-finite mean or a non-positive supplied variance, and
-/// `RootFindDiverged` if the variance solve fails to converge.
+/// `EmptyInput` for an empty dataset, `NoFeaturesRetained` for a threshold that
+/// keeps nothing, `ShapeMismatch` for disagreeing lengths, `NonPositiveSd` for a
+/// standard deviation that is not strictly positive and finite, `NonFiniteMean`
+/// for a non-finite mean, `NonPositiveVariance` for a supplied variance that is
+/// not positive, and `RootFindDiverged` if the variance solve fails to converge.
 pub fn prepare<T: BonsaiFloat>(
     means: &[T],
     sds: &[T],
@@ -745,8 +745,8 @@ pub fn prepare<T: BonsaiFloat>(
 ///
 /// Likelihood means and standard deviations over the surviving features, in raw
 /// units and ready for [`prepare`], plus the indices that were dropped. Errors
-/// as [`prepare`] does, with `EmptyInput` also standing in for "every feature
-/// was ill-conditioned".
+/// as [`prepare`] does, plus `IllConditionedConversion` when every feature is
+/// ill-conditioned.
 pub fn from_sanity<T: BonsaiFloat>(
     posterior_means: &[T],
     posterior_sds: &[T],

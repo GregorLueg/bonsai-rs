@@ -11,8 +11,9 @@
 //! so the pruning sweep is a bare linear scan with no traversal and no
 //! recursion. A parent row lies strictly above all of its children's rows, so
 //! borrowing it for writing while reading them is a `split_at_mut` rather than
-//! an unsafe alias. And a whole level is one contiguous block of rows, which is
-//! what lets the sweep fan out over rayon and what keeps the reads local.
+//! an unsafe alias. And a whole level is one contiguous block of rows, so the
+//! sweep's reads stay local and a level is independent enough to be walked in
+//! any order.
 //!
 //! [`Tree::from_parents`] enforces the ordering by relabelling internal nodes,
 //! which is free for callers: internal rows are always computed by the sweep,
@@ -419,10 +420,11 @@ impl Tree {
     /// Build a ladder (caterpillar) tree over `n_leaves` leaves.
     ///
     /// Every internal node has one leaf child and one internal child, so the
-    /// tree is maximally deep and every level holds exactly one node. This is
-    /// the worst case for the level-parallel sweep, which is exactly why it is
-    /// worth having: the Supplementary Information notes that biological trees
-    /// can be deep and laddery, so it bounds what tree shape can cost.
+    /// tree is maximally deep and every level holds exactly one node, which is
+    /// the deepest shape the arena has to carry and the worst case for anything
+    /// that walks a level at a time. Worth having because the Supplementary
+    /// Information notes that biological trees can be deep and laddery, so it
+    /// bounds what tree shape can cost.
     ///
     /// ### Params
     ///

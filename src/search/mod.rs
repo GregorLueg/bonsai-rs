@@ -1,7 +1,11 @@
 //! The tree search of SPEC.md section 9.
 
+use crate::errors::BonsaiErrors;
+use crate::model::global::UpState;
+use crate::model::likelihood::NodeState;
 use crate::tree::Tree;
 use crate::utils::rng::SplitMix64;
+use crate::utils::traits::BonsaiFloat;
 
 pub mod bounds;
 pub mod candidates;
@@ -25,6 +29,96 @@ pub struct Leaves<'a, T> {
     pub precisions: &'a [T],
     /// Number of features.
     pub n_features: usize,
+}
+
+//////////////////////
+// Settled trees    //
+//////////////////////
+
+/// Loglikelihood of a tree, from the leaf data alone.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `leaves` - The leaf data
+///
+/// ### Returns
+///
+/// The tree loglikelihood, or the error the state allocation failed with.
+pub(crate) fn tree_loglik<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+) -> Result<f64, BonsaiErrors> {
+    Ok(settled_down(tree, leaves)?.1)
+}
+
+/// Settle a tree's down rows alone.
+///
+/// The up sweep is the more expensive half of settling a tree, so a caller that
+/// only reads down rows takes this.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `leaves` - The leaf data
+///
+/// ### Returns
+///
+/// The settled rows and the tree loglikelihood, or the error the state
+/// allocation failed with.
+pub(crate) fn settled_down<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+) -> Result<(NodeState<T>, f64), BonsaiErrors> {
+    let mut down = NodeState::new(
+        tree.n_nodes(),
+        leaves.n_features,
+        leaves.means,
+        leaves.precisions,
+    )?;
+    let loglik = down.prune(tree);
+    Ok((down, loglik))
+}
+
+/// Settle a tree's down and up rows.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `leaves` - The leaf data
+///
+/// ### Returns
+///
+/// The settled rows and the tree loglikelihood, or the error the state
+/// allocation failed with.
+pub(crate) fn settle<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+) -> Result<(NodeState<T>, UpState<T>, f64), BonsaiErrors> {
+    let (down, loglik) = settled_down(tree, leaves)?;
+    let mut up = UpState::new(tree.n_nodes(), leaves.n_features);
+    up.sweep(tree, &down);
+    Ok((down, up, loglik))
+}
+
+/// Leaves standing below every node of a tree.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+///
+/// ### Returns
+///
+/// One count per node, indexed by node id.
+pub(crate) fn leaves_below(tree: &Tree) -> Vec<usize> {
+    let mut below = vec![0usize; tree.n_nodes()];
+    for leaf in 0..tree.n_leaves() {
+        below[leaf] = 1;
+    }
+    for node in tree.internal_postorder() {
+        below[node as usize] = tree.children(node).iter().map(|&c| below[c as usize]).sum();
+    }
+    below
 }
 
 ////////////////////////
@@ -61,13 +155,7 @@ pub(crate) fn split_fingerprint(tree: &Tree) -> Vec<u64> {
     let total = word[tree.root() as usize];
 
     // Leaf counts, to drop the splits that carry no information.
-    let mut below = vec![0usize; tree.n_nodes()];
-    for leaf in 0..tree.n_leaves() {
-        below[leaf] = 1;
-    }
-    for node in tree.internal_postorder() {
-        below[node as usize] = tree.children(node).iter().map(|&c| below[c as usize]).sum();
-    }
+    let below = leaves_below(tree);
     let n_leaves = tree.n_leaves();
 
     let mut key: Vec<u64> = tree

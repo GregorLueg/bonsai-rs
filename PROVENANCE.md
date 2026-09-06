@@ -42,6 +42,34 @@ regardless of where it was read, or criticism of their engineering, which is not
 the kind of thing anyone copies. Every design decision in this crate is taken
 from `docs/SPEC.md`.
 
+## The comparison harness, 2026-09-06
+
+A black-box comparison against the reference implementation was run. The
+arrangement is the two-team clean room, and it is recorded here because the
+whole licence position rests on it.
+
+A separate agent was given read access to a local clone of the reference, **for
+interface only**: how to invoke it, what input files it expects, what output it
+emits. It was forbidden from reading the source to learn how the method works,
+forbidden from writing any file inside this repository, and required to report
+results only. Explicitly excluded from its report: algorithm descriptions, code
+structure, numerical methods, and any performance explanation derived from
+reading source.
+
+No session that writes this crate's code has read that clone. The harness lives
+outside this repository, at `~/repos/others/bonsai-comparison`, and is not part
+of the crate.
+
+The comparison uses this crate's own simulated data (SPEC.md section 13.1, the
+paper's SI.E.2 recipe), not the reference's example datasets, so that both
+implementations are measured against a ground truth neither produced and no
+NonCommercial data file is involved.
+
+Running the reference to observe its output is black-box observation, protected
+under EU Software Directive Art. 5(3), and does not create Adapted Material. It
+was run on the author's private machine, so the NonCommercial clause is not
+engaged.
+
 ## Rules this crate follows
 
 1. Implementation reads `docs/SPEC.md`, not the PDFs and not their code. Every

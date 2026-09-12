@@ -130,7 +130,11 @@ pub(crate) fn leaves_below(tree: &Tree) -> Vec<usize> {
 /// Every leaf gets a fixed pseudo-random word; an internal node's word is the
 /// sum of its subtree's. A split is then canonicalised by taking the smaller of
 /// the word and its complement, so the fingerprint does not depend on which
-/// node is the root, on sibling order, or on internal node numbering.
+/// node is the root, on sibling order, or on internal node numbering. The
+/// fingerprint is the sum of a hash of each split, which is a multiset hash:
+/// the same set of splits gives the same word whatever order they are met in.
+/// It was a sorted vector of the split words until 2026-09-12, which cost a
+/// sort of `n` words per SPR candidate; the sum costs a pass.
 ///
 /// Used by both NNI and SPR to reject a proposal that changes no split. That
 /// filter is load-bearing rather than cosmetic: without it, collapsing and
@@ -138,10 +142,11 @@ pub(crate) fn leaves_below(tree: &Tree) -> Vec<usize> {
 /// leaving the topology alone, and the greedy phase does branch-length descent
 /// forever. See the deviation note on SPEC.md section 9.4.
 ///
-/// **The `dedup` is not tidying.** A degree-two root's two children describe the
-/// same split, so the raw key carries it twice and two representations of one
-/// unrooted tree compare unequal. Removing it is what makes the fingerprint
-/// blind to rerooting, which is what the filter needs it to be.
+/// **Skipping the second child of a degree-two root is not tidying.** Its two
+/// children describe the same split, so the sum would carry it twice and two
+/// representations of one unrooted tree would compare unequal. Skipping it is
+/// what makes the fingerprint blind to rerooting, which is what the filter
+/// needs it to be.
 ///
 /// ### Params
 ///
@@ -149,9 +154,10 @@ pub(crate) fn leaves_below(tree: &Tree) -> Vec<usize> {
 ///
 /// ### Returns
 ///
-/// The sorted, deduplicated split words.
+/// The fingerprint. Two trees with the same unrooted splits share it; two
+/// with different splits collide with probability about `2^-64`.
 #[cfg(test)]
-pub(crate) fn split_fingerprint(tree: &Tree) -> Vec<u64> {
+pub(crate) fn split_fingerprint(tree: &Tree) -> u64 {
     split_fingerprint_with(tree, &leaf_words(tree))
 }
 
@@ -164,17 +170,23 @@ pub(crate) fn split_fingerprint(tree: &Tree) -> Vec<u64> {
 ///
 /// ### Returns
 ///
-/// The sorted, deduplicated split words.
-pub(crate) fn split_fingerprint_with(tree: &Tree, word: &[u64]) -> Vec<u64> {
-    let total = word[tree.root() as usize];
+/// The fingerprint.
+pub(crate) fn split_fingerprint_with(tree: &Tree, word: &[u64]) -> u64 {
+    let root = tree.root();
+    let total = word[root as usize];
+    let root_kids = tree.children(root);
+    let duplicate = if root_kids.len() == 2 {
+        root_kids[1]
+    } else {
+        crate::tree::NO_NODE
+    };
 
     // Leaf counts, to drop the splits that carry no information.
     let below = leaves_below(tree);
     let n_leaves = tree.n_leaves();
 
-    let mut key: Vec<u64> = tree
-        .internal_postorder()
-        .filter(|&node| tree.parent(node).is_some())
+    tree.internal_postorder()
+        .filter(|&node| tree.parent(node).is_some() && node != duplicate)
         .filter(|&node| {
             // A split with fewer than two leaves on a side is trivial: every
             // tree over the same leaves has it, so it distinguishes nothing.
@@ -184,14 +196,11 @@ pub(crate) fn split_fingerprint_with(tree: &Tree, word: &[u64]) -> Vec<u64> {
             let here = below[node as usize];
             here >= 2 && n_leaves - here >= 2
         })
-        .map(|node| {
+        .fold(0u64, |acc, node| {
             let here = word[node as usize];
-            here.min(total.wrapping_sub(here))
+            let split = here.min(total.wrapping_sub(here));
+            acc.wrapping_add(SplitMix64::new(split).next_u64())
         })
-        .collect();
-    key.sort_unstable();
-    key.dedup();
-    key
 }
 
 /// Per-node word summarising which leaves sit below it.

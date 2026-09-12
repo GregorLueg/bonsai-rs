@@ -127,9 +127,19 @@ const DEFAULT_MAX_ROUNDS: usize = 100;
 /// against the new tree. So the chunk bounds the work an acceptance throws
 /// away, and it halves on every acceptance down to this. Measured 2026-09-12
 /// on an M1 Max, ten threads, 2048 leaves by 2000 features from a Ward start
-/// at noise 1.6, where one candidate in forty is accepted; see
-/// `PERFORMANCE.md` for the table.
-const PROPOSAL_CHUNK_MIN: usize = 32;
+/// at noise 1.6, where 641 of 27987 candidates are accepted and the same tree
+/// comes out at every floor:
+///
+/// | floor | proposals made | seconds |
+/// |---|---|---|
+/// | 32 | 49614 | 24.1 |
+/// | 16 | 41614 | 20.8 |
+/// | 8 | 37846 | 19.1 |
+/// | 4 | 36206 | 19.3 |
+///
+/// Below eight the chunk is too small to keep the pool busy where acceptances
+/// are dense, and above it the discarded proposals cost more than they save.
+const PROPOSAL_CHUNK_MIN: usize = 8;
 
 /// Most candidates a sweep proposes in parallel before deciding any of them.
 ///
@@ -326,15 +336,26 @@ fn assemble(
         }
     }
     let n_kept_leaves = next as usize;
-    let mut internal: Vec<u32> = (n_leaves..n)
-        .filter(|&i| reached[i])
-        .map(|i| i as u32)
-        .collect();
-    internal.sort_unstable_by_key(|&i| (height[i as usize], i));
-    for &node in &internal {
-        new_id[node as usize] = next;
-        next += 1;
+    // Numbered by height and then by index, as a counting sort: the walk over
+    // `n_leaves..n` is already in index order, so bucketing by height keeps
+    // it within each height.
+    let mut count = vec![0u32; n + 1];
+    for i in n_leaves..n {
+        if reached[i] {
+            count[height[i] as usize + 1] += 1;
+        }
     }
+    for h in 0..n {
+        count[h + 1] += count[h];
+    }
+    for i in n_leaves..n {
+        if reached[i] {
+            let h = height[i] as usize;
+            new_id[i] = next + count[h];
+            count[h] += 1;
+        }
+    }
+    next += count[n];
 
     let n_new = next as usize;
     let mut new_parent = vec![NO_NODE; n_new];
@@ -1122,7 +1143,7 @@ fn propose<T: BonsaiFloat>(
     down: &NodeState<T>,
     x: u32,
     params: &SprParams,
-    here: &[u64],
+    here: u64,
     by_word: &FxHashMap<u64, u32>,
 ) -> Result<Option<Proposal>, BonsaiErrors> {
     let Some(pruned) = prune_subtree(tree, x)? else {
@@ -1291,7 +1312,7 @@ pub fn spr_round<T: BonsaiFloat>(
         let proposals: Vec<Option<Proposal>> = order[next..end]
             .par_iter()
             .map(|want| match by_word.get(want) {
-                Some(&x) => propose(&tree, &down, x, &params, &here, &by_word),
+                Some(&x) => propose(&tree, &down, x, &params, here, &by_word),
                 None => Ok(None),
             })
             .collect::<Result<_, _>>()?;
@@ -2385,7 +2406,7 @@ mod tests {
                 &down,
                 leaf,
                 &SprParams::default(),
-                &here,
+                here,
                 &word_index(&word),
             )
             .expect("propose") else {
@@ -2424,7 +2445,7 @@ mod tests {
         let mut checked = 0usize;
         for x in 0..tree.n_nodes() as u32 {
             let Some(proposal) =
-                propose(&tree, &down, x, &SprParams::default(), &here, &by_word).expect("propose")
+                propose(&tree, &down, x, &SprParams::default(), here, &by_word).expect("propose")
             else {
                 continue;
             };

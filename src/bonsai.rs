@@ -33,6 +33,7 @@ use crate::search::star::{Star, StarParams, star_tree_with};
 use crate::search::{Leaves, tree_loglik};
 use crate::tree::Tree;
 use crate::tree::cluster::reroot_for_display;
+use crate::tree::linkage::{LinkageParams, linkage_tree};
 use crate::utils::traits::{BonsaiFloat, narrow};
 
 /// Branch length the initial star hangs every leaf on, before step 1 optimises
@@ -52,6 +53,10 @@ const INITIAL_STAR_BRANCH: f64 = 1.0;
 pub struct BonsaiParams {
     /// Feature selection and the scale transform (SPEC.md section 3).
     pub ingest: IngestParams,
+    /// How the initial topology is built, steps 1 and 2 or a linkage.
+    pub start: StartTree,
+    /// Knobs for the linkage, ignored unless `start` selects it.
+    pub linkage: LinkageParams,
     /// The greedy star primitive (section 9.1) and polytomy resolution (9.2).
     ///
     /// Steps 2 and 3 only. Steps 5 and 6 run the same primitive but take their
@@ -79,6 +84,27 @@ pub struct BonsaiParams {
     /// degenerate for branch-length optimisation: only the sum of the two
     /// branches below it is identifiable.
     pub reroot: bool,
+}
+
+/// How the initial topology is built.
+///
+/// Search steps 1 and 2, or a linkage in their place. The refinement of steps 3
+/// to 7 is identical either way.
+///
+/// **Measured 2026-09-12, and the numbers are in `PERFORMANCE.md`.** At 2048
+/// cells by 2000 features a Ward linkage reaches the same Robinson-Foulds
+/// distance and the same loglikelihood as the greedy merge for a quarter of
+/// the wall time, and at 200 features it is very slightly better. The greedy
+/// merge is still the default because it is what SPEC.md section 9 specifies
+/// and because the linkage has not yet been run against the reference
+/// implementation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartTree {
+    /// The star of SPEC.md section 9.1, agglomerated by the merge score.
+    #[default]
+    GreedyMerge,
+    /// Ward linkage over a neighbour graph, [`crate::tree::linkage`].
+    Linkage,
 }
 
 /// What one step of the search cost and what it bought.
@@ -197,30 +223,44 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
 
     let mut steps: Vec<StepReport> = Vec::with_capacity(7);
 
-    // Step 1: a star with optimised branch lengths.
-    let mut star = star_of(n_cells)?;
-    let mut state = NodeState::new(star.n_nodes(), p, leaves.means, leaves.precisions)?;
-    let loglik = optimise_branch_lengths(&mut star, &mut state, Some(params.branch))?;
-    record("1 star", loglik, &mut steps);
+    let tree = match params.start {
+        StartTree::GreedyMerge => {
+            // Step 1: a star with optimised branch lengths.
+            let mut star = star_of(n_cells)?;
+            let mut state = NodeState::new(star.n_nodes(), p, leaves.means, leaves.precisions)?;
+            let loglik = optimise_branch_lengths(&mut star, &mut state, Some(params.branch))?;
+            record("1 star", loglik, &mut steps);
 
-    // Step 2: greedily add ancestors. The star's optimised branch lengths carry
-    // over as the members' branches to the centre.
-    // Both restrictions on, which is what makes this step tractable. The
-    // bounds sit outside the neighbour graph: the graph decides which pairs
-    // exist, the bounds decide which of those need rescoring this round.
-    let mut candidates =
-        EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)), Some(params.bounds));
-    let (tree, _) = star_tree_with(
-        Star {
-            means: leaves.means,
-            precisions: leaves.precisions,
-            branch: &star.branches()[..n_cells],
-            n_features: p,
-        },
-        Some(params.star),
-        &mut candidates,
-    )?;
-    record("2 merge", tree_loglik(&tree, leaves)?, &mut steps);
+            // Step 2: greedily add ancestors. The star's optimised branch
+            // lengths carry over as the members' branches to the centre.
+            // Both restrictions on, which is what makes this step tractable.
+            // The bounds sit outside the neighbour graph: the graph decides
+            // which pairs exist, the bounds decide which of those need
+            // rescoring this round.
+            let mut candidates =
+                EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)), Some(params.bounds));
+            let (tree, _) = star_tree_with(
+                Star {
+                    means: leaves.means,
+                    precisions: leaves.precisions,
+                    branch: &star.branches()[..n_cells],
+                    n_features: p,
+                },
+                Some(params.star),
+                &mut candidates,
+            )?;
+            record("2 merge", tree_loglik(&tree, leaves)?, &mut steps);
+            tree
+        }
+        StartTree::Linkage => {
+            // Steps 1 and 2 at once, and neither of them scores anything with
+            // the model: the linkage supplies a topology and step 4 supplies
+            // the branch lengths.
+            let tree = linkage_tree(leaves.means, n_cells, p, Some(params.linkage))?;
+            record("1-2 linkage", tree_loglik(&tree, leaves)?, &mut steps);
+            tree
+        }
+    };
 
     refine_from(tree, data, &params, steps)
 }

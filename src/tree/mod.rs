@@ -23,6 +23,7 @@ pub mod cluster;
 pub mod distance;
 pub mod export;
 pub mod layout;
+pub mod linkage;
 pub mod newick;
 pub mod simulate;
 

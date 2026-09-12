@@ -18,7 +18,7 @@ name = "bonsai_rs"
 path = "src/lib.rs"
 
 [dependencies]
-ann-search-rs = "0.6.0"
+ann-search-rs = "0.8.4"
 num-traits = "0.2.19"
 rayon = "1.11.0"
 rustc-hash = "2.1.1"

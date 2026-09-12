@@ -42,6 +42,7 @@ use bonsai_rs::search::nni::nni;
 use bonsai_rs::search::polytomy::resolve_polytomies;
 use bonsai_rs::search::spr::spr;
 use bonsai_rs::search::star::{Star, star_tree_with};
+use bonsai_rs::tree::linkage::{KnnBackend, LinkageParams, linkage_tree as graph_linkage};
 use bonsai_rs::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
 use bonsai_rs::tree::{NO_NODE, Tree};
 use bonsai_rs::utils::rng::splitmix64_at;
@@ -118,6 +119,28 @@ const BEAM_QUERIES: usize = 32;
 /// large enough that a difference of a few splits is not one tree's luck.
 const SPR_NOISE_LEAVES: usize = 2048;
 
+/// Leaf counts for the linkage drift block.
+const DRIFT_LEAVES: [usize; 4] = [512, 1024, 2048, 4096];
+
+/// Neighbour counts swept in the drift block.
+///
+/// The graph linkage reaches the same Robinson-Foulds distance as the dense one
+/// after refinement and yet costs SPR three to seven times more, so the
+/// starting trees differ in a way `RF` to the truth does not see. This sweep
+/// asks in what way, and how much `k` it takes to close.
+const DRIFT_K: [usize; 5] = [8, 16, 32, 64, 128];
+
+/// Neighbour count held fixed while the rebuild cadence is swept.
+///
+/// Sixteen, the shipped default, where the `k` sweep chains worst: depth 131
+/// against 12 at 4096 leaves. If a cadence collapses that back to `log2(n)` the
+/// design survives at `O(n k p)`; if not, agglomeration is the wrong shape.
+const CADENCE_K: usize = 16;
+
+/// Live-count fractions swept as the rebuild trigger. Zero never redraws on
+/// the count and leaves only the dead-end redraw.
+const CADENCE_FRACTIONS: [f64; 4] = [0.0, 0.5, 0.75, 0.9];
+
 /// Members left attached to the root when a linkage stops.
 ///
 /// Three, not two. A binary dendrogram's root is degree two in the unrooted
@@ -136,6 +159,8 @@ enum Start {
     Ward,
     /// A uniformly random sequence of joins.
     Random,
+    /// Ward over a neighbour graph, `tree::linkage`, which is what ships.
+    Graph,
 }
 
 impl Start {
@@ -150,6 +175,7 @@ impl Start {
             Start::Average => "average",
             Start::Ward => "ward",
             Start::Random => "random",
+            Start::Graph => "graph",
         }
     }
 }
@@ -387,6 +413,7 @@ fn build_start(start: Start, data: &PreparedData<f64>, seed: u64) -> (Tree, f64)
         Start::Average => linkage_tree(&data.transformed_means, n, p, false),
         Start::Ward => linkage_tree(&data.transformed_means, n, p, true),
         Start::Random => random_tree(n, seed),
+        Start::Graph => graph_linkage(&data.transformed_means, n, p, None).expect("linkage"),
     };
     (tree, t0.elapsed().as_secs_f64())
 }
@@ -429,7 +456,13 @@ fn run(n: usize, p: usize, noise: f64) -> Vec<(Start, f64, f64, f64, f64)> {
             n_features_in: p,
         };
 
-        for start in [Start::Greedy, Start::Average, Start::Ward, Start::Random] {
+        for start in [
+            Start::Greedy,
+            Start::Average,
+            Start::Ward,
+            Start::Random,
+            Start::Graph,
+        ] {
             let (tree, build) = build_start(start, &data, seed);
             let t0 = Instant::now();
             let out = refine(&tree, &data, None).expect("refine");
@@ -495,7 +528,7 @@ fn step_split(n: usize, seed: u64) -> ([f64; 6], f64) {
     let mut t = [0.0f64; 6];
 
     let t0 = Instant::now();
-    let mut tree = linkage_tree(&sim.means, n, p, true);
+    let mut tree = graph_linkage(&sim.means, n, p, None).expect("linkage");
     t[0] = t0.elapsed().as_secs_f64();
 
     let t0 = Instant::now();
@@ -562,7 +595,7 @@ fn spr_ablation(n: usize, seed: u64, noise: f64) -> ([f64; 3], [f64; 3], f64) {
     };
 
     // Shared prefix: the Ward start, polytomy resolution and step 4.
-    let mut base = linkage_tree(&sim.means, n, p, true);
+    let mut base = graph_linkage(&sim.means, n, p, None).expect("linkage");
     base = resolve_polytomies(&base, leaves, None)
         .expect("step 3")
         .tree;
@@ -621,6 +654,93 @@ fn spr_ablation(n: usize, seed: u64, noise: f64) -> ([f64; 3], [f64; 3], f64) {
     (with, without, scored as f64 / BEAM_QUERIES as f64)
 }
 
+/// Deepest root-to-leaf path, in edges.
+///
+/// The explanatory variable `RF` cannot see. SPR proposes through
+/// `spr::LazyRows`, which recomputes the rows on the path from the cut to the
+/// root, so its cost per candidate is `O(depth * p)`. A linkage that chains
+/// rather than balances is therefore expensive to refine even when it is no
+/// less accurate.
+///
+/// ### Params
+///
+/// * `tree` - The tree to measure
+///
+/// ### Returns
+///
+/// The maximum leaf depth.
+fn max_depth(tree: &Tree) -> usize {
+    (0..tree.n_leaves())
+        .map(|leaf| {
+            let mut depth = 0usize;
+            let mut node = leaf as u32;
+            while let Some(par) = tree.parent(node) {
+                depth += 1;
+                node = par;
+            }
+            depth
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// One graph-linkage configuration against the dense chain, averaged over
+/// `STEP_SEEDS`.
+#[derive(Clone, Copy, Default)]
+struct DriftRow {
+    /// Build seconds.
+    secs: f64,
+    /// Robinson-Foulds to the dense Ward tree.
+    to_dense: f64,
+    /// Robinson-Foulds to the generating tree.
+    to_truth: f64,
+    /// Maximum leaf depth.
+    depth: f64,
+}
+
+/// The graph linkage against the dense chain for a list of parameter sets.
+///
+/// ### Params
+///
+/// * `n` - Number of cells
+/// * `configs` - One linkage configuration per row
+///
+/// ### Returns
+///
+/// One row per configuration, then the dense tree's own mean distance to the
+/// truth and depth.
+fn drift_rows(n: usize, configs: &[LinkageParams]) -> (Vec<DriftRow>, f64, f64) {
+    let reps = STEP_SEEDS.len() as f64;
+    let mut dense_truth = 0.0f64;
+    let mut dense_depth = 0.0f64;
+    let mut rows = vec![DriftRow::default(); configs.len()];
+
+    for &seed in STEP_SEEDS.iter() {
+        let sim = simulate_binary::<f64>(Some(SimulationParams {
+            n_leaves: n,
+            n_features: STEP_FEATURES,
+            noise_sd: NOISE,
+            seed,
+            ..Default::default()
+        }))
+        .expect("simulation");
+        let dense = linkage_tree(&sim.means, n, STEP_FEATURES, true);
+        dense_truth += robinson_foulds(&dense, &sim.tree).expect("rf") as f64 / reps;
+        dense_depth += max_depth(&dense) as f64 / reps;
+
+        for (slot, params) in configs.iter().enumerate() {
+            let t0 = Instant::now();
+            let got = graph_linkage(&sim.means, n, STEP_FEATURES, Some(*params)).expect("linkage");
+            let secs = t0.elapsed().as_secs_f64();
+            rows[slot].secs += secs / reps;
+            rows[slot].to_dense += robinson_foulds(&got, &dense).expect("rf") as f64 / reps;
+            rows[slot].to_truth += robinson_foulds(&got, &sim.tree).expect("rf") as f64 / reps;
+            rows[slot].depth += max_depth(&got) as f64 / reps;
+        }
+    }
+    (rows, dense_truth, dense_depth)
+}
+
 fn main() {
     // Each block on its own, because the whole thing is hours and the three
     // answer different questions. No argument runs all of them.
@@ -629,6 +749,7 @@ fn main() {
     let noise_sweep = want.is_empty() || want.iter().any(|a| a == "noise");
     let steps_sweep = want.is_empty() || want.iter().any(|a| a == "steps");
     let spr_block = want.is_empty() || want.iter().any(|a| a == "spr");
+    let drift_block = want.is_empty() || want.iter().any(|a| a == "drift");
 
     println!("threads {}", rayon::current_num_threads());
 
@@ -683,7 +804,15 @@ fn main() {
         println!("\n=== per-step split from a Ward start, {STEP_FEATURES} features ===");
         println!(
             "{:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
-            "leaves", "ward", "3 poly", "4 branch", "5 spr", "6 nni", "7 branch", "total s", "RF"
+            "leaves",
+            "linkage",
+            "3 poly",
+            "4 branch",
+            "5 spr",
+            "6 nni",
+            "7 branch",
+            "total s",
+            "RF"
         );
         let mut previous: Option<(usize, [f64; 6])> = None;
         for &n in STEP_LEAVES.iter() {
@@ -727,79 +856,145 @@ fn main() {
         }
     }
 
-    if !spr_block {
-        return;
-    }
-    println!("\n=== is SPR earning its 67 per cent? {STEP_FEATURES} features, Ward start ===");
-    println!(
-        "{:>7} {:>9} {:>7} {:>14} {:>9} {:>7} {:>14} {:>10} {:>9}",
-        "leaves", "spr s", "RF", "loglik", "no-spr s", "RF", "loglik", "beam nodes", "of tree"
-    );
-    let mut previous: Option<(usize, f64)> = None;
-    for &n in STEP_LEAVES.iter() {
-        let reps = STEP_SEEDS.len() as f64;
-        let (mut with, mut without, mut beam) = ([0.0f64; 3], [0.0f64; 3], 0.0f64);
-        for &seed in STEP_SEEDS.iter() {
-            let (w, wo, b) = spr_ablation(n, seed, NOISE);
-            for k in 0..3 {
-                with[k] += w[k] / reps;
-                without[k] += wo[k] / reps;
-            }
-            beam += b / reps;
-        }
+    if spr_block {
+        println!("\n=== is SPR earning its 67 per cent? {STEP_FEATURES} features, Ward start ===");
         println!(
-            "{n:>7} {:>9.2} {:>7.1} {:>14.1} {:>9.2} {:>7.1} {:>14.1} {beam:>10.1} {:>8.1}%",
-            with[0],
-            with[1],
-            with[2],
-            without[0],
-            without[1],
-            without[2],
-            100.0 * beam / (2.0 * n as f64)
+            "{:>7} {:>9} {:>7} {:>14} {:>9} {:>7} {:>14} {:>10} {:>9}",
+            "leaves", "spr s", "RF", "loglik", "no-spr s", "RF", "loglik", "beam nodes", "of tree"
         );
-        if let Some((prev_n, prev_beam)) = previous {
-            let factor = (n / prev_n) as f64;
+        let mut previous: Option<(usize, f64)> = None;
+        for &n in STEP_LEAVES.iter() {
+            let reps = STEP_SEEDS.len() as f64;
+            let (mut with, mut without, mut beam) = ([0.0f64; 3], [0.0f64; 3], 0.0f64);
+            for &seed in STEP_SEEDS.iter() {
+                let (w, wo, b) = spr_ablation(n, seed, NOISE);
+                for k in 0..3 {
+                    with[k] += w[k] / reps;
+                    without[k] += wo[k] / reps;
+                }
+                beam += b / reps;
+            }
             println!(
-                "{:>7} beam n^{:.2}",
-                "",
-                (beam / prev_beam).ln() / factor.ln()
+                "{n:>7} {:>9.2} {:>7.1} {:>14.1} {:>9.2} {:>7.1} {:>14.1} {beam:>10.1} {:>8.1}%",
+                with[0],
+                with[1],
+                with[2],
+                without[0],
+                without[1],
+                without[2],
+                100.0 * beam / (2.0 * n as f64)
+            );
+            if let Some((prev_n, prev_beam)) = previous {
+                let factor = (n / prev_n) as f64;
+                println!(
+                    "{:>7} beam n^{:.2}",
+                    "",
+                    (beam / prev_beam).ln() / factor.ln()
+                );
+            }
+            previous = Some((n, beam));
+            if with[0] > STEP_BUDGET_SECONDS {
+                println!("        (budget reached, stopping)");
+                break;
+            }
+        }
+
+        // Noise 0.3 recovers the whole topology from the Ward start alone, so it
+        // cannot show SPR earning anything. Turn the noise up to where recovery
+        // breaks and ask again.
+        println!("\n=== the same ablation where recovery breaks, {SPR_NOISE_LEAVES} leaves ===");
+        println!(
+            "{:>7} {:>9} {:>7} {:>14} {:>9} {:>7} {:>14} {:>10}",
+            "noise", "spr s", "RF", "loglik", "no-spr s", "RF", "loglik", "splits won"
+        );
+        for &noise in NOISES.iter() {
+            let reps = STEP_SEEDS.len() as f64;
+            let (mut with, mut without) = ([0.0f64; 3], [0.0f64; 3]);
+            for &seed in STEP_SEEDS.iter() {
+                let (w, wo, _) = spr_ablation(SPR_NOISE_LEAVES, seed, noise);
+                for k in 0..3 {
+                    with[k] += w[k] / reps;
+                    without[k] += wo[k] / reps;
+                }
+            }
+            println!(
+                "{noise:>7.1} {:>9.2} {:>7.1} {:>14.1} {:>9.2} {:>7.1} {:>14.1} {:>10.1}",
+                with[0],
+                with[1],
+                with[2],
+                without[0],
+                without[1],
+                without[2],
+                without[1] - with[1]
             );
         }
-        previous = Some((n, beam));
-        if with[0] > STEP_BUDGET_SECONDS {
-            println!("        (budget reached, stopping)");
-            break;
-        }
+        println!("{:>7} (of {} splits)", "", 2 * (SPR_NOISE_LEAVES - 3));
     }
 
-    // Noise 0.3 recovers the whole topology from the Ward start alone, so it
-    // cannot show SPR earning anything. Turn the noise up to where recovery
-    // breaks and ask again.
-    println!("\n=== the same ablation where recovery breaks, {SPR_NOISE_LEAVES} leaves ===");
+    if !drift_block {
+        return;
+    }
+    // The graph linkage costs SPR three to seven times what the dense one does
+    // while reaching the same Robinson-Foulds distance after refinement, so the
+    // two starting trees differ in something RF cannot see. `to dense` is how
+    // far the sparsity has moved the topology, `to truth` says whether the move
+    // is even in the wrong direction, and `depth` is the variable SPR's cost
+    // keys on, since a proposal recomputes the rows from the cut to the root.
+    // The backend is pinned to exhaustive so sparsity is the only thing varying.
+    println!("\n=== linkage drift against the dense chain, {STEP_FEATURES} features ===");
     println!(
-        "{:>7} {:>9} {:>7} {:>14} {:>9} {:>7} {:>14} {:>10}",
-        "noise", "spr s", "RF", "loglik", "no-spr s", "RF", "loglik", "splits won"
+        "{:>7} {:>5} {:>9} {:>10} {:>10} {:>8} {:>8}",
+        "leaves", "k", "build s", "to dense", "to truth", "depth", "dense d"
     );
-    for &noise in NOISES.iter() {
-        let reps = STEP_SEEDS.len() as f64;
-        let (mut with, mut without) = ([0.0f64; 3], [0.0f64; 3]);
-        for &seed in STEP_SEEDS.iter() {
-            let (w, wo, _) = spr_ablation(SPR_NOISE_LEAVES, seed, noise);
-            for k in 0..3 {
-                with[k] += w[k] / reps;
-                without[k] += wo[k] / reps;
-            }
+    for &n in DRIFT_LEAVES.iter() {
+        let configs: Vec<LinkageParams> = DRIFT_K
+            .iter()
+            .map(|&k| LinkageParams {
+                k,
+                backend: Some(KnnBackend::Exhaustive),
+                ..LinkageParams::default()
+            })
+            .collect();
+        let (rows, dense_truth, dense_depth) = drift_rows(n, &configs);
+        for (&k, row) in DRIFT_K.iter().zip(rows) {
+            println!(
+                "{n:>7} {k:>5} {:>9.2} {:>10.1} {:>10.1} {:>8.1} {dense_depth:>8.1}",
+                row.secs, row.to_dense, row.to_truth, row.depth
+            );
         }
         println!(
-            "{noise:>7.1} {:>9.2} {:>7.1} {:>14.1} {:>9.2} {:>7.1} {:>14.1} {:>10.1}",
-            with[0],
-            with[1],
-            with[2],
-            without[0],
-            without[1],
-            without[2],
-            without[1] - with[1]
+            "{:>7} {:>5} dense to truth {dense_truth:.1} of {} splits",
+            "",
+            "",
+            2 * (n - 3)
         );
     }
-    println!("{:>7} (of {} splits)", "", 2 * (SPR_NOISE_LEAVES - 3));
+
+    // Same columns with `k` pinned and the rebuild cadence swept instead. The
+    // headline is depth: the graph goes stale between rebuilds, so if redrawing
+    // it more often is enough then the chaining is a cadence problem and the
+    // `O(n k p)` design stands.
+    println!("\n=== rebuild cadence at k = {CADENCE_K}, {STEP_FEATURES} features ===");
+    println!(
+        "{:>7} {:>6} {:>9} {:>10} {:>10} {:>8} {:>8}",
+        "leaves", "frac", "build s", "to dense", "to truth", "depth", "dense d"
+    );
+    for &n in DRIFT_LEAVES.iter() {
+        let configs: Vec<LinkageParams> = CADENCE_FRACTIONS
+            .iter()
+            .map(|&fraction| LinkageParams {
+                k: CADENCE_K,
+                backend: Some(KnnBackend::Exhaustive),
+                rebuild_fraction: fraction,
+                ..LinkageParams::default()
+            })
+            .collect();
+        let (rows, _, dense_depth) = drift_rows(n, &configs);
+        for (params, row) in configs.iter().zip(rows) {
+            println!(
+                "{n:>7} {:>6.2} {:>9.2} {:>10.1} {:>10.1} {:>8.1} {dense_depth:>8.1}",
+                params.rebuild_fraction, row.secs, row.to_dense, row.to_truth, row.depth
+            );
+        }
+    }
 }

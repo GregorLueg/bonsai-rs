@@ -17,13 +17,14 @@
 //!
 //! Two reasons, both measured on 2026-09-12.
 //!
-//! Ward is reducible, so nearest-neighbour chaining finds the same pair the
-//! naive scan would (Bruynooghe 1977, Murtagh 1983). The Bonsai merge gain is
+//! Ward is reducible, so every mutually nearest pair is a pair the naive scan
+//! merges at some point, and merging all of them at once builds the same
+//! dendrogram (Bruynooghe 1977, Murtagh 1983). The Bonsai merge gain is
 //! **not**: merging changes the peeled remainder that every other pair's score
 //! depends on, and about one round in five lifts some other pair above the
-//! score the merged pair had, by up to 13 nats. A chain driven by the gain would
-//! silently build a different dendrogram from the one the round-by-round scan
-//! builds.
+//! score the merged pair had, by up to 13 nats. A linkage driven by the gain
+//! would silently build a different dendrogram from the one the round-by-round
+//! scan builds.
 //!
 //! Ward is also defined through centroids, which is what makes it work on a
 //! sparse graph: a merged cluster's position is one `O(p)` update and needs no
@@ -31,7 +32,7 @@
 //!
 //! ### The graph, and why it is an approximation
 //!
-//! A chain needs the nearest live *cluster* to the cluster on its tip. A
+//! Each round needs the nearest live *cluster* to every live cluster. A
 //! neighbour graph over the original cells answers that for leaves and only
 //! approximately for clusters, so this inherits the union of the two children's
 //! neighbour lists on every merge and rebuilds the graph over the live
@@ -41,8 +42,21 @@
 //!
 //! The union has to be symmetric. Giving the merged cluster its children's
 //! lists without replacing the children in everyone else's leaves the new
-//! cluster invisible to the clusters it should be adjacent to, and the chain
-//! walks into dead ends. `search::candidates` records the same trap.
+//! cluster invisible to the clusters it should be adjacent to, and every list
+//! runs dry. `search::candidates` records the same trap.
+//!
+//! ### Rounds, not a chain
+//!
+//! The first version walked a nearest-neighbour chain, and at `k = 16` it
+//! built caterpillars: depth 131 against `log2(n) = 12` at 4096 leaves,
+//! measured 2026-09-12. The chain is depth-first, so one cluster reaches size
+//! 32 while everything else is a singleton. A big centroid carries `1/size` of
+//! the noise, which at 2000 features puts it closer to every leaf than that
+//! leaf's own third cousins are, so it takes a slot in every list; once a
+//! block has merged all its listed relatives the big cluster is its only edge
+//! left, the mutual test passes trivially, and the block is absorbed. Merging
+//! every mutual pair per round keeps the live clusters at similar sizes, and
+//! the sweep in `benches/start_tree.rs` records what that bought.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};
@@ -51,6 +65,7 @@ use ann_search_rs::{
     build_exhaustive_index, build_kmknn_index, build_nndescent_index, extract_nndescent_knn,
     query_exhaustive_self, query_kmknn_self,
 };
+use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 ////////////////
@@ -301,7 +316,7 @@ fn build_graph(
 
     // The backends index into `live`, and every one of them counts a point as
     // its own nearest neighbour, so the self edge is dropped here rather than
-    // guarded against in the chain.
+    // guarded against in the scan.
     let mut adjacency: Vec<Vec<u32>> = vec![Vec::new(); centroids.len() / p];
     let mut seen: FxHashSet<(u32, u32)> = FxHashSet::default();
     for (i, row) in neighbours.iter().enumerate() {
@@ -327,10 +342,10 @@ fn build_graph(
 
 /// Build a starting tree by Ward linkage over a neighbour graph.
 ///
-/// Nearest-neighbour chaining, with the candidate neighbours of each cluster
-/// restricted to a graph that is inherited across merges and rebuilt as it goes
-/// stale. `O(n k p)` in the chain plus the graph builds, against `O(n^2 p)` for
-/// the dense form.
+/// Rounds of mutual nearest-neighbour merges, with the candidate neighbours of
+/// each cluster restricted to a graph that is inherited across merges and
+/// rebuilt as it goes stale. `O(n k p)` per round plus the graph builds,
+/// against `O(n^2 p)` for the dense form.
 ///
 /// Leaves come back as `0..n_cells` in the caller's order and every branch is
 /// one, since only the topology is meant: search step 4 replaces the lengths.
@@ -383,34 +398,54 @@ pub fn linkage_tree<T: BonsaiFloat>(
 
     let mut adjacency = build_graph(&centroids, &live, p, &params)?;
     let mut live_at_rebuild = live.len();
-    let mut chain: Vec<usize> = Vec::with_capacity(64);
+    let mut fresh = true;
 
     while live.len() > ROOT_MEMBERS {
         let stale = (live.len() as f64) <= params.rebuild_fraction * live_at_rebuild as f64;
         if stale {
             adjacency = build_graph(&centroids, &live, p, &params)?;
             live_at_rebuild = live.len();
-            chain.clear();
+            fresh = true;
         }
 
-        let Some((a, b)) = walk_chain(&mut chain, &adjacency, &centroids, &size, &live, p) else {
-            // The tip has no live neighbour left, which inheritance can produce
-            // before the halving is due. Redraw rather than join arbitrarily.
-            adjacency = build_graph(&centroids, &live, p, &params)?;
-            live_at_rebuild = live.len();
-            chain.clear();
-            continue;
-        };
+        let mut pairs = mutual_pairs(&adjacency, &centroids, &size, &live, p);
+        if pairs.is_empty() {
+            if !fresh {
+                // Inheritance has run every list dry before the halving is due.
+                // Redraw rather than join arbitrarily.
+                adjacency = build_graph(&centroids, &live, p, &params)?;
+                live_at_rebuild = live.len();
+                fresh = true;
+                continue;
+            }
+            // A fresh symmetric graph always has a mutual pair unless every
+            // remaining edge ties; join the best edge and carry on.
+            pairs.push(
+                best_edge(&adjacency, &centroids, &size, &live, p).ok_or_else(|| {
+                    BonsaiErrors::NeighbourGraph {
+                        reason: format!("no edges left among {} live clusters", live.len()),
+                    }
+                })?,
+            );
+        }
+        fresh = false;
 
-        let ancestor = next_internal as u32;
-        next_internal += 1;
-        parent[node_of[a] as usize] = ancestor;
-        parent[node_of[b] as usize] = ancestor;
+        for (merged, (a, b)) in pairs.into_iter().enumerate() {
+            if live.len() - merged == ROOT_MEMBERS {
+                break;
+            }
+            let ancestor = next_internal as u32;
+            next_internal += 1;
+            parent[node_of[a] as usize] = ancestor;
+            parent[node_of[b] as usize] = ancestor;
 
-        merge_slots(&mut centroids, &mut size, p, a, b);
-        merge_adjacency(&mut adjacency, a, b);
-        node_of[a] = ancestor;
-        live.retain(|&slot| slot != b);
+            merge_slots(&mut centroids, &mut size, p, a, b);
+            merge_adjacency(&mut adjacency, a, b);
+            node_of[a] = ancestor;
+        }
+        // Retired slots leave `live` once per round, so a round is `O(n)` in
+        // bookkeeping rather than `O(n)` per merge.
+        live.retain(|&slot| size[slot] > 0.0);
     }
 
     let root = next_internal as u32;
@@ -428,65 +463,130 @@ pub fn linkage_tree<T: BonsaiFloat>(
 /// Three, for the reason [`linkage_tree`] gives.
 const ROOT_MEMBERS: usize = 3;
 
-/// Walk the chain until its last two entries are mutually nearest.
+/// Nearest live neighbour of one slot under Ward's dissimilarity.
 ///
 /// ### Params
 ///
-/// * `chain` - The chain, carried across calls so a walk is amortised
+/// * `slot` - The slot whose list is scanned
 /// * `adjacency` - Neighbour lists by slot
 /// * `centroids` - Centroid rows
-/// * `size` - Cluster sizes by slot
-/// * `live` - Slots currently holding a cluster
+/// * `size` - Cluster sizes by slot; zero marks a retired slot
 /// * `p` - Features per row
 ///
 /// ### Returns
 ///
-/// The mutually nearest pair, or `None` if the tip has no live neighbour and
-/// the graph has to be redrawn.
-fn walk_chain(
-    chain: &mut Vec<usize>,
+/// The nearest slot and its dissimilarity, or `None` if the list holds no live
+/// cluster.
+fn nearest(
+    slot: usize,
+    adjacency: &[Vec<u32>],
+    centroids: &[f32],
+    size: &[f64],
+    p: usize,
+) -> Option<(usize, f64)> {
+    let mut best = f64::INFINITY;
+    let mut who = usize::MAX;
+    for &candidate in &adjacency[slot] {
+        let other = candidate as usize;
+        if other == slot || size[other] == 0.0 {
+            continue;
+        }
+        let d = ward(centroids, size, p, slot, other);
+        // Ties go to the lower slot, so the answer does not depend on the
+        // order the graph happened to list neighbours in.
+        if d < best || (d == best && other < who) {
+            best = d;
+            who = other;
+        }
+    }
+    (who != usize::MAX).then_some((who, best))
+}
+
+/// Every mutually nearest pair among the live clusters, `(lower, higher)` in
+/// ascending order of the lower slot.
+///
+/// Ward is reducible, so a mutually nearest pair is a pair the sequential
+/// linkage merges at some point and merging all of them at once builds the same
+/// dendrogram (Murtagh 1983). Taking them all per round is what keeps the live
+/// clusters level-synchronous: nothing grows far ahead of its neighbours, so no
+/// centroid becomes the low-noise attractor that crowds the true relatives out
+/// of every list. Measured 2026-09-12 against the depth-first chain this
+/// replaced: at 2048 leaves and `k = 16` the chain reached size 32 after 31
+/// merges while every other cluster was a singleton, and ended at depth 56
+/// against a dense linkage's 11.
+///
+/// Per-slot searches are independent and run in parallel; the collection order
+/// is the live order, so the result is the same at any thread count.
+///
+/// ### Params
+///
+/// * `adjacency` - Neighbour lists by slot
+/// * `centroids` - Centroid rows
+/// * `size` - Cluster sizes by slot
+/// * `live` - Slots currently holding a cluster, ascending
+/// * `p` - Features per row
+///
+/// ### Returns
+///
+/// The mutual pairs.
+fn mutual_pairs(
+    adjacency: &[Vec<u32>],
+    centroids: &[f32],
+    size: &[f64],
+    live: &[usize],
+    p: usize,
+) -> Vec<(usize, usize)> {
+    let mut nn = vec![usize::MAX; adjacency.len()];
+    let found: Vec<usize> = live
+        .par_iter()
+        .map(|&slot| {
+            nearest(slot, adjacency, centroids, size, p)
+                .map(|(who, _)| who)
+                .unwrap_or(usize::MAX)
+        })
+        .collect();
+    for (&slot, &who) in live.iter().zip(&found) {
+        nn[slot] = who;
+    }
+    live.iter()
+        .filter_map(|&a| {
+            let b = nn[a];
+            (b != usize::MAX && a < b && nn[b] == a).then_some((a, b))
+        })
+        .collect()
+}
+
+/// The cheapest edge in the graph, for a round with no mutual pair.
+///
+/// ### Params
+///
+/// * `adjacency` - Neighbour lists by slot
+/// * `centroids` - Centroid rows
+/// * `size` - Cluster sizes by slot
+/// * `live` - Slots currently holding a cluster, ascending
+/// * `p` - Features per row
+///
+/// ### Returns
+///
+/// The pair `(lower, higher)`, or `None` if no live slot has a live neighbour.
+fn best_edge(
     adjacency: &[Vec<u32>],
     centroids: &[f32],
     size: &[f64],
     live: &[usize],
     p: usize,
 ) -> Option<(usize, usize)> {
-    // Retired slots can sit on the chain from before a merge; drop them before
-    // reading the tip.
-    while chain.last().is_some_and(|&tip| !live.contains(&tip)) {
-        chain.pop();
-    }
-    if chain.is_empty() {
-        chain.push(*live.first()?);
-    }
-
-    loop {
-        let a = *chain.last()?;
-        let mut best = f64::INFINITY;
-        let mut b = usize::MAX;
-        for &candidate in &adjacency[a] {
-            let slot = candidate as usize;
-            if slot == a || size[slot] == 0.0 {
-                continue;
-            }
-            let d = ward(centroids, size, p, a, slot);
-            // Ties go to the lower slot, so the answer does not depend on the
-            // order the graph happened to list neighbours in.
-            if d < best || (d == best && slot < b) {
-                best = d;
-                b = slot;
-            }
+    let mut best = f64::INFINITY;
+    let mut pair = None;
+    for &slot in live {
+        if let Some((who, d)) = nearest(slot, adjacency, centroids, size, p)
+            && d < best
+        {
+            best = d;
+            pair = Some((slot.min(who), slot.max(who)));
         }
-        if b == usize::MAX {
-            return None;
-        }
-        if chain.len() >= 2 && b == chain[chain.len() - 2] {
-            chain.pop();
-            chain.pop();
-            return Some((a.min(b), a.max(b)));
-        }
-        chain.push(b);
     }
+    pair
 }
 
 /// Fold slot `b`'s cluster into slot `a` and retire `b`.
@@ -516,8 +616,8 @@ fn merge_slots(centroids: &mut [f32], size: &mut [f64], p: usize, a: usize, b: u
 ///
 /// The union is maintained symmetrically: every list that held either child is
 /// rewritten to hold `a` instead. Doing only half of that leaves the merged
-/// cluster invisible to its own neighbours and the chain walks into dead ends,
-/// which is the trap `search::candidates` records.
+/// cluster invisible to its own neighbours and its list runs dry, which is the
+/// trap `search::candidates` records.
 ///
 /// ### Params
 ///
@@ -682,7 +782,7 @@ mod tests {
     #[test]
     fn test_a_complete_graph_reproduces_the_dense_linkage() {
         // The whole approximation is the sparsity of the graph. At `k = n - 1`
-        // there is none, so the chain has to find exactly the pair the dense
+        // there is none, so the rounds have to find exactly the pairs the dense
         // scan finds, every round. This is what says the inheritance and the
         // symmetry bookkeeping are right, and it is the gate
         // `search::candidates` keeps for the same reason.
@@ -726,7 +826,7 @@ mod tests {
     #[test]
     fn test_the_exact_backends_agree() {
         // Exhaustive and kmknn are both exact, so at the same `k` they hand the
-        // chain the identical graph and therefore the identical tree.
+        // rounds the identical graph and therefore the identical tree.
         // NN-descent is approximate and is not held to this.
         let (n, p) = (64usize, 32usize);
         let means = fixture(n, p, 11);

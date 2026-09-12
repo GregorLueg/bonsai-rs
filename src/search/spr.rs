@@ -46,30 +46,33 @@
 //!
 //! ### Accepting a move
 //!
-//! On a fresh [`NodeState::prune`] of the candidate tree, never on an
-//! incremental figure. [`crate::search::polytomy::Splice::gain`] is exact only
-//! against the tree its star was built from, and by the time a move has been
-//! proposed the tree has been cut, rebuilt and possibly re-rooted.
+//! On the candidate tree's own per-node terms, never on
+//! [`crate::search::polytomy::Splice::gain`]: that gain is exact only against
+//! the tree its star was built from, and by the time a move has been proposed
+//! the tree has been cut, rebuilt and possibly re-rooted. A regraft moves a
+//! subtree across the tree, which no single star summarises.
+//! [`crate::search::nni`] can accept on its merge gains plus a collapse delta
+//! because an interchange edits one internal edge and the star it resolves
+//! summarises the rest of the tree exactly.
 //!
-//! [`crate::search::nni`] does **not** do this, contrary to what this paragraph
-//! claimed until 2026-09-06: it accepts on the merge gains plus its collapse
-//! delta and never re-prunes the candidate. That is sound there because an
-//! interchange edits one internal edge and the star it resolves summarises the
-//! rest of the tree exactly, so the accounting closes; measured over 144 runs
-//! its reported loglikelihood matches a fresh prune of its output to better
-//! than `1e-9` relative. The difference is that a regraft moves a subtree
-//! across the tree, which no single star summarises.
+//! Until 2026-09-12 the terms came from a fresh [`NodeState::prune`] of every
+//! candidate that changed a split. That was measured at 0.03 per cent of the
+//! step on 2026-08-31, at 512 leaves and 200 features and a noise where nothing
+//! is accepted. At noise 1.6, where the step earns its keep, it was 33 to 41
+//! per cent: one candidate in twenty passes the split filter there, every one
+//! of them paid an `O(n p)` sweep, and every accepted one paid a second to
+//! settle the rows. The terms now come from [`LazyRows::loglik`], which reads
+//! the current tree's terms wherever the candidate's subtrees are the current
+//! tree's and recomputes the rest, and an accepted candidate's rows are
+//! assembled from the same rows by [`LazyRows::into_state`] rather than swept.
+//! `test_the_incremental_loglik_matches_a_fresh_prune` pins both against the
+//! sweep, the state to the bit.
 //!
-//! That prune is `O(n p)` and it stays, because it is what makes the sweep
-//! monotone in the quantity that matters. It is affordable because almost
-//! nothing reaches it: a proposal whose splits match the current tree's is
-//! discarded first, and on a searched tree that is all but a handful of the
-//! candidates. Measured 2026-08-31 at 512 leaves and 200 features, it was 0.03
-//! per cent of step 5's running time. **What was expensive was proposing**, not
-//! accepting: settling the tree the cut leaves behind and the tree the regraft
-//! builds, and collapsing the first onto every node, five `O(n p)` sweeps per
-//! candidate for rows of which a few dozen are ever read. [`LazyRows`] forms
-//! the ones that are read and no others, which is what took step 5 off `n^1.9`.
+//! Proposing was what cost before that: settling the tree the cut leaves
+//! behind and the tree the regraft builds, and collapsing the first onto every
+//! node, five `O(n p)` sweeps per candidate for rows of which a few dozen are
+//! ever read. [`LazyRows`] forms the ones that are read and no others, which
+//! is what took step 5 off `n^1.9`.
 //!
 //! ### This is a topology search and only a topology search
 //!

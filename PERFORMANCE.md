@@ -116,6 +116,10 @@ Nothing in the wall-clock numbers said so; it took a run at
 | Ward linkage start replacing search step 2 | 66.08 s to 17.06 s at 2048 by 2000, identical tree | 2026-09-12 |
 | Parallel edge solve in `optimise_branch_lengths` | 1.00x to 2.4x on ten cores, bit-identical | 2026-09-12 |
 | Parallel edge scan in `nni_greedy` | 2.0x on top of the 3.8x it borrowed, bit-identical | 2026-09-12 |
+| Edge solve started at `mean(d - s)`, stopped on the Newton correction | 22.4 to 4.6 passes per attachment; every `optimise_edge` caller | 2026-09-12 |
+| Merge split by Illinois regula falsi instead of bisection | 58 to 20.5 derivative passes per pair | 2026-09-12 |
+| SPR proposals in parallel chunks, restarted on acceptance, bit-identical | 200.04 s to 24.44 s at 16384 by 2000; `n^1.45` to `n^1.31` | 2026-09-12 |
+| SPR acceptance on the candidate's own terms, rows assembled not swept | 2048 by 2000 at noise 1.6: 127.9 s to 19.1 s with the above | 2026-09-12 |
 
 Three notes on these.
 
@@ -150,6 +154,9 @@ pins it at 1, 3 and 8 threads.
 | Feature subsampling to rank merge candidates | argmax survives 4 of 15 checkpoints at a quarter of the features | 2026-09-12 |
 | Chain or Boruvka agglomeration on the Bonsai merge gain | the score is not reducible: one round in five inverts, by up to 13 nats | 2026-09-12 |
 | Tree-distance limit on SPR regrafts | the beam is `n^0.06`, so there is nothing to limit | 2026-09-12 |
+| Warm-starting the beam's root find from the neighbour's optimum | 8.3 passes per solve against 5.8 from the mean start | 2026-09-12 |
+| Counting sort in SPR's `assemble` | the height sort was never the cost; `Tree::from_parents` is | 2026-09-12 |
+| Parallel pair scan on the four-member star inside the SPR proposal loop | 3.0 ms a resolution summed over threads against 0.7 sequential | 2026-09-12 |
 
 Two of these deserve their own paragraph.
 
@@ -268,3 +275,168 @@ and they want opposite things: the speed delta should widen, and
 `reference/bonsai_ref.py` is a different thing and covers the pruning kernel
 alone, agreeing to twelve significant figures. It has no oracle for the merge
 score or the branch solve, which is where most changes land.
+
+## SPR, 2026-09-12: the fourth wrong diagnosis and what the profile said
+
+Rule 5 held. The brief for this pass carried three beliefs about where step 5
+spends its time, and the profile agreed with one of them.
+
+- **The beam's root find dominates.** Half true. At 2048 by 2000 from a Ward
+  start, noise 0.3, `place` was 64 per cent of the step: 48 in the solve and 16
+  in forming the effective leaves. The solve was 22.4 Newton passes per
+  attachment, and half of those were wasted (below).
+- **The solve does not use the SIMD tier.** Wrong. `model::branch` imports
+  `edge_newton_simd as edge_newton`; every caller had it.
+- **The acceptance path is 0.03 per cent, do not touch it.** True at noise 0.3,
+  where nothing is accepted, which is where it was measured. At noise 1.6,
+  where SPR is the step that saves the run (rule 7), it was **33 to 41 per
+  cent**: one candidate in twenty passes the split filter, each paid a fresh
+  `O(n p)` prune, and each accepted one paid a second to settle the rows.
+
+Two costs nobody had named at all:
+
+- **The four-member star.** 77 per cent of regrafts land on an internal node,
+  so the polytomy resolution of SPEC.md section 7.3 runs after nearly every
+  proposal. Its six pair scores were 1.8 ms single-threaded, and 77 per cent of
+  that was `MergeScratch::optimise_split`: a bisection to `1e-8` on the
+  analytic derivative, 29 passes per sweep, 58 per pair. The kernel rule 3
+  records as running 0.07 times per pair on the merge scan runs 58 times per
+  pair here. Same kernel, different caller, different answer.
+- **The step had no parallelism of its own.** The 1.18x on ten cores was the
+  inner pair scan of that star, six pairs spread over ten threads.
+
+### What changed
+
+All measured on an M1 Max at load 4 to 9 throughout (another agent was
+building in the same tree), 2000 features, Ward start, seed 31. Seconds are
+pessimistic; ratios are interleaved and trustworthy.
+
+| change | measure | before | after |
+|---|---|---|---|
+| Edge solve starts at `mean(d - s)` and stops on the Newton correction | Newton passes per attachment | 22.4 | 4.6 |
+| Split solve by Illinois regula falsi, tolerance `1e-8` to `1e-10` | derivative passes per pair | 58 | 20.5 |
+| Candidates proposed in parallel chunks, decided in order, chunk restarted on acceptance | 2048 at noise 0.3, ten threads | 12.40 s | 1.84 s |
+| Acceptance on the candidate's own terms, rows assembled rather than swept | 2048 at noise 1.6, ten threads | 127.9 s | 19.1 s |
+| Split fingerprint as a multiset hash instead of a sorted vector | fingerprint per candidate at 4096 | 59 us | 26 us |
+
+The termination fix is worth its own sentence because it was a real defect,
+not a tuning. Near the root the Newton correction points exactly at a bracket
+end; the safeguard refuses it as not strictly inside and bisects a bracket
+already narrower than the tolerance, one full pass per halving, until the
+midpoint happens to satisfy the step test. Seven passes of fifteen on a
+typical solve, on every `optimise_edge` call in the crate.
+
+The parallel round is exact. A chunk is proposed against one tree and decided
+in order; the first acceptance throws the rest of the chunk away and proposes
+it again against the new tree, so every candidate that is decided was proposed
+against the tree it is decided against, which is the sequential sweep's
+invariant. The tree, the branches, the loglikelihood and the move list are the
+same at 1, 3 and 8 threads and at every chunk floor tried
+(`test_the_sweep_is_deterministic_whatever_the_thread_count`). The cost is the
+discarded work, which is why the chunk floor is 8 and not 32: at 2048 by 2000,
+noise 1.6, 641 of 27987 candidates accepted, 49614 proposals were made at a
+floor of 32 and 37846 at 8, 24.1 s against 19.1 s.
+
+Two things had to change elsewhere for the incremental acceptance to be cheap:
+
+- `polytomy::rebuild` numbered nodes in a post-order that visited siblings
+  last-first, so every splice reversed the order of equal-height siblings and
+  `LazyRows` could not recognise an untouched subtree by its children. Fixed
+  by pushing children in reverse; the incremental score went from 8.5 ms to
+  0.7 ms per candidate.
+- The star primitive's pair scan now runs on the calling thread below 64 pairs
+  (`PAR_PAIRS_MIN`). Inside the proposal loop, a six-pair `par_iter` hands
+  half its pairs to a worker that is busy with a whole other proposal and
+  waits for it.
+
+### Where the step's time goes now
+
+Single thread, 2048 by 2000, noise 0.3, 10.24 s over 4093 candidates:
+
+| part | share | note |
+|---|---|---|
+| beam: solve | 28 | 17.6 us per attachment, 39.5 attachments per candidate |
+| beam: effective leaves | 17 | 10.7 us per attachment, scalar, division-bound |
+| star resolution | 29 | of which split 15, prepare 4, root branch 3, total 2 |
+| arena rebuilds and rows | 21 | `Tree::from_parents` is 58 per cent of the rebuilds, two per candidate |
+| fingerprint | 1 | |
+
+The rebuilds-and-rows line is the exponent. It is `O(n)` per candidate with
+a large constant, `1.0 ms` of `2.9 ms` at 4096 and roughly half of the step at
+16384. Its counting-sort replacement for `assemble`'s height sort measured
+nothing, because the sort was not the cost; the passes and the allocations
+are, and most of them are inside `Tree::from_parents`.
+
+### What did not work
+
+| attempt | why not |
+|---|---|
+| Warm-start the beam's root find from the neighbour's optimum | 8.3 passes per solve against 5.8 from the mean start; adjacent attachment points want different edge lengths |
+| Counting sort in `assemble` | no measurable change at 4096; the sort was never the cost |
+| Keeping the four-member star's pair scan parallel | 3.0 ms per resolution summed over threads against 0.7 sequential, inside the proposal loop |
+
+### The tables
+
+Robinson-Foulds gate, `benches/start_tree.rs` `spr` block, two seeds, ten
+threads, load 7 to 18. The with-SPR arm's seconds include steps 6 and 7.
+
+| leaves, noise 0.3 | with SPR s | RF | without s | RF | beam nodes |
+|---|---|---|---|---|---|
+| 1024 | 0.84 | 0.0 | 0.19 | 0.0 | 41.0 |
+| 2048 | 1.80 | 0.0 | 0.37 | 0.0 | 42.9 |
+| 4096 | 4.12 | 0.0 | 0.75 | 0.0 | 44.9 |
+| 8192 | 10.18 | 0.0 | 1.49 | 0.0 | 47.0 |
+| 16384 | 27.32 | 0.0 | 2.94 | 0.0 | 49.0 |
+
+| 2048, noise | with SPR s | RF | without s | RF | splits won |
+|---|---|---|---|---|---|
+| 0.3 | 1.81 | 0.0 | 0.37 | 0.0 | 0.0 |
+| 0.6 | 1.97 | 0.0 | 0.44 | 0.0 | 0.0 |
+| 1.0 | 5.90 | 5.0 | 18.06 | 3.0 | -2.0 |
+| 1.6 | 19.83 | 370.5 | 219.04 | 397.0 | 26.5 |
+
+At noise 1.6 SPR still wins its 26.5 splits of 4090 (27.5 before) and is now
+11x faster than not having it (7.3x before). The two splits it loses at noise
+1.0 are inside the seed-to-seed spread of three to five.
+
+Per step, `steps` block, ten threads, **load 18 to 24** while it ran, so the
+seconds are pessimistic against the 2026-09-12 table above and the ratios are
+what to read:
+
+| step | before | after | gain |
+|---|---|---|---|
+| ward linkage | 59.49 | 60.47 | 1.0x |
+| 3 polytomy | 0.30 | 0.32 | 0.9x |
+| 4 branch | 10.26 | 8.85 | 1.2x |
+| 5 SPR | 200.04 | 24.44 | **8.2x** |
+| 6 NNI | 4.69 | 2.33 | 2.0x |
+| 7 branch | 0.65 | 0.59 | 1.1x |
+| total | 275.43 | 97.00 | 2.8x |
+
+Steps 4, 6 and 7 gained from the two solver changes alone, since they share
+`optimise_edge` and the merge split. SPR's exponent over 1024 to 16384 is
+1.31, from 1.45, and it is still rising with size: 1.15, 1.21, 1.38, 1.49 per
+doubling, which is the `O(n)` bookkeeping per candidate taking over from the
+`O(p)` beam as `n` grows. Single-threaded, 2048 by 2000 at noise 0.3 runs in
+10.24 s against 12.40 s on ten threads before, so the step is now 5.6x faster
+on ten threads than on one, from 1.18x.
+
+### What next
+
+The exponent. Every candidate materialises two arenas and one candidate tree,
+and none of them is needed until a move is accepted. A pruned *view* over the
+current tree (the cut, the suppressed node, the two branch sums) answers
+every question the beam asks in `O(1)`; the attachment star can be read off
+that view's rows plus the pruned subtree's own row, since the up row at the
+attachment point does not change when something is hung below it; the
+candidate's terms are the view's terms plus the recomputed chain above the
+attachment; and the fingerprint is a sum, so the splits the move changes can
+be subtracted and added in `O(depth)`. That makes a proposal
+`O(depth * p + beam)` and leaves `O(n)` for accepted moves only, which are one
+candidate in forty at the hard noise and none at the easy one. It is the third
+rewrite of the module and the first one that changes its complexity class.
+
+Below that: the effective-leaf formation (17 per cent, four scalar divisions a
+feature) and `split_derivative` (15 per cent, four more) are the two remaining
+division-bound scalar loops, and `f64x4` division is the obvious tier for
+both, subject to rule 3's measurement.

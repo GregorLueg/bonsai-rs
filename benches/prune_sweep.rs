@@ -17,10 +17,11 @@
 //!
 //! Both storage widths are timed because `f32` is the fastest path and the one
 //! most likely to be used at scale, so it needs a measurement at scale of its
-//! own rather than an extrapolation from the `f64` column. This bench used to
-//! carry two `BlockedState` columns as well; that type was deleted on
-//! 2026-09-06 once measurement showed the whole prune is 2.4 per cent of the
-//! pipeline, so parallelising it could not matter.
+//! own rather than an extrapolation from the `f64` column.
+//!
+//! **The whole prune is 2.4 per cent of the pipeline**, measured 2026-09-06 and
+//! flat in feature count, so nothing done to the numbers below can buy more
+//! than that. `benches/steps.rs` is where the time actually is.
 //!
 //! Plain `main`, no criterion. The sweep is deterministic and long enough that
 //! best-of-N over a handful of repeats is stable.

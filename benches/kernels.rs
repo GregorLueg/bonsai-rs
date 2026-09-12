@@ -20,20 +20,48 @@
 //! in nanoseconds per element, so anything else competing for the cores moves
 //! them by more than the effects being looked for. Check `uptime` first.
 //!
-//! ### Open question
+//! ### `edge_newton` is the kernel to beat, and lanes are what beat it
 //!
-//! `edge_newton` is the hottest kernel in the crate and it is not obvious which
-//! wall it hits. At roughly three cycles per feature it sits close to both the
-//! two-chain FMA latency bound and the `f64` division throughput bound, and
-//! those want opposite fixes: more accumulator chains for the first, fewer
-//! divisions for the second. Splitting it into four independent chains was
-//! tried and appeared to change nothing, but that measurement was taken on a
-//! loaded machine and is worthless. Redo it, and settle the question by timing
-//! a variant with the division replaced by a multiply: if that is much faster,
-//! the division is the wall and extra chains will never help.
+//! It is the hottest kernel in the crate and not only here: instrumenting
+//! `benches/merge_scan.rs` gives 35 to 45 calls per candidate pair, because
+//! `model::branch::optimise_edge` is a bracketed Newton and every iteration is
+//! one pass over the feature axis. Nothing else comes close;
+//! `model::merge::MergeScratch::split_derivative` reads like a hot loop and runs
+//! 0.07 times per pair.
+//!
+//! At roughly three cycles per feature it sat close to both the two-chain FMA
+//! latency bound and the `f64` division throughput bound, which want opposite
+//! fixes. The variants below settle it. Measured 2026-09-12 on an M1 Max,
+//! `P = 2000`, load average 3.5 rather than a quiet machine, so read the small
+//! differences as noise:
+//!
+//! | variant | ns/elem |
+//! |---|---|
+//! | `edge_newton`, scalar | 0.95 |
+//! | division replaced by a multiply | 0.92 |
+//! | four accumulator chains | 1.00 |
+//! | one division per four features | 1.23 |
+//! | **`utils::simd::edge_newton_simd`, `f64x4`** | **0.71** |
+//!
+//! Neither algebraic fix does anything: the division is not the wall and the
+//! dependency chain is not the wall. Explicit lanes take a third off, and that
+//! carries through to 14 per cent of the merge scan and 8 per cent of a whole
+//! run at 2048 cells by 2000 features, with identical trees.
+//!
+//! The compiler will not find this. `edge_newton` accumulates into two
+//! floating-point reductions that LLVM may not reorder, so the scalar tier is
+//! genuinely scalar: one feature per iteration with a scalar divide on aarch64,
+//! and the same on x86-64 at baseline, at `x86-64-v3` and at `x86-64-v4`.
+//! Vectorising a reduction is work only a human is allowed to do here.
+//!
+//! `prune_binary` is the other kernel with a vector tier, and it is the other
+//! side of the same lesson in the opposite direction: `benches/prune_sweep.rs`
+//! puts the whole prune at 2.4 per cent of the pipeline, so its 1.7x is worth
+//! about one per cent of a run.
 
 use bonsai_rs::utils::kernels::{edge_loglik, edge_newton, prep_edge, prune_binary_scalar};
 use bonsai_rs::utils::rng::splitmix64_at;
+use bonsai_rs::utils::simd::edge_newton_simd;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -138,4 +166,144 @@ fn main() {
             &mut d,
         )
     });
+
+    println!();
+    println!("diagnostics for edge_newton, not shipped kernels:");
+
+    // Same shape with the division replaced by a multiply. If this is much
+    // faster than `edge_newton` the division is the wall and more accumulator
+    // chains cannot help; if it is not, the two-chain latency is the wall.
+    report("  no division", 7.0, 16.0, || {
+        let (f, fp) = edge_newton_no_division(black_box(&s), black_box(&d), 0.83);
+        f + fp
+    });
+
+    // The division kept, the two dependency chains split into eight. The other
+    // half of the same question.
+    report("  eight chains", 7.0, 16.0, || {
+        let (f, fp) = edge_newton_eight_chains(black_box(&s), black_box(&d), 0.83);
+        f + fp
+    });
+
+    // Both, so the two effects can be told apart from their combination.
+    report("  batched division", 7.0, 16.0, || {
+        let (f, fp) = edge_newton_batched(black_box(&s), black_box(&d), 0.83);
+        f + fp
+    });
+
+    // Explicit lanes, which none of the three above touch.
+    report("  f64x4 lanes", 7.0, 16.0, || {
+        let (f, fp) = edge_newton_simd(black_box(&s), black_box(&d), 0.83);
+        f + fp
+    });
+}
+
+/// [`edge_newton`] with the reciprocal replaced by a multiply.
+///
+/// Numerically meaningless; it exists only to price the division. Everything
+/// else about the loop, including the two dependency chains, is unchanged.
+///
+/// ### Params
+///
+/// * `s` - Summed inverse precisions
+/// * `d` - Squared separations
+/// * `t` - Branch length
+///
+/// ### Returns
+///
+/// Two numbers of no significance, shaped like `(f, f')`.
+fn edge_newton_no_division(s: &[f64], d: &[f64], t: f64) -> (f64, f64) {
+    let mut f = 0.0f64;
+    let mut fp = 0.0f64;
+    for g in 0..s.len() {
+        let r = 0.5 * (s[g] + t);
+        let dr = d[g] * r;
+        f += r * (1.0 - dr);
+        fp += r * r * (2.0 * dr - 1.0);
+    }
+    (f, fp)
+}
+
+/// [`edge_newton`] with the two accumulators split into eight.
+///
+/// Exact same arithmetic per feature and the same division; only the
+/// dependency structure of the reduction changes. Chains are summed in a fixed
+/// order, so this is deterministic, but it does not agree with `edge_newton` to
+/// the bit.
+///
+/// ### Params
+///
+/// * `s` - Summed inverse precisions
+/// * `d` - Squared separations
+/// * `t` - Branch length
+///
+/// ### Returns
+///
+/// The pair `(f(t), f'(t))`.
+fn edge_newton_eight_chains(s: &[f64], d: &[f64], t: f64) -> (f64, f64) {
+    let mut f = [0.0f64; 4];
+    let mut fp = [0.0f64; 4];
+    let n = s.len() - s.len() % 4;
+    for g in (0..n).step_by(4) {
+        for k in 0..4 {
+            let r = 1.0 / (s[g + k] + t);
+            let dr = d[g + k] * r;
+            f[k] += r * (1.0 - dr);
+            fp[k] += r * r * (2.0 * dr - 1.0);
+        }
+    }
+    let (mut f_tot, mut fp_tot) = (f[0] + f[1] + f[2] + f[3], fp[0] + fp[1] + fp[2] + fp[3]);
+    for g in n..s.len() {
+        let r = 1.0 / (s[g] + t);
+        let dr = d[g] * r;
+        f_tot += r * (1.0 - dr);
+        fp_tot += r * r * (2.0 * dr - 1.0);
+    }
+    (f_tot, fp_tot)
+}
+
+/// [`edge_newton`] with one division per four features and eight chains.
+///
+/// Four reciprocals from one division by the same identity
+/// `model::merge::batched_reciprocals` uses, extended to four terms. The
+/// products of three `r` values overflow far sooner than the merge kernel's
+/// triple product does, so this is a measurement variant and not a candidate
+/// for shipping as written.
+///
+/// ### Params
+///
+/// * `s` - Summed inverse precisions
+/// * `d` - Squared separations
+/// * `t` - Branch length
+///
+/// ### Returns
+///
+/// The pair `(f(t), f'(t))`.
+fn edge_newton_batched(s: &[f64], d: &[f64], t: f64) -> (f64, f64) {
+    let mut f = [0.0f64; 4];
+    let mut fp = [0.0f64; 4];
+    let n = s.len() - s.len() % 4;
+    for g in (0..n).step_by(4) {
+        let r0 = s[g] + t;
+        let r1 = s[g + 1] + t;
+        let r2 = s[g + 2] + t;
+        let r3 = s[g + 3] + t;
+        let p01 = r0 * r1;
+        let p23 = r2 * r3;
+        let x = 1.0 / (p01 * p23);
+        let a = [r1 * p23 * x, r0 * p23 * x, r3 * p01 * x, r2 * p01 * x];
+        for k in 0..4 {
+            let dr = d[g + k] * a[k];
+            f[k] += a[k] * (1.0 - dr);
+            fp[k] += a[k] * a[k] * (2.0 * dr - 1.0);
+        }
+    }
+    let (mut f_tot, mut fp_tot) = (f[0] + f[1] + f[2] + f[3], fp[0] + fp[1] + fp[2] + fp[3]);
+    for g in n..s.len() {
+        let r = 1.0 / (s[g] + t);
+        let dr = d[g] * r;
+        f_tot += r * (1.0 - dr);
+        fp_tot += r * r * (2.0 * dr - 1.0);
+    }
+    (f_tot, fp_tot)
 }

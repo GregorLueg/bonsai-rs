@@ -105,7 +105,7 @@ Same input, same tree, whatever the thread count. Floating-point addition is not
 - One `thiserror` enum in `src/errors.rs`, grouped by subsystem. Add to the matching section, not the bottom. Anything a caller could hit returns `Err`; panics are for broken invariants the type system cannot state.
 - `wide` types appear only in `src/utils/simd.rs`.
 - Benches need a `harness = false` entry in `Cargo.toml` and must check their output before reporting a timing. An implausible speedup is the signature of a sweep that did nothing.
-- Do not add a SIMD tier without a measurement in its doc comment. `f64` is scalar here because vectorising it was measured *slower*, and that table exists so the experiment is not silently redone.
+- Do not add a SIMD tier without a measurement in its doc comment, and pick the kernel by call count rather than by how vectorisable it looks. `edge_newton` earned one at 35 to 45 calls per candidate pair; `split_derivative` reads like the hot loop, runs 0.07 times per pair, and measured flat.
 
 ## What's tracked outside this file
 

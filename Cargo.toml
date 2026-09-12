@@ -74,3 +74,15 @@ harness = false
 [[bench]]
 name = "recovery"
 harness = false
+
+## Does step 2 earn its keep? Four starting trees through the identical
+## refinement. Plain `main`, no criterion.
+[[bench]]
+name = "start_tree"
+harness = false
+
+## Reducibility of the merge score and how far the feature axis can be
+## subsampled. Plain `main`, no criterion.
+[[bench]]
+name = "approx_star"
+harness = false

@@ -60,6 +60,7 @@ use crate::tree::Tree;
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::BonsaiFloat;
+use rayon::prelude::*;
 
 ////////////////
 // Parameters //
@@ -630,7 +631,6 @@ pub fn nni_greedy<T: BonsaiFloat>(
 ) -> Result<NniResult, BonsaiErrors> {
     let params = params.unwrap_or_default();
     let mut tree = tree.clone();
-    let mut scratch = PeelScratch::<T>::new(leaves.n_features);
     let mut best: Option<f64> = None;
     let mut n_moves = 0usize;
     let mut rounds = 0usize;
@@ -642,59 +642,90 @@ pub fn nni_greedy<T: BonsaiFloat>(
         let below = leaves_below(&tree);
         let n_leaves = tree.n_leaves();
 
-        let mut winner: Option<(f64, CentreStar<T>)> = None;
-        for k in tree.internal_postorder() {
-            let Some(l) = tree.parent(k) else { continue };
-            let Some(star) = collapsed_star(&tree, &down, &up, k) else {
-                continue;
-            };
-            let result = resolve_star(star.view(), Some(params.star))?;
-            if result.merges.is_empty() {
-                continue;
-            }
-            // A proposal that puts the same subtrees back where they were is
-            // not an interchange: it is a reoptimisation of the three branches
-            // the star primitive creates at `l`. Those nearly always gain a
-            // little, and taking them turns the phase into branch-length
-            // descent that steps 4 and 7 do properly and far more cheaply.
-            // Measured 2026-08-31: from the generating tree itself, at 32 to 64
-            // leaves and 256 features, accepting them ran 104 to 239 rounds
-            // with the Robinson-Foulds distance pinned at zero throughout, so
-            // every one of those rounds was branch lengths and none was
-            // topology.
-            let k_lo = tree.children(l).len() - 1;
-            let k_hi = k_lo + tree.children(k).len();
-            let last = star.member_nodes.len() - 1;
-            let member_leaves: Vec<usize> = star
-                .member_nodes
-                .iter()
-                .enumerate()
-                .map(|(i, &node)| {
-                    if star.has_upstream && i == last {
-                        n_leaves - below[l as usize]
-                    } else {
-                        below[node as usize]
+        // Every edge is scored against the same settled rows and nothing in the
+        // scan writes to the tree, so the candidates are independent and the
+        // round is parallel. The reduction keeps only the running best rather
+        // than collecting, because a `CentreStar` carries its members' rows and
+        // one per edge would be gigabytes at atlas scale.
+        //
+        // **Determinism.** The sequential scan took the first strict maximum in
+        // `internal_postorder`, which the arena invariant makes ascending node
+        // order, so the reduction breaks ties on the lower node id and the
+        // winner is the same at any thread count. No float is summed across
+        // candidates, so there is nothing else for the order to change.
+        let edges: Vec<u32> = tree.internal_postorder().collect();
+        let winner = edges
+            .par_iter()
+            .map_init(
+                || PeelScratch::<T>::new(leaves.n_features),
+                |scratch, &k| -> Result<Option<(f64, u32, CentreStar<T>)>, BonsaiErrors> {
+                    let Some(l) = tree.parent(k) else {
+                        return Ok(None);
+                    };
+                    let Some(star) = collapsed_star(&tree, &down, &up, k) else {
+                        return Ok(None);
+                    };
+                    let result = resolve_star(star.view(), Some(params.star))?;
+                    if result.merges.is_empty() {
+                        return Ok(None);
                     }
-                })
-                .collect();
-            if rebuilds_the_same_splits(&result, k_lo, k_hi, &member_leaves, n_leaves) {
-                continue;
-            }
+                    // A proposal that puts the same subtrees back where they were is
+                    // not an interchange: it is a reoptimisation of the three branches
+                    // the star primitive creates at `l`. Those nearly always gain a
+                    // little, and taking them turns the phase into branch-length
+                    // descent that steps 4 and 7 do properly and far more cheaply.
+                    // Measured 2026-08-31: from the generating tree itself, at 32 to 64
+                    // leaves and 256 features, accepting them ran 104 to 239 rounds
+                    // with the Robinson-Foulds distance pinned at zero throughout, so
+                    // every one of those rounds was branch lengths and none was
+                    // topology.
+                    let k_lo = tree.children(l).len() - 1;
+                    let k_hi = k_lo + tree.children(k).len();
+                    let last = star.member_nodes.len() - 1;
+                    let member_leaves: Vec<usize> = star
+                        .member_nodes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &node)| {
+                            if star.has_upstream && i == last {
+                                n_leaves - below[l as usize]
+                            } else {
+                                below[node as usize]
+                            }
+                        })
+                        .collect();
+                    if rebuilds_the_same_splits(&result, k_lo, k_hi, &member_leaves, n_leaves) {
+                        return Ok(None);
+                    }
 
-            let gain: f64 = result.merges.iter().map(|x| x.gain).sum::<f64>()
-                + collapse_delta(&tree, &down, &up, k, l, &star, &mut scratch);
-            let beats = match &winner {
-                None => gain > params.star.min_gain,
-                Some((incumbent, _)) => gain > *incumbent,
-            };
-            if beats {
-                winner = Some((gain, star));
-            }
-        }
+                    let gain: f64 = result.merges.iter().map(|x| x.gain).sum::<f64>()
+                        + collapse_delta(&tree, &down, &up, k, l, &star, scratch);
+                    if gain > params.star.min_gain {
+                        Ok(Some((gain, k, star)))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )
+            .try_reduce(
+                || None,
+                |a, b| {
+                    Ok(match (a, b) {
+                        (None, other) | (other, None) => other,
+                        (Some(x), Some(y)) => {
+                            if y.0 > x.0 || (y.0 == x.0 && y.1 < x.1) {
+                                Some(y)
+                            } else {
+                                Some(x)
+                            }
+                        }
+                    })
+                },
+            )?;
 
         match winner {
             None => break,
-            Some((gain, star)) => {
+            Some((gain, _, star)) => {
                 tree = splice_star(&tree, &star, Some(params.star))?.tree;
                 best = Some(loglik + gain);
                 n_moves += 1;
@@ -1262,6 +1293,45 @@ mod tests {
             assert_eq!(got.tree.branches(), reference.tree.branches());
             assert_eq!(got.loglik.to_bits(), reference.loglik.to_bits());
             assert_eq!(got.n_moves, reference.n_moves);
+        }
+    }
+
+    #[test]
+    fn test_the_greedy_phase_is_deterministic_whatever_the_thread_count() {
+        // The round scores every eligible edge in parallel and reduces to one
+        // winner, so a tie broken by arrival order rather than by node id would
+        // make the search thread-dependent. A ladder is the fixture that puts
+        // real work in front of the phase: it is as far from the generating
+        // tree as the simulator gets and takes tens of moves to fix.
+        let (p, n) = (128usize, 32usize);
+        let (data, w) = dataset(n, p, 3);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let reference = nni_greedy(&start, leaves, None).expect("greedy");
+        assert!(
+            reference.n_moves > 0,
+            "the fixture has to give the phase something to do"
+        );
+
+        for threads in [1usize, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let got = pool.install(|| nni_greedy(&start, leaves, None).expect("greedy"));
+            assert_eq!(
+                splits(&got.tree),
+                splits(&reference.tree),
+                "topology moved at {threads} threads"
+            );
+            assert_eq!(got.tree.branches(), reference.tree.branches());
+            assert_eq!(got.loglik.to_bits(), reference.loglik.to_bits());
+            assert_eq!(got.n_moves, reference.n_moves);
+            assert_eq!(got.rounds, reference.rounds);
         }
     }
 

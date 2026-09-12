@@ -1,0 +1,270 @@
+# Performance: what worked, what did not, and why
+
+A record of every optimisation attempted on this crate, kept because most of the
+value is in the failures and in the reasoning that led to them. `CHANGELOG.md`
+says what changed. This says what it cost, what it bought, and what the next
+person should not repeat.
+
+Every number here was measured on an M1 Max unless stated. Where a machine was
+under load at the time, that is recorded, because it makes the seconds
+pessimistic and the ratios trustworthy.
+
+---
+
+## The rules
+
+Nine, all of them paid for.
+
+### 1. Measure a component's share of the whole before optimising it
+
+`BlockedState` was a feature-blocked parallel pruning sweep. At 8192 leaves by
+2000 features it ran a ladder tree in 11.2 ms against level-parallelism's
+67.7 ms. Real code, real tests, a real measurement.
+
+It was deleted on 2026-09-06, because instrumenting the whole search rather than
+the kernel showed **the prune is 2.1 to 2.4 per cent of a run and the up-sweep
+another 0.5**, with the share flat in feature count. A perfect tenfold speedup
+bought under 3 per cent of wall time. Cost: 324 lines and a doc comment that
+misled every reader for a month.
+
+### 2. Check that the pipeline calls it at all
+
+Two modules on this project were built, tested, benchmarked and never wired in.
+`BlockedState` was constructed in exactly two places, both inside a benchmark,
+while this repo's `CLAUDE.md` called it "the production path" from the day it
+was written.
+
+The mirror image is worse. The kNN restriction and the ellipsoid bounds were
+implemented and tested and *also* not wired in, and nobody noticed for a week
+because the search still gave the right answer, just cubically. Wiring them up
+was 1478.8 s to 37.4 s at 512 cells by 2000 features.
+
+### 3. Pick the kernel by call count, not by how vectorisable it looks
+
+`edge_newton` earned a SIMD tier at 35 to 45 calls per candidate pair.
+`split_derivative` reads like the hot loop, runs **0.07 times per pair** because
+the split solve almost always terminates at a bracket end, and measured flat.
+
+### 4. An exponent measured at the wrong parameter value is worse than none
+
+`benches/steps.rs` ran at 200 features and reported polytomy resolution at
+`n^2.83` and the interchanges at `n^2.60`. Both were treated as the last
+structural problems in the crate. Measured again at 2000 features, which is the
+regime this crate is for, they are `n^1.08` and `n^0.97` and together are 3 per
+cent of a run. Both exponents were round counts, and round counts collapse as
+the feature axis grows because the likelihood landscape gets cleaner.
+
+An hour of planning went into fixing two steps that did not need fixing.
+
+### 5. Diagnose before fixing, and expect the first diagnosis to be wrong
+
+Three for three so far.
+
+- SPR was assumed to be paying for its `O(n p)` acceptance re-prune. That re-prune
+  is **0.03 per cent** of the step, because the split fingerprint discards 99.7
+  per cent of candidates before it runs. The cost was *proposing*: five `O(n p)`
+  sweeps per candidate for rows of which a few dozen are read. 93.19 s to 6.71 s.
+- NNI was assumed to be paying for its re-prune too. The cost was **the filter
+  itself**: `interchange_at` built a whole tree and `split_fingerprint` walked
+  it, `O(n)` each, per candidate, 1.47 s of 1.98 s at 4096 leaves. 1.98 s to
+  0.75 s.
+- SPR's remaining `n^1.46` was assumed to be the placement beam, and a
+  FastTree-style tree-distance limit was planned for it. The beam is **flat**:
+  41 to 49 nodes over a sixteenfold growth in `n`, `n^0.06`. The limit would
+  have bought nothing.
+
+### 6. Ablate the step, do not just optimise it
+
+Asking "how do I make SPR faster" produced a plan. Asking "what happens if I
+delete SPR" produced the answer, which is that at noise 0.3 it costs 20x the
+wall clock and changes nothing at all.
+
+### 7. Test the hard regime, not only the easy one
+
+The same ablation, run at four noise levels instead of one, inverted. At noise
+1.6 SPR wins 27.5 splits of 4090 and is 7.3x *faster* than not having it. Three
+noise levels said delete it. The fourth said it is the thing that saves you.
+
+### 8. A justification has a shelf life tied to the measurement behind it
+
+"The tree sweeps are sequential and on measurement they do not need to be: the
+whole prune is 2.4 per cent of a run" was correct when written. Then step 2 was
+replaced by a linkage and the prune-based steps became a much larger share of
+what is left. The sentence stayed true and stopped being a reason.
+
+Any comment of the form "X is fine because Y is small" needs re-reading whenever
+Y's denominator changes.
+
+### 9. Look at core utilisation, not only wall time
+
+The crate names three parallel axes and all three live in ingest or in search
+step 2. Once step 2 was replaced, the pipeline got **1.26x out of ten cores**.
+Nothing in the wall-clock numbers said so; it took a run at
+`RAYON_NUM_THREADS=1` to see it.
+
+---
+
+## What worked
+
+| change | effect | date |
+|---|---|---|
+| Wire in the kNN restriction and ellipsoid bounds | 1478.8 s to 37.4 s at 512 by 2000; `n^2.9` to `n^1.8` | 2026-09-01 |
+| Lazy SPR proposal rows (`LazyRows`) | 93.19 s to 6.71 s at 2048 by 200; `n^1.98` to `n^1.47` | 2026-09-04 |
+| Structural NNI filter over the star result | 1.98 s to 0.75 s at 2048 by 200; per round `n^1.53` to `n^1.02` | 2026-09-06 |
+| `f64x4` tier on `edge_newton` | 0.95 to 0.71 ns per feature; 8 per cent of a whole run | 2026-09-12 |
+| Adaptive ellipsoid sizing on redraw-versus-walk cost | 0.109 s against 0.170 and 0.175 for fixed schedules either side | 2026-08-31 |
+| Ward linkage start replacing search step 2 | 66.08 s to 17.06 s at 2048 by 2000, identical tree | 2026-09-12 |
+| Parallel edge solve in `optimise_branch_lengths` | 1.00x to 2.4x on ten cores, bit-identical | 2026-09-12 |
+| Parallel edge scan in `nni_greedy` | 2.0x on top of the 3.8x it borrowed, bit-identical | 2026-09-12 |
+
+Three notes on these.
+
+**The two big rewrites were both about not materialising things.** `LazyRows`
+forms the rows a proposal reads and no others; the NNI filter tests the star
+result rather than building a tree and walking it. Neither made any kernel
+faster.
+
+**The SIMD tier is honest about its size.** 14 per cent of the merge scan and 8
+per cent of a whole run at 2048 by 2000, `71.4 s` to `65.7 s`. That is worth
+having and it is not a headline.
+
+**The two parallel changes are bit-identical, deliberately.** The branch solve
+writes one slot per node with no reduction. The NNI scan reduces to a running
+best with ties broken on the lower node id, which is what the sequential scan
+did implicitly, since the arena invariant makes ascending index order a
+post-order. `test_the_greedy_phase_is_deterministic_whatever_the_thread_count`
+pins it at 1, 3 and 8 threads.
+
+---
+
+## What did not work
+
+| attempt | why not | date |
+|---|---|---|
+| `BlockedState`, feature-blocked parallel prune | 6x on a kernel that is 2.4 per cent of a run | 2026-09-06 |
+| SIMD on `split_derivative` | runs 0.07 times per candidate pair; measured flat | 2026-09-12 |
+| `edge_newton` with the division replaced by a multiply | 0.92 against 0.95 ns per feature, inside noise | 2026-09-12 |
+| `edge_newton` with eight accumulator chains | 1.00 against 0.95, slower | 2026-09-12 |
+| `edge_newton` with one division per four features | 1.23 against 0.95, much slower | 2026-09-12 |
+| Ellipsoid sizing on walk depth | the walk is chunked, so every round reads shallow and the cap chose the answer | 2026-08-31 |
+| Feature subsampling to rank merge candidates | argmax survives 4 of 15 checkpoints at a quarter of the features | 2026-09-12 |
+| Chain or Boruvka agglomeration on the Bonsai merge gain | the score is not reducible: one round in five inverts, by up to 13 nats | 2026-09-12 |
+| Tree-distance limit on SPR regrafts | the beam is `n^0.06`, so there is nothing to limit | 2026-09-12 |
+
+Two of these deserve their own paragraph.
+
+**Feature subsampling.** The merge gain is a sum over `p` features, so estimating
+it on `p'` of them and rescaling looks like a free 30x. It is not. Measured over
+five checkpoints through a 128-member star at 2000 features, three seeds, with a
+*shared* column set per checkpoint so the correlated part of the error is
+already cancelled:
+
+| subsample | argmax agreed | mean relative error | mean nats lost |
+|---|---|---|---|
+| 32 | 1 / 15 | 9.4e-1 | 94.6 |
+| 128 | 3 / 15 | 3.7e-1 | 26.1 |
+| 512 | 4 / 15 | 1.2e-1 | 12.0 |
+
+The arithmetic says why. The estimator's standard deviation is
+`p * sigma / sqrt(p')`, about 11 per cent of the gain at `p' = 512`, and
+competing merges in a real round differ by far less than that. A random
+*projection* is a different mechanism and is still open, since it summarises
+every feature rather than discarding all but `p'`; it needs the precisions to be
+approximately rank-1 in gene by cell, which has not been checked.
+
+**Reducibility.** Merging changes the peeled remainder `R` that every other
+pair's score depends on, so a merge can lift another pair above the score the
+merged pair had. Measured at 64 and 128 members: 10 to 32 inversions over 61 to
+125 rounds, worst excess 3.6 to 13.2 nats, up to 60 per cent relative. Ward has
+no global remainder term and is reducible by construction, which is a second
+reason to prefer it over a likelihood-driven linkage.
+
+---
+
+## Memory
+
+**`f32` storage, `f64` accumulation, always.** The tree loglikelihood sums
+thousands of features whose interesting differences are `O(1)` while the sum is
+`O(p)`, so `f32` accumulation turns the convergence criterion into noise. `f32`
+*storage* halves the working set the search streams and is the fastest path.
+
+The cost of `f32` storage is a function of how far the means sit from zero,
+measured 2026-08-31 over four leaves by 256 features:
+
+| mean over separation | relative error in the difference |
+|---|---|
+| 0 | 1.1e-6 |
+| 1e3 | 1.5e-6 |
+| 1e5 | 3.2e-4 |
+| 1e7 | 7.0e-2 |
+
+Everything downstream consumes squared *differences* of means, so centred data
+is fine and uncentred data at `1e7` is not.
+
+**Dense `n x n` anything is dead above about 20k cells.** The Ward experiment's
+distance matrix is 2.1 GB at 16384 in `f64` and 4 TB at 1M. A `k = 16` neighbour
+graph at 1M is 128 MB. That, not the flop count, is what forces the linkage
+through `ann-search-rs`.
+
+**`MergeScratch` is six `p`-length arrays per candidate pair**, 48 KB at `p =
+2000` in `f32`. That is over any sensible GPU shared-memory budget, so a cubecl
+merge kernel has to fuse `prepare` into the solve and recompute the separations
+from `M` and `W` in registers rather than materialising them.
+
+**`NodeState::prune` asserts on the node count**, so it cannot be reused across
+trees of different shape. Polytomy resolution therefore reallocates and refills
+two `n x p` slabs on every sweep. That is invisible at 2000 features, where the
+step is 0.1 per cent of a run, and would not be at 200.
+
+---
+
+## Where the time goes, 2026-09-12
+
+Ward start, 2000 features, two seeds, Robinson-Foulds 0 at every size.
+
+At 16384 leaves, before and after the two parallel changes above. Ten cores.
+
+| step | before | after | gain |
+|---|---|---|---|
+| ward linkage | 60.94 | 59.49 | 1.0x |
+| 3 polytomy | 0.32 | 0.30 | 1.1x |
+| 4 branch | 25.06 | 10.26 | **2.4x** |
+| 5 SPR | 200.81 | 200.04 | 1.0x |
+| 6 NNI | 9.03 | 4.69 | **1.9x** |
+| 7 branch | 1.40 | 0.65 | **2.2x** |
+| total | 297.55 | 275.43 | 1.08x |
+
+Nineteen seconds off 297, for free and bit-identical. The total barely moves
+because SPR is 73 per cent of the run and untouched, which is rule 1 pointing at
+itself: the two steps that were easy to parallelise were the two that did not
+matter. What the change does buy is that branch optimisation and the
+interchanges are no longer on the critical path at any size.
+
+Exponents over the full sweep, unchanged by threading: linkage 2.00, polytomy
+0.98, branch 1.03, SPR 1.45, NNI 0.98, total 1.52. Two things set the asymptote
+and nothing else does:
+
+1. The linkage at `n^2.00`, which is a dense distance matrix and has to become a
+   neighbour graph.
+2. SPR at `n^1.45`, which is `O(n)` candidates each paying an `O(n)` arena
+   rebuild and an `O(n)` fingerprint, so `Theta(n^2)` of pure bookkeeping, and
+   which runs at 1.18x on ten cores.
+
+## Against the reference implementation
+
+`/Users/gregorlueg/repos/others/bonsai-comparison`, run 2026-09-06. Matched
+inputs, both implementations scored the same way.
+
+| config | ours | reference | speedup | RF ours vs reference |
+|---|---|---|---|---|
+| 256 by 1000 | 1.87 s | 148.22 s | 79x | 0 |
+| 1024 by 200 | 5.64 s | 241.96 s | 43x | 2 |
+| 2048 by 200 | 17.22 s | 491.77 s | 29x | 2 |
+
+Distance recovery matches to four decimal places throughout. Two deltas matter
+and they want opposite things: the speed delta should widen, and
+`rf_ours_vs_reference` should not. Rerun this after any change to the search.
+
+`reference/bonsai_ref.py` is a different thing and covers the pruning kernel
+alone, agreeing to twelve significant figures. It has no oracle for the merge
+score or the branch solve, which is where most changes land.

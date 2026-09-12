@@ -24,6 +24,7 @@ use crate::model::likelihood::NodeState;
 use crate::tree::Tree;
 use crate::utils::kernels::prep_edge;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
+use rayon::prelude::*;
 
 /////////////////////
 // Two-sided sweep //
@@ -282,7 +283,14 @@ pub(crate) fn up_part<T: BonsaiFloat>(is_root: bool, t_a: f64, w_up: T, m_up: T)
 /// Means, row-major `[node][feature]` in the storage type, and precisions in
 /// `f64`, which is what a caller wanting standard deviations needs and what a
 /// caller wanting an effective leaf narrows.
-pub(crate) fn collapse_onto_every_node<T: BonsaiFloat>(
+///
+/// ### Why this is public
+///
+/// [`crate::model::place::place`] is public and takes the effective leaf of
+/// every node as a closure, which its own documentation says must be this
+/// composition and not [`UpState`]'s rows. So an external caller of `place`
+/// cannot write a correct one without this.
+pub fn collapse_onto_every_node<T: BonsaiFloat>(
     tree: &Tree,
     means: &[T],
     precisions: &[T],
@@ -441,30 +449,42 @@ pub fn optimise_branch_lengths<T: BonsaiFloat>(
     let root = tree.root() as usize;
 
     let mut up = UpState::new(n_nodes, p);
-    let mut s = vec![0.0f64; p];
-    let mut d = vec![0.0f64; p];
     let mut proposal = vec![0.0f64; n_nodes];
     let mut current: Vec<f64> = tree.branches().to_vec();
     let mut best = state.prune(tree);
 
     for _ in 0..params.max_iter {
         up.sweep(tree, state);
-        for k in 0..n_nodes {
-            if k == root {
-                proposal[k] = current[k];
-                continue;
-            }
-            let node = k as u32;
-            let upper = prep_edge(
-                state.means(node),
-                state.precisions(node),
-                up.means(node),
-                up.precisions(node),
-                &mut s,
-                &mut d,
-            );
-            proposal[k] = optimise_edge(&s, &d, upper)?;
-        }
+        // One independent edge solve per node, each reading the two settled
+        // rows and writing its own slot, so this is parallel without a
+        // reduction and is bit-identical to the sequential loop whatever the
+        // thread count. The scratch is per thread rather than per node: the
+        // pair of `p`-length buffers is the only allocation an edge solve
+        // needs, and allocating it once per node would cost more than the
+        // solve. The sweeps either side of this stay sequential.
+        let settled: &NodeState<T> = state;
+        let up_ref = &up;
+        let current_ref = &current;
+        proposal.par_iter_mut().enumerate().try_for_each_init(
+            || (vec![0.0f64; p], vec![0.0f64; p]),
+            |(s, d), (k, out)| -> Result<(), BonsaiErrors> {
+                if k == root {
+                    *out = current_ref[k];
+                    return Ok(());
+                }
+                let node = k as u32;
+                let upper = prep_edge(
+                    settled.means(node),
+                    settled.precisions(node),
+                    up_ref.means(node),
+                    up_ref.precisions(node),
+                    s,
+                    d,
+                );
+                *out = optimise_edge(s, d, upper)?;
+                Ok(())
+            },
+        )?;
         if proposal == current {
             return Ok(best);
         }

@@ -43,7 +43,9 @@ use bonsai_rs::search::polytomy::resolve_polytomies;
 use bonsai_rs::search::spr::spr;
 use bonsai_rs::search::star::{Star, star_tree_with};
 use bonsai_rs::tree::linkage::{KnnBackend, LinkageParams, linkage_tree as graph_linkage};
-use bonsai_rs::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
+use bonsai_rs::tree::simulate::{
+    SimulatedData, SimulationParams, robinson_foulds, simulate_binary, simulate_unbalanced,
+};
 use bonsai_rs::tree::{NO_NODE, Tree};
 use bonsai_rs::utils::rng::splitmix64_at;
 use rayon::prelude::*;
@@ -140,6 +142,37 @@ const CADENCE_K: usize = 16;
 /// Live-count fractions swept as the rebuild trigger. Zero never redraws on
 /// the count and leaves only the dead-end redraw.
 const CADENCE_FRACTIONS: [f64; 4] = [0.0, 0.5, 0.75, 0.9];
+
+/// Leaf count for the hard-regime rows of the drift block.
+///
+/// The balanced fixture at noise 0.3 is the easy regime: every round is one
+/// level and the union lists cover four. Rule 7 says test the hard one too, so
+/// the same columns are reported at raised noise and on the unbalanced
+/// generator, where Ward itself chains and the rounds have to keep up.
+const HARD_LEAVES: usize = 2048;
+
+/// Noise levels for the unbalanced rows of the drift block.
+const HARD_UNBALANCED_NOISES: [f64; 2] = [0.3, 1.0];
+
+/// Leaf counts for the backend crossover block.
+///
+/// `resolve_backend` hands sizes above 4096 to kmknn, which measured 43.82 s
+/// at 8192 by 2000 against 1.34 s for exhaustive at 4096. That threshold is a
+/// placeholder and this block is where its replacement comes from.
+const BACKEND_LEAVES: [usize; 3] = [4096, 8192, 16384];
+
+/// Backends compared in the crossover block. Exhaustive is the reference the
+/// others are scored against, since it is exact and their trees should match
+/// it up to recall.
+const BACKENDS: [KnnBackend; 3] = [
+    KnnBackend::Exhaustive,
+    KnnBackend::Kmknn,
+    KnnBackend::NnDescent,
+];
+
+/// Wall-clock ceiling for one backend at one size in the crossover block; a
+/// backend that exceeds it is not run at the next size.
+const BACKEND_BUDGET_SECONDS: f64 = 120.0;
 
 /// Members left attached to the root when a linkage stops.
 ///
@@ -503,12 +536,13 @@ fn run(n: usize, p: usize, noise: f64) -> Vec<(Start, f64, f64, f64, f64)> {
 ///
 /// * `n` - Number of cells
 /// * `seed` - Simulation seed
+/// * `dense` - Start from the dense Ward chain rather than the graph linkage
 ///
 /// ### Returns
 ///
 /// Seconds for the linkage build and for steps 3, 4, 5, 6 and 7 in order, then
 /// the Robinson-Foulds distance to the generating tree.
-fn step_split(n: usize, seed: u64) -> ([f64; 6], f64) {
+fn step_split(n: usize, seed: u64, dense: bool) -> ([f64; 6], f64) {
     let p = STEP_FEATURES;
     let sim = simulate_binary::<f64>(Some(SimulationParams {
         n_leaves: n,
@@ -528,7 +562,11 @@ fn step_split(n: usize, seed: u64) -> ([f64; 6], f64) {
     let mut t = [0.0f64; 6];
 
     let t0 = Instant::now();
-    let mut tree = graph_linkage(&sim.means, n, p, None).expect("linkage");
+    let mut tree = if dense {
+        linkage_tree(&sim.means, n, p, true)
+    } else {
+        graph_linkage(&sim.means, n, p, None).expect("linkage")
+    };
     t[0] = t0.elapsed().as_secs_f64();
 
     let t0 = Instant::now();
@@ -698,32 +736,58 @@ struct DriftRow {
     depth: f64,
 }
 
+/// The balanced fixture at `STEP_FEATURES`.
+///
+/// ### Params
+///
+/// * `n` - Number of cells
+/// * `noise` - Measurement noise in transformed units
+/// * `unbalanced` - Grow the tree by random leaf splitting instead
+///
+/// ### Returns
+///
+/// A closure from seed to dataset.
+fn fixture(n: usize, noise: f64, unbalanced: bool) -> impl Fn(u64) -> SimulatedData<f64> {
+    move |seed| {
+        let params = Some(SimulationParams {
+            n_leaves: n,
+            n_features: STEP_FEATURES,
+            noise_sd: noise,
+            seed,
+            ..Default::default()
+        });
+        if unbalanced {
+            simulate_unbalanced::<f64>(params).expect("simulation")
+        } else {
+            simulate_binary::<f64>(params).expect("simulation")
+        }
+    }
+}
+
 /// The graph linkage against the dense chain for a list of parameter sets.
 ///
 /// ### Params
 ///
 /// * `n` - Number of cells
+/// * `simulate` - The fixture for a seed
 /// * `configs` - One linkage configuration per row
 ///
 /// ### Returns
 ///
 /// One row per configuration, then the dense tree's own mean distance to the
 /// truth and depth.
-fn drift_rows(n: usize, configs: &[LinkageParams]) -> (Vec<DriftRow>, f64, f64) {
+fn drift_rows(
+    n: usize,
+    simulate: impl Fn(u64) -> SimulatedData<f64>,
+    configs: &[LinkageParams],
+) -> (Vec<DriftRow>, f64, f64) {
     let reps = STEP_SEEDS.len() as f64;
     let mut dense_truth = 0.0f64;
     let mut dense_depth = 0.0f64;
     let mut rows = vec![DriftRow::default(); configs.len()];
 
     for &seed in STEP_SEEDS.iter() {
-        let sim = simulate_binary::<f64>(Some(SimulationParams {
-            n_leaves: n,
-            n_features: STEP_FEATURES,
-            noise_sd: NOISE,
-            seed,
-            ..Default::default()
-        }))
-        .expect("simulation");
+        let sim = simulate(seed);
         let dense = linkage_tree(&sim.means, n, STEP_FEATURES, true);
         dense_truth += robinson_foulds(&dense, &sim.tree).expect("rf") as f64 / reps;
         dense_depth += max_depth(&dense) as f64 / reps;
@@ -750,6 +814,7 @@ fn main() {
     let steps_sweep = want.is_empty() || want.iter().any(|a| a == "steps");
     let spr_block = want.is_empty() || want.iter().any(|a| a == "spr");
     let drift_block = want.is_empty() || want.iter().any(|a| a == "drift");
+    let backend_block = want.is_empty() || want.iter().any(|a| a == "backend");
 
     println!("threads {}", rayon::current_num_threads());
 
@@ -801,10 +866,17 @@ fn main() {
     }
 
     if steps_sweep {
-        println!("\n=== per-step split from a Ward start, {STEP_FEATURES} features ===");
+        // Both starts, interleaved per seed so the ratio between them holds
+        // whatever the machine is doing. The graph start is only a fix if the
+        // SPR column comes back to what the dense start gives it.
+        let starts = [(true, "dense ward"), (false, "graph linkage")];
+        let mut previous = [None::<(usize, [f64; 6])>; 2];
+        let mut over_budget = false;
+        println!("\n=== per-step split, {STEP_FEATURES} features ===");
         println!(
-            "{:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+            "{:>7} {:>13} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
             "leaves",
+            "start",
             "linkage",
             "3 poly",
             "4 branch",
@@ -814,42 +886,48 @@ fn main() {
             "total s",
             "RF"
         );
-        let mut previous: Option<(usize, [f64; 6])> = None;
         for &n in STEP_LEAVES.iter() {
-            let mut t = [0.0f64; 6];
-            let mut rf = 0.0f64;
+            let mut t = [[0.0f64; 6]; 2];
+            let mut rf = [0.0f64; 2];
             for &seed in STEP_SEEDS.iter() {
-                let (one, one_rf) = step_split(n, seed);
-                for k in 0..6 {
-                    t[k] += one[k] / STEP_SEEDS.len() as f64;
+                for (which, &(dense, _)) in starts.iter().enumerate() {
+                    let (one, one_rf) = step_split(n, seed, dense);
+                    for k in 0..6 {
+                        t[which][k] += one[k] / STEP_SEEDS.len() as f64;
+                    }
+                    rf[which] += one_rf / STEP_SEEDS.len() as f64;
                 }
-                rf += one_rf / STEP_SEEDS.len() as f64;
             }
-            let total: f64 = t.iter().sum();
-            println!(
-                "{n:>7} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {total:>9.2} {rf:>7.1}",
-                t[0], t[1], t[2], t[3], t[4], t[5]
-            );
-            if let Some((prev_n, prev)) = previous {
-                let factor = (n / prev_n) as f64;
-                print!("{:>7}", "exps");
-                for k in 0..6 {
-                    // Below a tenth of a second the ratio is timer noise, not an
-                    // exponent, and printing one invites it to be quoted.
-                    let e = if prev[k] > 0.1 {
-                        (t[k] / prev[k]).ln() / factor.ln()
-                    } else {
-                        f64::NAN
-                    };
-                    print!(" {e:>9.2}");
+            for (which, &(_, name)) in starts.iter().enumerate() {
+                let t = t[which];
+                let total: f64 = t.iter().sum();
+                println!(
+                    "{n:>7} {name:>13} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {total:>9.2} {:>7.1}",
+                    t[0], t[1], t[2], t[3], t[4], t[5], rf[which]
+                );
+                if let Some((prev_n, prev)) = previous[which] {
+                    let factor = (n / prev_n) as f64;
+                    print!("{:>7} {:>13}", "", "exps");
+                    for k in 0..6 {
+                        // Below a tenth of a second the ratio is timer noise,
+                        // not an exponent, and printing one invites it to be
+                        // quoted.
+                        let e = if prev[k] > 0.1 {
+                            (t[k] / prev[k]).ln() / factor.ln()
+                        } else {
+                            f64::NAN
+                        };
+                        print!(" {e:>9.2}");
+                    }
+                    println!("   {:>9.2}   (n^exponent)", {
+                        let prev_total: f64 = prev.iter().sum();
+                        (total / prev_total).ln() / factor.ln()
+                    });
                 }
-                println!("   {:>9.2}   (n^exponent)", {
-                    let prev_total: f64 = prev.iter().sum();
-                    (total / prev_total).ln() / factor.ln()
-                });
+                previous[which] = Some((n, t));
+                over_budget |= total > STEP_BUDGET_SECONDS;
             }
-            previous = Some((n, t));
-            if total > STEP_BUDGET_SECONDS {
+            if over_budget {
                 println!("        (budget reached, stopping)");
                 break;
             }
@@ -931,9 +1009,21 @@ fn main() {
         println!("{:>7} (of {} splits)", "", 2 * (SPR_NOISE_LEAVES - 3));
     }
 
-    if !drift_block {
-        return;
+    if drift_block {
+        drift(want.iter().any(|a| a == "quick"));
     }
+
+    if backend_block {
+        backends();
+    }
+}
+
+/// The drift, cadence and hard-regime tables.
+///
+/// ### Params
+///
+/// * `quick` - Skip the `k` and cadence sweeps and run the hard regime alone
+fn drift(quick: bool) {
     // The graph linkage costs SPR three to seven times what the dense one does
     // while reaching the same Robinson-Foulds distance after refinement, so the
     // two starting trees differ in something RF cannot see. `to dense` is how
@@ -941,60 +1031,156 @@ fn main() {
     // is even in the wrong direction, and `depth` is the variable SPR's cost
     // keys on, since a proposal recomputes the rows from the cut to the root.
     // The backend is pinned to exhaustive so sparsity is the only thing varying.
-    println!("\n=== linkage drift against the dense chain, {STEP_FEATURES} features ===");
-    println!(
-        "{:>7} {:>5} {:>9} {:>10} {:>10} {:>8} {:>8}",
-        "leaves", "k", "build s", "to dense", "to truth", "depth", "dense d"
-    );
-    for &n in DRIFT_LEAVES.iter() {
-        let configs: Vec<LinkageParams> = DRIFT_K
-            .iter()
-            .map(|&k| LinkageParams {
-                k,
-                backend: Some(KnnBackend::Exhaustive),
-                ..LinkageParams::default()
-            })
-            .collect();
-        let (rows, dense_truth, dense_depth) = drift_rows(n, &configs);
-        for (&k, row) in DRIFT_K.iter().zip(rows) {
+    if !quick {
+        println!("\n=== linkage drift against the dense chain, {STEP_FEATURES} features ===");
+        println!(
+            "{:>7} {:>5} {:>9} {:>10} {:>10} {:>8} {:>8}",
+            "leaves", "k", "build s", "to dense", "to truth", "depth", "dense d"
+        );
+        for &n in DRIFT_LEAVES.iter() {
+            let configs: Vec<LinkageParams> = DRIFT_K
+                .iter()
+                .map(|&k| LinkageParams {
+                    k,
+                    backend: Some(KnnBackend::Exhaustive),
+                    ..LinkageParams::default()
+                })
+                .collect();
+            let (rows, dense_truth, dense_depth) =
+                drift_rows(n, fixture(n, NOISE, false), &configs);
+            for (&k, row) in DRIFT_K.iter().zip(rows) {
+                println!(
+                    "{n:>7} {k:>5} {:>9.2} {:>10.1} {:>10.1} {:>8.1} {dense_depth:>8.1}",
+                    row.secs, row.to_dense, row.to_truth, row.depth
+                );
+            }
             println!(
-                "{n:>7} {k:>5} {:>9.2} {:>10.1} {:>10.1} {:>8.1} {dense_depth:>8.1}",
-                row.secs, row.to_dense, row.to_truth, row.depth
+                "{:>7} {:>5} dense to truth {dense_truth:.1} of {} splits",
+                "",
+                "",
+                2 * (n - 3)
             );
         }
+
+        // Same columns with `k` pinned and the rebuild cadence swept instead.
+        // The headline is depth: the graph goes stale between rebuilds, so if
+        // redrawing it more often is enough then the chaining is a cadence
+        // problem and the `O(n k p)` design stands.
+        println!("\n=== rebuild cadence at k = {CADENCE_K}, {STEP_FEATURES} features ===");
         println!(
-            "{:>7} {:>5} dense to truth {dense_truth:.1} of {} splits",
-            "",
-            "",
-            2 * (n - 3)
+            "{:>7} {:>6} {:>9} {:>10} {:>10} {:>8} {:>8}",
+            "leaves", "frac", "build s", "to dense", "to truth", "depth", "dense d"
         );
+        for &n in DRIFT_LEAVES.iter() {
+            let configs: Vec<LinkageParams> = CADENCE_FRACTIONS
+                .iter()
+                .map(|&fraction| LinkageParams {
+                    k: CADENCE_K,
+                    backend: Some(KnnBackend::Exhaustive),
+                    rebuild_fraction: fraction,
+                    ..LinkageParams::default()
+                })
+                .collect();
+            let (rows, _, dense_depth) = drift_rows(n, fixture(n, NOISE, false), &configs);
+            for (params, row) in configs.iter().zip(rows) {
+                println!(
+                    "{n:>7} {:>6.2} {:>9.2} {:>10.1} {:>10.1} {:>8.1} {dense_depth:>8.1}",
+                    params.rebuild_fraction, row.secs, row.to_dense, row.to_truth, row.depth
+                );
+            }
+        }
     }
 
-    // Same columns with `k` pinned and the rebuild cadence swept instead. The
-    // headline is depth: the graph goes stale between rebuilds, so if redrawing
-    // it more often is enough then the chaining is a cadence problem and the
-    // `O(n k p)` design stands.
-    println!("\n=== rebuild cadence at k = {CADENCE_K}, {STEP_FEATURES} features ===");
+    // The hard regime: raised noise on the balanced generator, then the
+    // unbalanced one, where Ward itself chains and `dense d` is far above
+    // `log2(n)`. The graph linkage has to track the dense tree here too, and
+    // a depth far above the dense one is the caterpillar coming back.
     println!(
-        "{:>7} {:>6} {:>9} {:>10} {:>10} {:>8} {:>8}",
-        "leaves", "frac", "build s", "to dense", "to truth", "depth", "dense d"
+        "\n=== hard regime at {HARD_LEAVES} leaves, k = {CADENCE_K}, {STEP_FEATURES} features ==="
     );
-    for &n in DRIFT_LEAVES.iter() {
-        let configs: Vec<LinkageParams> = CADENCE_FRACTIONS
-            .iter()
-            .map(|&fraction| LinkageParams {
-                k: CADENCE_K,
-                backend: Some(KnnBackend::Exhaustive),
-                rebuild_fraction: fraction,
-                ..LinkageParams::default()
-            })
-            .collect();
-        let (rows, _, dense_depth) = drift_rows(n, &configs);
-        for (params, row) in configs.iter().zip(rows) {
+    println!(
+        "{:>10} {:>6} {:>9} {:>10} {:>10} {:>8} {:>8} {:>10}",
+        "tree", "noise", "build s", "to dense", "to truth", "depth", "dense d", "dense t"
+    );
+    let defaults = [LinkageParams {
+        k: CADENCE_K,
+        backend: Some(KnnBackend::Exhaustive),
+        ..LinkageParams::default()
+    }];
+    let regimes = NOISES
+        .iter()
+        .map(|&noise| (false, noise))
+        .chain(HARD_UNBALANCED_NOISES.iter().map(|&noise| (true, noise)));
+    for (unbalanced, noise) in regimes {
+        let (rows, dense_truth, dense_depth) = drift_rows(
+            HARD_LEAVES,
+            fixture(HARD_LEAVES, noise, unbalanced),
+            &defaults,
+        );
+        let row = rows[0];
+        println!(
+            "{:>10} {noise:>6.1} {:>9.2} {:>10.1} {:>10.1} {:>8.1} {dense_depth:>8.1} {dense_truth:>10.1}",
+            if unbalanced { "unbalanced" } else { "balanced" },
+            row.secs,
+            row.to_dense,
+            row.to_truth,
+            row.depth
+        );
+    }
+    println!("{:>10} {:>6} (of {} splits)", "", "", 2 * (HARD_LEAVES - 3));
+}
+
+/// The backend crossover: every backend at every size, scored against the
+/// exhaustive tree.
+fn backends() {
+    println!("\n=== backend crossover at k = {CADENCE_K}, {STEP_FEATURES} features ===");
+    println!(
+        "{:>7} {:>11} {:>9} {:>13} {:>8}",
+        "leaves", "backend", "build s", "to exhaustive", "depth"
+    );
+    let mut skip = [false; BACKENDS.len()];
+    for &n in BACKEND_LEAVES.iter() {
+        let reps = STEP_SEEDS.len() as f64;
+        let mut secs = [0.0f64; BACKENDS.len()];
+        let mut to_exhaustive = [0.0f64; BACKENDS.len()];
+        let mut depth = [0.0f64; BACKENDS.len()];
+        for &seed in STEP_SEEDS.iter() {
+            let sim = fixture(n, NOISE, false)(seed);
+            let mut reference: Option<Tree> = None;
+            for (slot, &backend) in BACKENDS.iter().enumerate() {
+                if skip[slot] {
+                    continue;
+                }
+                let params = LinkageParams {
+                    k: CADENCE_K,
+                    backend: Some(backend),
+                    ..LinkageParams::default()
+                };
+                let t0 = Instant::now();
+                let got =
+                    graph_linkage(&sim.means, n, STEP_FEATURES, Some(params)).expect("linkage");
+                secs[slot] += t0.elapsed().as_secs_f64() / reps;
+                depth[slot] += max_depth(&got) as f64 / reps;
+                if let Some(reference) = reference.as_ref() {
+                    to_exhaustive[slot] +=
+                        robinson_foulds(&got, reference).expect("rf") as f64 / reps;
+                } else {
+                    reference = Some(got);
+                }
+            }
+        }
+        for (slot, &backend) in BACKENDS.iter().enumerate() {
+            if skip[slot] {
+                continue;
+            }
             println!(
-                "{n:>7} {:>6.2} {:>9.2} {:>10.1} {:>10.1} {:>8.1} {dense_depth:>8.1}",
-                params.rebuild_fraction, row.secs, row.to_dense, row.to_truth, row.depth
+                "{n:>7} {:>11} {:>9.2} {:>13.1} {:>8.1}",
+                format!("{backend:?}"),
+                secs[slot],
+                to_exhaustive[slot],
+                depth[slot]
             );
+            skip[slot] = secs[slot] > BACKEND_BUDGET_SECONDS;
         }
     }
 }

@@ -74,12 +74,12 @@ use rustc_hash::FxHashSet;
 
 /// Neighbours kept per cluster.
 ///
-/// Sixteen, matching [`crate::search::candidates::KnnCandidatesParams`], whose
-/// doc comment carries the measurement: at 128 leaves by 200 features over 24
-/// replicates, `k = 16` reproduces the exhaustive topology in 24 of 24 and both
-/// recovery measures stop moving there. That was measured for the merge scan
-/// rather than for this, so it is a starting point rather than a result; the
-/// gate is Robinson-Foulds through the whole pipeline.
+/// Sixteen, matching [`crate::search::candidates::KnnCandidatesParams`].
+/// Measured 2026-09-12 in the `drift` block of `benches/start_tree.rs`, 2000
+/// features, exhaustive backend, two seeds: at every `k` from 8 to 128 and
+/// every size from 512 to 4096 the rounds reproduce the dense Ward tree
+/// exactly, at depth `log2(n)`. Under the chain this replaced `k = 16` was
+/// 248 splits and depth 131 at 4096, and the `k` needed grew as `1.5 sqrt(n)`.
 const DEFAULT_K: usize = 16;
 
 /// Rebuild the graph once the live cluster count has fallen to this fraction of
@@ -89,18 +89,28 @@ const DEFAULT_K: usize = 16;
 /// neither child's, so the graph goes stale as a description of the current
 /// geometry. Halving gives `log2(n)` rebuilds over a whole linkage, each over a
 /// set half the size of the last, so the rebuilds are a geometric series and
-/// cost a constant multiple of the first one. Chosen 2026-09-12 on that
-/// argument, not from a recovery measurement.
+/// cost a constant multiple of the first one.
+///
+/// Swept 2026-09-12 at `k = 16` over 0, 0.5, 0.75 and 0.9 (`benches/start_tree.rs`,
+/// `drift`): every setting, including never redrawing on the count and leaving
+/// only the dry-list redraw, reproduces the dense tree at depth `log2(n)` from
+/// 512 to 4096 leaves. So the cadence does not decide recovery; it was the
+/// depth-first chain that did, and the rounds fixed it. Halving is kept as the
+/// bound on staleness; the build-second differences between the settings were
+/// inside the noise of a machine at load 40.
 const DEFAULT_REBUILD_FRACTION: f64 = 0.5;
 
-/// Cells below which the exhaustive backend is used whatever the dimension.
+/// Cells up to which the exhaustive backend is used.
 ///
-/// An exhaustive self-kNN is `O(n^2 p)` but has no build phase and no recall
-/// question, and at high dimension the graph methods lose much of their edge
-/// because the distance computation dominates and pruning is weak. Chosen
-/// 2026-09-12 as a placeholder; the crossover has not been measured and
-/// `resolve_backend` is where it goes when it has been.
-const EXHAUSTIVE_MAX_CELLS: usize = 4_096;
+/// Measured 2026-09-12, `backend` block of `benches/start_tree.rs`, 2000
+/// features, `k = 16`, two seeds, the three backends interleaved on a machine
+/// at load 50 to 65 so only the ratios are trustworthy: exhaustive 0.78, 1.44,
+/// 5.20 s at 4096, 8192, 16384 against NN-descent 1.33, 2.39, 4.48 s, all three
+/// backends returning the identical tree. The crossover is at 16384 and the
+/// quadratic term takes over from there. kmknn was 2.98, 8.32, 30.32 s, four to
+/// six times exhaustive at every size, because k-means pruning does nothing at
+/// this dimension; it stays available but is never chosen.
+const EXHAUSTIVE_MAX_CELLS: usize = 16_384;
 
 /// Metric the graph is built in. Plain Euclidean on the transformed means: the
 /// graph decides which pairs are *considered*, and the linkage that decides
@@ -114,13 +124,6 @@ const NNDESCENT_DELTA: f32 = 0.001;
 /// NN-descent diversification probability. One, meaning no pruning: the graph
 /// is small in `k` and wanted at full recall.
 const NNDESCENT_DIVERSIFY: f32 = 1.0;
-
-/// Cells above which the approximate backend is used.
-///
-/// `kmknn` is exact and sublinear in the number of distance computations, which
-/// is the right trade in the middle of the range. Above this the exactness is
-/// not worth the build. Chosen 2026-09-12 as a placeholder, unmeasured.
-const KMKNN_MAX_CELLS: usize = 65_536;
 
 /// Which neighbour-search backend builds the graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,11 +168,8 @@ impl Default for LinkageParams {
 
 /// Pick a backend from the problem size.
 ///
-/// **The thresholds are placeholders and are not measured.** They encode the
-/// shape of the trade rather than its location: exhaustive has no build phase
-/// and no recall question but is quadratic, `kmknn` is exact and prunes, and
-/// NN-descent is approximate and is the cheapest way to a self-kNN graph at
-/// scale. See `PERFORMANCE.md` before quoting any of them.
+/// Exhaustive up to [`EXHAUSTIVE_MAX_CELLS`], NN-descent above it; the
+/// measurement is on the constant.
 ///
 /// ### Params
 ///
@@ -179,10 +179,10 @@ impl Default for LinkageParams {
 ///
 /// The backend to use.
 fn resolve_backend(n_cells: usize) -> KnnBackend {
-    match n_cells {
-        n if n <= EXHAUSTIVE_MAX_CELLS => KnnBackend::Exhaustive,
-        n if n <= KMKNN_MAX_CELLS => KnnBackend::Kmknn,
-        _ => KnnBackend::NnDescent,
+    if n_cells <= EXHAUSTIVE_MAX_CELLS {
+        KnnBackend::Exhaustive
+    } else {
+        KnnBackend::NnDescent
     }
 }
 

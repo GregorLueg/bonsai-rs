@@ -101,6 +101,18 @@ pub const BOUND_WALK_CHUNK: usize = 16;
 /// See that field for the drift measurement that fixes it.
 const CENTRE_EXACT_EVERY: usize = 32;
 
+/// Fewest candidate pairs a scan spreads over the thread pool.
+///
+/// Below this the scan runs on the calling thread. Search step 5 proposes its
+/// candidates in parallel and resolves the four-member star each regraft
+/// leaves behind, six pairs, from inside that loop; a parallel scan there
+/// hands half of six pairs to a worker that is busy with a whole other
+/// proposal, and the caller waits on it. Measured 2026-09-12 on an M1 Max,
+/// ten threads, 2048 leaves by 2000 features at noise 1.6: 3.0 ms per
+/// resolution summed over threads against 0.7 ms sequential. A merge scan
+/// over a real star is thousands of pairs and is not affected.
+const PAR_PAIRS_MIN: usize = 64;
+
 /// How the primitive picks the pair to merge in a round.
 ///
 /// SPEC.md section 9.4. The greedy rule drives search steps 2 and 3 and is the
@@ -963,6 +975,14 @@ fn scan_pairs<T: BonsaiFloat>(
     merge: MergeParams,
 ) -> Result<Scan, BonsaiErrors> {
     let p = work.p;
+    if pairs.len() < PAR_PAIRS_MIN {
+        let mut scratch = PairScratch::new(p);
+        let mut scan = Scan::EMPTY;
+        for &(a, b) in pairs {
+            scan = scan.merge(score_pair(work, members, a, b, merge, &mut scratch)?);
+        }
+        return Ok(scan);
+    }
     pairs
         .par_iter()
         .map_init(
@@ -1056,15 +1076,25 @@ fn sample_pair<T: BonsaiFloat>(
     rng: &mut SplitMix64,
 ) -> Result<Candidate, BonsaiErrors> {
     let p = work.p;
-    let scored: Vec<Candidate> = pairs
-        .par_iter()
-        .map_init(
-            || PairScratch::new(p),
-            |scratch, &(a, b)| {
-                score_pair(work, members, a, b, merge, scratch).map(|scan| scan.best)
-            },
-        )
-        .collect::<Result<Vec<_>, BonsaiErrors>>()?;
+    let scored: Vec<Candidate> = if pairs.len() < PAR_PAIRS_MIN {
+        let mut scratch = PairScratch::new(p);
+        pairs
+            .iter()
+            .map(|&(a, b)| {
+                score_pair(work, members, a, b, merge, &mut scratch).map(|scan| scan.best)
+            })
+            .collect::<Result<Vec<_>, BonsaiErrors>>()?
+    } else {
+        pairs
+            .par_iter()
+            .map_init(
+                || PairScratch::new(p),
+                |scratch, &(a, b)| {
+                    score_pair(work, members, a, b, merge, scratch).map(|scan| scan.best)
+                },
+            )
+            .collect::<Result<Vec<_>, BonsaiErrors>>()?
+    };
 
     let eligible = |c: &&Candidate| c.gain > min_gain;
     let top = scored

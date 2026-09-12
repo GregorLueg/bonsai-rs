@@ -435,7 +435,11 @@ fn rebuild(
         }
         stack.push((node, true));
         let (lo, hi) = (ptr[node as usize] as usize, ptr[node as usize + 1] as usize);
-        for &child in &kids[lo..hi] {
+        // Pushed last-first so the post-order visits siblings in their arena
+        // order. Siblings of equal height then keep their relative order
+        // through the relabelling, which is what lets `search::spr` recognise
+        // the subtrees a splice left alone by their children alone.
+        for &child in kids[lo..hi].iter().rev() {
             stack.push((child, false));
         }
     }

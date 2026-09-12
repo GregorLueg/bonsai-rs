@@ -150,8 +150,22 @@ pub(crate) fn leaves_below(tree: &Tree) -> Vec<usize> {
 /// ### Returns
 ///
 /// The sorted, deduplicated split words.
+#[cfg(test)]
 pub(crate) fn split_fingerprint(tree: &Tree) -> Vec<u64> {
-    let word = leaf_words(tree);
+    split_fingerprint_with(tree, &leaf_words(tree))
+}
+
+/// [`split_fingerprint`] over words the caller already has.
+///
+/// ### Params
+///
+/// * `tree` - Tree to fingerprint
+/// * `word` - Its [`leaf_words`]
+///
+/// ### Returns
+///
+/// The sorted, deduplicated split words.
+pub(crate) fn split_fingerprint_with(tree: &Tree, word: &[u64]) -> Vec<u64> {
     let total = word[tree.root() as usize];
 
     // Leaf counts, to drop the splits that carry no information.

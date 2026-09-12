@@ -93,12 +93,14 @@ use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place};
 use crate::search::polytomy::{CentreStar, splice_star};
 use crate::search::star::StarParams;
-use crate::search::{Leaves, settled_down, tree_loglik};
+use crate::search::{Leaves, leaf_words, settled_down, split_fingerprint_with, tree_loglik};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
 use crate::utils::simd::prune_binary;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use std::cell::OnceCell;
 
 ////////////////
@@ -117,6 +119,24 @@ use std::cell::OnceCell;
 /// two to four rounds and never more. A hundred is more than an order of
 /// magnitude of headroom on that.
 const DEFAULT_MAX_ROUNDS: usize = 100;
+
+/// Fewest candidates a sweep proposes in parallel before deciding any of them.
+///
+/// A chunk is proposed against one tree and decided in order; the first
+/// accepted move invalidates the rest of its chunk, which is proposed again
+/// against the new tree. So the chunk bounds the work an acceptance throws
+/// away, and it halves on every acceptance down to this. Measured 2026-09-12
+/// on an M1 Max, ten threads, 2048 leaves by 2000 features from a Ward start
+/// at noise 1.6, where one candidate in forty is accepted; see
+/// `PERFORMANCE.md` for the table.
+const PROPOSAL_CHUNK_MIN: usize = 32;
+
+/// Most candidates a sweep proposes in parallel before deciding any of them.
+///
+/// Doubles from [`PROPOSAL_CHUNK_MIN`] on every chunk that accepts nothing,
+/// which on a settled tree is every chunk. Bounds memory rather than waste: a
+/// candidate is a whole arena, so a chunk holds this many trees at once.
+const PROPOSAL_CHUNK_MAX: usize = 256;
 
 /// Which subtree the sweep considers next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -525,6 +545,8 @@ struct LazyRows<'a, T> {
     fresh_m: Vec<T>,
     /// Recomputed down precisions, same layout.
     fresh_w: Vec<T>,
+    /// Loglikelihood contribution of each recomputed row, `[slot]`.
+    fresh_contrib: Vec<f64>,
     /// Up rows, filled a chain at a time.
     up: Vec<OnceCell<Row<T>>>,
     /// Effective leaves, filled as the beam search asks for them.
@@ -608,6 +630,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
             slot,
             fresh_m: vec![T::zero(); dirty.len() * p],
             fresh_w: vec![T::zero(); dirty.len() * p],
+            fresh_contrib: vec![0.0; dirty.len()],
             up: (0..n).map(|_| OnceCell::new()).collect(),
             eff: (0..n).map(|_| OnceCell::new()).collect(),
         };
@@ -629,7 +652,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
             // slab the answer goes into whenever one of them is dirty too.
             let mut m_out = vec![T::zero(); p];
             let mut w_out = vec![T::zero(); p];
-            if children.len() == 2 {
+            let contrib = if children.len() == 2 {
                 prune_binary(
                     children[0].0,
                     children[0].1,
@@ -639,7 +662,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
                     children[1].2,
                     &mut m_out,
                     &mut w_out,
-                );
+                )
             } else {
                 if scratch.len() < p * children.len() {
                     scratch.resize(p * children.len(), 0.0);
@@ -649,13 +672,70 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
                     &mut m_out,
                     &mut w_out,
                     &mut scratch[..p * children.len()],
-                );
-            }
+                )
+            };
             drop(children);
             rows.fresh_m[here..here + p].copy_from_slice(&m_out);
             rows.fresh_w[here..here + p].copy_from_slice(&w_out);
+            rows.fresh_contrib[here / p] = contrib;
         }
         Ok(rows)
+    }
+
+    /// The tree loglikelihood, from the rows.
+    ///
+    /// The same terms [`NodeState::prune`] sums, read off the base state where
+    /// the row was inherited and off the recomputed row where it was not. The
+    /// association differs from the level-wise one `prune` uses, so the two
+    /// agree to rounding and not to the bit; `test_the_incremental_loglik_matches_a_fresh_prune`
+    /// pins how close.
+    ///
+    /// ### Returns
+    ///
+    /// The loglikelihood, up to the dropped additive constants.
+    fn loglik(&self) -> f64 {
+        let mut total = 0.0f64;
+        for v in self.tree.n_leaves()..self.tree.n_nodes() {
+            let old = self.inherited[v];
+            total += if old != NO_NODE {
+                self.base.contribution(old)
+            } else {
+                self.fresh_contrib[self.slot[v] as usize]
+            };
+        }
+        total
+    }
+
+    /// The rows as a settled state of the tree they describe.
+    ///
+    /// Row for row what [`NodeState::prune`] would produce, because every row
+    /// either is one of its rows or was formed through the kernels it
+    /// dispatches to; a copy rather than a sweep, which is what makes accepting
+    /// a move cheaper than proposing one.
+    ///
+    /// ### Returns
+    ///
+    /// The state, ready to propose against.
+    fn into_state(self) -> NodeState<T> {
+        let p = self.p;
+        let n = self.tree.n_nodes();
+        let mut m = vec![T::zero(); n * p];
+        let mut w = vec![T::zero(); n * p];
+        let mut contrib = vec![0.0f64; n];
+        for v in 0..n {
+            let (m_v, w_v) = self.down_row(v as u32);
+            m[v * p..(v + 1) * p].copy_from_slice(m_v);
+            w[v * p..(v + 1) * p].copy_from_slice(w_v);
+            if v >= self.tree.n_leaves() {
+                let old = self.inherited[v];
+                contrib[v] = if old != NO_NODE {
+                    self.base.contribution(old)
+                } else {
+                    self.fresh_contrib[self.slot[v] as usize]
+                };
+            }
+        }
+        NodeState::from_rows(p, self.tree.n_leaves(), m, w, contrib)
     }
 
     /// The down row of one node.
@@ -969,8 +1049,47 @@ fn regraft(
     Ok((tree, centre, to_old))
 }
 
+/// A candidate move, proposed and scored but not yet decided.
+struct Proposal {
+    /// The tree the move produces.
+    tree: Tree,
+    /// Per node of `tree`, the node of the tree the move started from whose
+    /// leaf set it shares, or [`NO_NODE`]; leaves map to themselves.
+    to_old: Vec<u32>,
+    /// The subtree that was pruned, as a node of the tree the move started
+    /// from.
+    pruned: u32,
+    /// Loglikelihood of `tree`, from [`LazyRows::loglik`].
+    loglik: f64,
+}
+
+/// Index a tree's [`leaf_words`] by word.
+///
+/// ### Params
+///
+/// * `word` - One word per node
+///
+/// ### Returns
+///
+/// Word to node.
+fn word_index(word: &[u64]) -> FxHashMap<u64, u32> {
+    word.iter()
+        .enumerate()
+        .map(|(i, &w)| (w, i as u32))
+        .collect()
+}
+
 /// Propose the move that prunes `x` and regrafts it wherever the beam search
-/// likes best.
+/// likes best, and score it.
+///
+/// A proposal whose splits match the current tree's is not a move at all, only
+/// a reoptimisation of the branches the cut and the regraft touched, and is
+/// dropped here; see the module docs for what accepting those costs. The rest
+/// are scored by [`LazyRows::loglik`], which reads the current tree's rows
+/// wherever the candidate's subtrees are the current tree's. Which they are
+/// is settled by leaf set: the candidate's nodes are matched to the current
+/// tree's by [`leaf_words`], and [`LazyRows`] then checks children and
+/// branches one for one before trusting the match.
 ///
 /// A proposal never touches the leaf data. Everything it reads is either the
 /// arena or a row of the tree it starts from, which is what
@@ -990,17 +1109,22 @@ fn regraft(
 /// * `down` - Down rows, settled against `tree`
 /// * `x` - Node to prune
 /// * `params` - Knobs
+/// * `here` - Split fingerprint of `tree`
+/// * `by_word` - [`word_index`] of `tree`
 ///
 /// ### Returns
 ///
-/// The candidate tree, `None` if `x` may not be pruned, or the error the
-/// placement, the primitive or the arena failed with.
+/// The scored candidate, `None` if `x` may not be pruned or the move changes
+/// no split, or the error the placement, the primitive or the arena failed
+/// with.
 fn propose<T: BonsaiFloat>(
     tree: &Tree,
     down: &NodeState<T>,
     x: u32,
     params: &SprParams,
-) -> Result<Option<Tree>, BonsaiErrors> {
+    here: &[u64],
+    by_word: &FxHashMap<u64, u32>,
+) -> Result<Option<Proposal>, BonsaiErrors> {
     let Some(pruned) = prune_subtree(tree, x)? else {
         return Ok(None);
     };
@@ -1027,12 +1151,41 @@ fn propose<T: BonsaiFloat>(
     // reads if there is are the ones the regraft left alone plus the centre's
     // own ancestors.
     let members = attached.children(centre).len() + usize::from(attached.parent(centre).is_some());
-    if members <= crate::search::polytomy::RESOLVED_STAR_MEMBERS {
-        return Ok(Some(attached));
+    let candidate = if members <= crate::search::polytomy::RESOLVED_STAR_MEMBERS {
+        attached
+    } else {
+        let attached_rows = LazyRows::new(&attached, &to_old, tree, down)?;
+        let star = lazy_centre_star(&attached, &attached_rows, centre)?;
+        splice_star(&attached, &star, Some(params.star))?.tree
+    };
+
+    let word = leaf_words(&candidate);
+    let same = split_fingerprint_with(&candidate, &word) == here;
+    if same {
+        return Ok(None);
     }
-    let attached_rows = LazyRows::new(&attached, &to_old, tree, down)?;
-    let star = lazy_centre_star(&attached, &attached_rows, centre)?;
-    Ok(Some(splice_star(&attached, &star, Some(params.star))?.tree))
+
+    let n_leaves = tree.n_leaves();
+    let to_old: Vec<u32> = (0..candidate.n_nodes())
+        .map(|v| {
+            if v < n_leaves {
+                v as u32
+            } else {
+                by_word
+                    .get(&word[v])
+                    .copied()
+                    .filter(|&old| old as usize >= n_leaves)
+                    .unwrap_or(NO_NODE)
+            }
+        })
+        .collect();
+    let loglik = LazyRows::new(&candidate, &to_old, tree, down)?.loglik();
+    Ok(Some(Proposal {
+        tree: candidate,
+        to_old,
+        pruned: x,
+        loglik,
+    }))
 }
 
 ////////////
@@ -1079,14 +1232,28 @@ fn candidate_order(tree: &Tree, params: &SprParams, rng: &mut SplitMix64) -> Vec
 /// is skipped. Everything the scan reads off the tree is settled once and
 /// resettled only where a move actually moved it.
 ///
-/// Each candidate is scored by a fresh [`NodeState::prune`] of the tree it
-/// would produce, so an accepted move is an improvement in the quantity that
-/// actually matters and the sweep is monotone in the loglikelihood by
-/// construction. A candidate whose splits match the current tree's is discarded
-/// before it is scored; see the module docs. The scan is sequential because it
-/// has to be: an accepted move resettles the rows every later candidate is
-/// proposed against, so a candidate cannot be scored until the one before it has
-/// been decided.
+/// A candidate is scored by [`LazyRows::loglik`] on the tree it would produce,
+/// which sums the same per-node terms a fresh [`NodeState::prune`] would and
+/// recomputes only the ones the move changed. An accepted move is therefore an
+/// improvement in the quantity that matters and the sweep is monotone in it.
+/// The one figure that is not incremental is the result's, which is a fresh
+/// prune of the tree the sweep finished on.
+///
+/// ### Chunks
+///
+/// The decisions are sequential and the proposals are not. A candidate must
+/// be decided against the tree as it stands when its turn comes, and an
+/// accepted move changes that tree, so a candidate proposed before an earlier
+/// one was decided may have been proposed against the wrong tree. What makes
+/// parallel proposal safe is refusing to use those: candidates are proposed a
+/// chunk at a time against one tree, decided in order, and at the first
+/// acceptance the rest of the chunk is discarded and proposed again against
+/// the new tree. Every candidate that is decided was proposed against the tree
+/// it is decided against, which is the sequential sweep's invariant, so the
+/// result does not depend on the chunk size or the thread count. The chunk
+/// halves on an acceptance and doubles on a clean chunk, between
+/// [`PROPOSAL_CHUNK_MIN`] and [`PROPOSAL_CHUNK_MAX`], so the work an
+/// acceptance discards tracks how often acceptances come.
 ///
 /// ### Params
 ///
@@ -1106,46 +1273,70 @@ pub fn spr_round<T: BonsaiFloat>(
     let params = params.unwrap_or_default();
     let mut rng = SplitMix64::new(params.seed);
     let mut tree = tree.clone();
-    let mut best = tree_loglik(&tree, leaves)?;
     let mut gains = Vec::new();
 
-    // All three describe the tree as it stands, and a rejected candidate leaves
-    // it exactly as it stands, so they are settled once and again only when a
-    // move is accepted. The scan is sequential, which is what makes that safe.
-    let mut down = settled_down(&tree, leaves)?.0;
-    let mut word = crate::search::leaf_words(&tree);
-    let mut here = crate::search::split_fingerprint(&tree);
+    // All of these describe the tree as it stands, and a rejected candidate
+    // leaves it exactly as it stands, so they are settled once and again only
+    // when a move is accepted.
+    let (mut down, mut best) = settled_down(&tree, leaves)?;
+    let mut word = leaf_words(&tree);
+    let mut here = split_fingerprint_with(&tree, &word);
+    let mut by_word = word_index(&word);
 
-    for want in candidate_order(&tree, &params, &mut rng) {
-        let Some(x) = (0..tree.n_nodes() as u32).find(|&i| word[i as usize] == want) else {
-            continue;
-        };
-        let Some(candidate) = propose(&tree, &down, x, &params)? else {
-            continue;
-        };
-        // Not a move at all, only a reoptimisation of the branches the cut
-        // and the regraft touched; see the module docs for what accepting
-        // those costs.
-        if crate::search::split_fingerprint(&candidate) == here {
-            continue;
-        }
-        let loglik = tree_loglik(&candidate, leaves)?;
-        if loglik > best + params.star.min_gain {
+    let order = candidate_order(&tree, &params, &mut rng);
+    let mut next = 0usize;
+    let mut chunk = PROPOSAL_CHUNK_MIN;
+    while next < order.len() {
+        let end = (next + chunk).min(order.len());
+        let proposals: Vec<Option<Proposal>> = order[next..end]
+            .par_iter()
+            .map(|want| match by_word.get(want) {
+                Some(&x) => propose(&tree, &down, x, &params, &here, &by_word),
+                None => Ok(None),
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut accepted = None;
+        for (k, proposal) in proposals.into_iter().enumerate() {
+            let Some(proposal) = proposal else {
+                continue;
+            };
+            if proposal.loglik <= best + params.star.min_gain {
+                continue;
+            }
             gains.push(SprGain {
-                pruned: x,
-                gain: loglik - best,
+                pruned: proposal.pruned,
+                gain: proposal.loglik - best,
             });
-            best = loglik;
-            tree = candidate;
-            down = settled_down(&tree, leaves)?.0;
-            word = crate::search::leaf_words(&tree);
-            here = crate::search::split_fingerprint(&tree);
+            best = proposal.loglik;
+            let fresh = LazyRows::new(&proposal.tree, &proposal.to_old, &tree, &down)?.into_state();
+            down = fresh;
+            tree = proposal.tree;
+            word = leaf_words(&tree);
+            here = split_fingerprint_with(&tree, &word);
+            by_word = word_index(&word);
+            accepted = Some(k);
+            break;
+        }
+
+        // The rest of a chunk that accepted was proposed against the tree
+        // before the move, so it is proposed again against the tree after it.
+        match accepted {
+            Some(k) => {
+                next += k + 1;
+                chunk = (chunk / 2).max(PROPOSAL_CHUNK_MIN);
+            }
+            None => {
+                next = end;
+                chunk = (chunk * 2).min(PROPOSAL_CHUNK_MAX);
+            }
         }
     }
 
+    let loglik = tree_loglik(&tree, leaves)?;
     Ok(SprResult {
         tree,
-        loglik: best,
+        loglik,
         gains,
         rounds: 1,
     })
@@ -2187,16 +2378,116 @@ mod tests {
                 .expect("prune")
                 .expect("prunable");
             assert_eq!(pruned.tree.n_leaves(), tree.n_leaves() - 1);
-            let candidate = propose(&tree, &down, leaf, &SprParams::default())
-                .expect("propose")
-                .expect("prunable");
-            assert_eq!(candidate.n_leaves(), tree.n_leaves());
+            let word = leaf_words(&tree);
+            let here = split_fingerprint_with(&tree, &word);
+            let Some(candidate) = propose(
+                &tree,
+                &down,
+                leaf,
+                &SprParams::default(),
+                &here,
+                &word_index(&word),
+            )
+            .expect("propose") else {
+                continue;
+            };
+            assert_eq!(candidate.tree.n_leaves(), tree.n_leaves());
             // Regrafting is a proposal, not an acceptance, so it is allowed to
             // come back worse; what it may not come back is malformed.
-            let _ = tree_loglik(&candidate, leaves).expect("loglik");
+            let _ = tree_loglik(&candidate.tree, leaves).expect("loglik");
             checked += 1;
         }
         assert!(checked > 0);
+    }
+
+    #[test]
+    fn test_the_incremental_loglik_matches_a_fresh_prune() {
+        // Every candidate a round proposes is scored off the current tree's
+        // rows plus the few the move changed, and accepted on that figure. So
+        // the figure has to be the fresh prune's to rounding, and the state an
+        // acceptance builds from the same rows has to be the fresh prune's to
+        // the bit. A ladder start on a small tree makes nearly every candidate
+        // a real move, so the filter passes most of them through.
+        let (p, n) = (96usize, 32usize);
+        let (data, w) = dataset(n, p, 5);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let tree = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let (down, _, _) = settle(&tree, leaves).expect("settle");
+        let word = leaf_words(&tree);
+        let here = split_fingerprint_with(&tree, &word);
+        let by_word = word_index(&word);
+
+        let mut checked = 0usize;
+        for x in 0..tree.n_nodes() as u32 {
+            let Some(proposal) =
+                propose(&tree, &down, x, &SprParams::default(), &here, &by_word).expect("propose")
+            else {
+                continue;
+            };
+            let (fresh, loglik) = settled_down(&proposal.tree, leaves).expect("settle");
+            assert_relative_eq!(proposal.loglik, loglik, max_relative = 1e-12);
+            let built = LazyRows::new(&proposal.tree, &proposal.to_old, &tree, &down)
+                .expect("rows")
+                .into_state();
+            for v in 0..proposal.tree.n_nodes() as u32 {
+                assert_eq!(
+                    built.means(v),
+                    fresh.means(v),
+                    "means at node {v} of candidate {x}"
+                );
+                assert_eq!(built.precisions(v), fresh.precisions(v));
+            }
+            checked += 1;
+        }
+        assert!(checked > n, "only {checked} candidates exercised");
+    }
+
+    #[test]
+    fn test_the_sweep_is_deterministic_whatever_the_thread_count() {
+        // Proposals run a chunk at a time in parallel and an acceptance throws
+        // the rest of its chunk away, so the sweep has to come out the same
+        // however the chunks were scheduled. A ladder is the fixture with real
+        // work in it: tens of accepted moves, most of them inside a chunk.
+        let (p, n) = (128usize, 32usize);
+        let (data, w) = dataset(n, p, 3);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let reference = spr_round(&start, leaves, None).expect("round");
+        // Some sixty candidates and a chunk of thirty-two, so this many moves
+        // cannot all fall on chunk boundaries.
+        assert!(
+            reference.n_moves() >= 8,
+            "the fixture has to accept inside chunks, got {} moves",
+            reference.n_moves()
+        );
+
+        for threads in [1usize, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let got = pool.install(|| spr_round(&start, leaves, None).expect("round"));
+            assert_eq!(
+                splits(&got.tree),
+                splits(&reference.tree),
+                "topology moved at {threads} threads"
+            );
+            assert_eq!(got.tree.branches(), reference.tree.branches());
+            assert_eq!(got.loglik.to_bits(), reference.loglik.to_bits());
+            assert_eq!(got.n_moves(), reference.n_moves());
+            for (a, b) in got.gains.iter().zip(&reference.gains) {
+                assert_eq!(a.pruned, b.pruned);
+                assert_eq!(a.gain.to_bits(), b.gain.to_bits());
+            }
+        }
     }
 
     #[test]

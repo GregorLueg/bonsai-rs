@@ -36,6 +36,13 @@ pub struct NodeState<T> {
     /// a smaller leaf set: the constructor takes a node count, so it cannot
     /// check this itself.
     n_leaf_rows: usize,
+    /// Per-node loglikelihood contributions, the terms `prune` sums. Zero at
+    /// the leaves and at any internal node not yet pruned.
+    ///
+    /// Kept so a tree that differs from this one at a few nodes can be scored
+    /// by summing these where it agrees and recomputing where it does not,
+    /// which is what search step 5 does with its candidates.
+    contrib: Vec<f64>,
     /// Scratch for the polytomy path, grown on demand.
     scratch: Vec<f64>,
 }
@@ -92,8 +99,65 @@ impl<T: BonsaiFloat> NodeState<T> {
             p,
             n_nodes,
             n_leaf_rows,
+            contrib: vec![0.0; n_nodes],
             scratch: Vec::new(),
         })
+    }
+
+    /// Assemble a state from rows that are already settled.
+    ///
+    /// No validation beyond the lengths, because the one caller is
+    /// [`crate::search::spr`], which forms the rows through the same kernels
+    /// [`NodeState::prune`] dispatches to and is tested bit for bit against it.
+    ///
+    /// ### Params
+    ///
+    /// * `p` - Number of features
+    /// * `n_leaf_rows` - Number of leaf rows, which `prune` checks against the
+    ///   tree it is handed
+    /// * `m` - Effective means, `[node][feature]`, row-major, every row settled
+    /// * `w` - Effective precisions, same layout
+    /// * `contrib` - Per-node loglikelihood contributions, one per node
+    ///
+    /// ### Returns
+    ///
+    /// The state.
+    ///
+    /// ### Panics
+    ///
+    /// If the three lengths do not describe the same node count.
+    pub(crate) fn from_rows(
+        p: usize,
+        n_leaf_rows: usize,
+        m: Vec<T>,
+        w: Vec<T>,
+        contrib: Vec<f64>,
+    ) -> Self {
+        assert_eq!(m.len(), w.len());
+        assert_eq!(m.len(), contrib.len() * p);
+        Self {
+            n_nodes: contrib.len(),
+            m,
+            w,
+            p,
+            n_leaf_rows,
+            contrib,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// One node's loglikelihood contribution from the last `prune`.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node whose term is wanted
+    ///
+    /// ### Returns
+    ///
+    /// The term, zero for a leaf.
+    #[inline]
+    pub fn contribution(&self, node: u32) -> f64 {
+        self.contrib[node as usize]
     }
 
     /// Number of features.
@@ -194,7 +258,7 @@ impl<T: BonsaiFloat> NodeState<T> {
             let (start, end) = tree.level(level);
             let mut level_total = 0.0f64;
             for node in start..end {
-                level_total += prune_node_into(
+                let here = prune_node_into(
                     tree,
                     node as u32,
                     self.p,
@@ -202,6 +266,8 @@ impl<T: BonsaiFloat> NodeState<T> {
                     &mut self.w,
                     &mut self.scratch,
                 );
+                self.contrib[node] = here;
+                level_total += here;
             }
             total += level_total;
         }

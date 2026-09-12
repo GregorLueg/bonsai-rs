@@ -2,8 +2,40 @@
 //!
 //! Portable SIMD via the `wide` crate. This is the only file in the crate that
 //! names a `wide` type; algorithm code stays generic over [`BonsaiSimd`].
+//!
+//! ### What is vectorised, and why those two
+//!
+//! Two kernels: [`edge_newton_simd`], which the bracketed branch-length solve
+//! calls 35 to 45 times per candidate pair, and the `f32` binary prune. Nothing
+//! else, because nothing else runs often enough to matter.
+//!
+//! Picking those by call count rather than by how vectorisable they looked is
+//! the whole trick. `model::merge::MergeScratch::split_derivative` reads like
+//! the hot loop and is not: instrumenting `benches/merge_scan.rs` puts it at
+//! **0.07 calls per pair**, because a pair whose total branch length is zero,
+//! or whose split is optimal at a bracket end, never reaches the bisection. A
+//! `wide::f64x4` tier written for it measured flat, as did batching its
+//! reciprocals. The same `f64x4` treatment applied to `edge_newton` took 14 per
+//! cent off the merge scan.
+//!
+//! The compiler will not do this for you. `edge_newton` and `split_derivative`
+//! both accumulate into floating-point reductions that LLVM may not reorder, so
+//! neither is auto-vectorised: scalar divides on aarch64, and on x86-64 the same
+//! at baseline, at `x86-64-v3` and at `x86-64-v4`.
+//!
+//! ### Lane width is set by the target, not by the source
+//!
+//! `wide` compiles to the baseline instruction set. On aarch64 that is NEON, so
+//! an `f64x4` is two registers and an `f32x8` is two. On x86-64 with no
+//! `target-cpu` it is SSE2, and `benches/prune_sweep.rs` built for x86-64 shows
+//! it: 104 128-bit operations at the baseline against 22 256-bit ones at
+//! `x86-64-v3`. `x86-64-v4` is identical to v3, because an `f32x8` already fills
+//! a 256-bit register.
+//!
+//! So AVX2 would widen both kernels on x86 and AVX-512 would need an `f32x16`
+//! and an `f64x8` to reach. Neither is measured; there is no x86 machine here.
 
-use wide::f32x8;
+use wide::{f32x8, f64x4};
 
 use crate::utils::kernels::prune_binary_scalar;
 use crate::utils::traits::BonsaiFloat;
@@ -85,8 +117,9 @@ fn store8(v: f32x8, s: &mut [f32]) {
 }
 
 impl BonsaiSimd for f64 {
-    /// `f64` storage runs the scalar path, on measurement rather than by
-    /// oversight. See the module docs.
+    /// `f64` storage has no vector tier and runs the scalar path.
+    ///
+    /// No measurement says it should not have one; see the module docs.
     #[inline]
     fn prune_binary_simd(
         m_k: &[f64],
@@ -183,6 +216,90 @@ impl BonsaiSimd for f32 {
     }
 }
 
+/// Lanes in the `f64` vector type.
+const LANES_F64: usize = 4;
+
+/// Load four consecutive `f64` into a vector register.
+///
+/// ### Params
+///
+/// * `s` - Slice of at least four elements
+///
+/// ### Returns
+///
+/// The first four elements as a vector.
+#[inline(always)]
+fn load4(s: &[f64]) -> f64x4 {
+    f64x4::from([s[0], s[1], s[2], s[3]])
+}
+
+/// One Newton evaluation of the branch-length stationarity condition,
+/// vectorised.
+///
+/// Semantics are identical to [`crate::utils::kernels::edge_newton`]; see that
+/// function for the equations.
+///
+/// This is the kernel the search spends its time in. Instrumenting
+/// `benches/merge_scan.rs` gives **35 to 45 calls per candidate pair**, against
+/// 0.07 for `model::merge::MergeScratch::split_derivative` and one each for
+/// `prep_edge` and the peel: `model::branch::optimise_edge` is a bracketed
+/// Newton and every iteration is one pass over the feature axis.
+///
+/// Four lanes, two lane accumulators, reduced in a fixed order so the result
+/// does not depend on how the work was scheduled. Accumulation stays in `f64`.
+///
+/// Measured 2026-09-12 on an M1 Max against the scalar tier:
+///
+/// | bench | scalar | here |
+/// |---|---|---|
+/// | `kernels`, ns per feature | 0.95 | 0.71 |
+/// | `merge_scan`, 8192 by 2000, ms | 1365 | 1168 |
+/// | `pipeline`, 2048 by 2000, s | 71.4 | 65.7 |
+///
+/// So a third off the kernel, 14 per cent off the merge scan and 8 per cent off
+/// the whole run. Trees and loglikelihoods are unchanged across all ten
+/// `pipeline` configurations.
+///
+/// ### Params
+///
+/// * `s` - Summed inverse precisions from `prep_edge`, length `p`
+/// * `d` - Squared separations from `prep_edge`, length `p`
+/// * `t` - Branch length at which to evaluate
+///
+/// ### Returns
+///
+/// The pair `(f(t), f'(t))`.
+pub fn edge_newton_simd(s: &[f64], d: &[f64], t: f64) -> (f64, f64) {
+    let n = s.len();
+    let n_vec = n - n % LANES_F64;
+
+    let one = f64x4::splat(1.0);
+    let two = f64x4::splat(2.0);
+    let vt = f64x4::splat(t);
+
+    let mut vf = f64x4::splat(0.0);
+    let mut vfp = f64x4::splat(0.0);
+
+    let mut i = 0;
+    while i < n_vec {
+        let r = one / (load4(&s[i..]) + vt);
+        let dr = load4(&d[i..]) * r;
+        vf += r * (one - dr);
+        vfp += r * r * (two * dr - one);
+        i += LANES_F64;
+    }
+
+    let mut f = vf.reduce_add();
+    let mut fp = vfp.reduce_add();
+    for g in n_vec..n {
+        let r = 1.0 / (s[g] + t);
+        let dr = d[g] * r;
+        f += r * (1.0 - dr);
+        fp += r * r * (2.0 * dr - 1.0);
+    }
+    (f, fp)
+}
+
 /// Fused prune of a node with exactly two children, dispatched by storage type.
 ///
 /// ### Params
@@ -232,6 +349,49 @@ mod tests {
             w_l.push(0.05 + (f * 0.19).sin().abs() * 8.0);
         }
         (m_k, w_k, m_l, w_l)
+    }
+
+    #[test]
+    fn test_vector_edge_newton_tracks_the_scalar_one() {
+        use crate::utils::kernels::edge_newton;
+
+        // A length that is not a multiple of the lane count, so the tail runs,
+        // and precisions spanning several orders of magnitude so the reciprocal
+        // is exercised over the range a deep tree produces.
+        let p = 2053usize;
+        let s: Vec<f64> = (0..p)
+            .map(|g| 1e-3 * (1.0 + (g as f64 * 0.37).sin().abs() * 1e4))
+            .collect();
+        let d: Vec<f64> = (0..p)
+            .map(|g| (g as f64 * 0.53).cos().abs() * 9.0)
+            .collect();
+
+        for t in [0.0f64, 1e-9, 0.83, 17.5, 1e6] {
+            let (f_s, fp_s) = edge_newton(&s, &d, t);
+            let (f_v, fp_v) = edge_newton_simd(&s, &d, t);
+            assert_relative_eq!(f_v, f_s, max_relative = 1e-12);
+            assert_relative_eq!(fp_v, fp_s, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_vector_edge_newton_is_deterministic_across_lengths() {
+        // Lane count decides which features take the vector path and which fall
+        // to the tail, so a per-feature-constant input must give a per-feature
+        // constant answer whatever the length. This is the shape of bug
+        // `test_extreme_precisions_do_not_leave_f32_range` pins for the prune.
+        let mut previous: Option<(f64, f64)> = None;
+        for p in [3usize, 4, 7, 8, 64, 1000] {
+            let s = vec![0.25f64; p];
+            let d = vec![1.5f64; p];
+            let (f, fp) = edge_newton_simd(&s, &d, 0.4);
+            let per = (f / p as f64, fp / p as f64);
+            if let Some((wf, wfp)) = previous {
+                assert_relative_eq!(per.0, wf, max_relative = 1e-12);
+                assert_relative_eq!(per.1, wfp, max_relative = 1e-12);
+            }
+            previous = Some(per);
+        }
     }
 
     #[test]

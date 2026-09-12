@@ -6,7 +6,8 @@
 //! there is no call to a general-purpose optimiser anywhere in this crate.
 
 use crate::errors::BonsaiErrors;
-use crate::utils::kernels::{edge_loglik, edge_newton};
+use crate::utils::kernels::edge_loglik;
+use crate::utils::simd::edge_newton_simd as edge_newton;
 
 ////////////
 // Consts //

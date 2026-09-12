@@ -46,6 +46,24 @@ const BRANCH_TOL: f64 = 1e-12;
 /// transcendentals out of the iteration entirely; positivity comes from the
 /// bracket rather than from a change of variable.
 ///
+/// Two details decide the iteration count, which is the cost of every merge,
+/// placement and branch solve in the crate. Both measured 2026-09-12 on the SPR
+/// beam at 1024 leaves by 2000 features, 76752 solves:
+///
+/// - **Where it starts.** `upper` is a maximum over features and sits an order
+///   of magnitude above the root, so from `upper / 2` the first three or four
+///   steps are bisections. The mean of `d - s` over features is the exact
+///   optimum when the features agree and lands inside Newton's basin when they
+///   do not. The neighbour's optimum, which the beam could hand down, was
+///   tried and is worse: 8.3 iterations per solve against 5.8 from the mean.
+/// - **When it stops.** Convergence is tested on the Newton correction before
+///   the safeguard sees it. Near the root the correction points exactly at a
+///   bracket end, the safeguard refuses it as not strictly inside, and the loop
+///   would otherwise bisect a bracket already narrower than the tolerance, one
+///   full pass over the features per halving: seven wasted passes out of
+///   fifteen on a typical solve. 22.4 iterations per solve before, 10.9 after,
+///   5.8 with the mean start as well.
+///
 /// ### Params
 ///
 /// * `s` - Summed inverse precisions from `prep_edge`, length `p`
@@ -85,7 +103,12 @@ pub fn optimise_edge(s: &[f64], d: &[f64], upper: f64) -> Result<f64, BonsaiErro
     }
 
     let (mut lo, mut hi) = (0.0f64, upper);
-    let mut t = 0.5 * upper;
+    let mean: f64 = s.iter().zip(d).map(|(&s_g, &d_g)| d_g - s_g).sum::<f64>() / s.len() as f64;
+    let mut t = if mean > 0.0 && mean < upper {
+        mean
+    } else {
+        0.5 * upper
+    };
     let mut step = upper;
 
     for _ in 0..MAX_NEWTON_ITER {
@@ -97,6 +120,9 @@ pub fn optimise_edge(s: &[f64], d: &[f64], upper: f64) -> Result<f64, BonsaiErro
         }
 
         let newton = t - f / fp;
+        if (newton - t).abs() <= BRANCH_TOL * t.max(BRANCH_TOL) {
+            return Ok(t);
+        }
         let prev = t;
         if newton > lo && newton < hi && (newton - t).abs() < 0.5 * step {
             step = (newton - t).abs();

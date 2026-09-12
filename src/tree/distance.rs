@@ -8,6 +8,15 @@
 //!
 //! So this is the measurement to compare two implementations on, and the one
 //! that would catch a search that found a plausible topology by accident.
+//!
+//! Nothing in the search calls any of this. It is scored once, from
+//! `benches/recovery.rs`, so it is not a target for vectorisation however much
+//! [`data_distances`] and [`pearson`] look like one: a kernel the pipeline never
+//! runs cannot be worth a lane. [`data_distances`] is parallel because it is
+//! `O(pairs * p)` and the ceiling is two million pairs; [`pearson`] is `O(n)`
+//! against that and is left alone.
+
+use rayon::prelude::*;
 
 use crate::tree::Tree;
 use crate::utils::rng::SplitMix64;
@@ -156,7 +165,7 @@ pub fn data_distances<T: BonsaiFloat>(
     pairs: &[(usize, usize)],
 ) -> Vec<f64> {
     pairs
-        .iter()
+        .par_iter()
         .map(|&(i, j)| {
             let (a, b) = (i * n_features, j * n_features);
             let mut acc = 0.0f64;

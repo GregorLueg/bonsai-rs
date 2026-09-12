@@ -100,17 +100,18 @@ const DEFAULT_K: usize = 16;
 /// inside the noise of a machine at load 40.
 const DEFAULT_REBUILD_FRACTION: f64 = 0.5;
 
-/// Cells up to which the exhaustive backend is used.
+/// Cells up to which the exhaustive backend is used; NN-descent above it.
 ///
-/// Measured 2026-09-12, `backend` block of `benches/start_tree.rs`, 2000
-/// features, `k = 16`, two seeds, the three backends interleaved on a machine
-/// at load 50 to 65 so only the ratios are trustworthy: exhaustive 0.78, 1.44,
-/// 5.20 s at 4096, 8192, 16384 against NN-descent 1.33, 2.39, 4.48 s, all three
-/// backends returning the identical tree. The crossover is at 16384 and the
-/// quadratic term takes over from there. kmknn was 2.98, 8.32, 30.32 s, four to
-/// six times exhaustive at every size, because k-means pruning does nothing at
-/// this dimension; it stays available but is never chosen.
-const EXHAUSTIVE_MAX_CELLS: usize = 16_384;
+/// **Provisional.** The only timings taken so far (`backend` block of
+/// `benches/start_tree.rs`, 2026-09-12) were at load 50 to 65 and are not
+/// usable for placing the crossover. What is usable from that run is
+/// load-independent: at 4096, 8192 and 16384 leaves by 2000 features,
+/// `k = 16`, NN-descent's graph produced the identical tree to the exhaustive
+/// one, so nothing the linkage can see is lost by switching. kmknn is out of
+/// the automatic path on the one quiet-machine number there is, 43.82 s at
+/// 8192 against 1.34 s for exhaustive at 4096: k-means pruning buys nothing
+/// at this dimension. The quiet re-run of the crossover is queued.
+const EXHAUSTIVE_MAX_CELLS: usize = 4_096;
 
 /// Metric the graph is built in. Plain Euclidean on the transformed means: the
 /// graph decides which pairs are *considered*, and the linkage that decides
@@ -169,7 +170,7 @@ impl Default for LinkageParams {
 /// Pick a backend from the problem size.
 ///
 /// Exhaustive up to [`EXHAUSTIVE_MAX_CELLS`], NN-descent above it; the
-/// measurement is on the constant.
+/// state of the measurement is on the constant.
 ///
 /// ### Params
 ///

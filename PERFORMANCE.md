@@ -120,6 +120,7 @@ Nothing in the wall-clock numbers said so; it took a run at
 | Merge split by Illinois regula falsi instead of bisection | 58 to 20.5 derivative passes per pair | 2026-09-12 |
 | SPR proposals in parallel chunks, restarted on acceptance, bit-identical | 200.04 s to 24.44 s at 16384 by 2000; `n^1.45` to `n^1.31` | 2026-09-12 |
 | SPR acceptance on the candidate's own terms, rows assembled not swept | 2048 by 2000 at noise 1.6: 127.9 s to 19.1 s with the above | 2026-09-12 |
+| Graph linkage by mutual-nearest-neighbour rounds instead of a chain | at 4096 by 2000, `k = 16`: depth 131 to 12, 248 splits from the dense tree to 0; `k = 8` now suffices where the chain needed 128 | 2026-09-12 |
 
 Three notes on these.
 
@@ -157,6 +158,7 @@ pins it at 1, 3 and 8 threads.
 | Warm-starting the beam's root find from the neighbour's optimum | 8.3 passes per solve against 5.8 from the mean start | 2026-09-12 |
 | Counting sort in SPR's `assemble` | the height sort was never the cost; `Tree::from_parents` is | 2026-09-12 |
 | Parallel pair scan on the four-member star inside the SPR proposal loop | 3.0 ms a resolution summed over threads against 0.7 sequential | 2026-09-12 |
+| Redrawing the linkage graph more often to stop it chaining | fraction 0.9: depth 22 against 11; growth 4x: right tree at 12x the redraws; the chain was the cause, not the cadence | 2026-09-12 |
 
 Two of these deserve their own paragraph.
 
@@ -440,3 +442,150 @@ Below that: the effective-leaf formation (17 per cent, four scalar divisions a
 feature) and `split_derivative` (15 per cent, four more) are the two remaining
 division-bound scalar loops, and `f64x4` division is the obvious tier for
 both, subject to rule 3's measurement.
+
+## The graph linkage, 2026-09-12: it chained, and cadence was not why
+
+Rule 5 again, five for five. The brief said the neighbour-graph Ward linkage
+chains because the graph goes stale between rebuilds, and asked for a cadence
+sweep first. The sweep was run; the cadence was not the cause.
+
+Exhaustive backend, 2000 features, two seeds, the drift block of
+`benches/start_tree.rs`. `dense d` is the depth of the dense Ward tree, which
+recovers the balanced generator exactly, so it is also `log2(n)`.
+
+**Every seconds column in this section was taken on a machine at load 13 to
+65** (another agent was running Sanity preprocessing on eight threads).
+Depth, Robinson-Foulds and the trace are exact whatever the load; the seconds
+are order-of-magnitude sanity checks and nothing else. The quiet re-runs are
+listed at the end.
+
+### The chain, as it was
+
+| leaves | k | build s | to dense | depth | dense d |
+|---|---|---|---|---|---|
+| 512 | 16 | 0.09 | 10 | 13.5 | 9 |
+| 1024 | 16 | 0.19 | 44 | 29.5 | 10 |
+| 2048 | 16 | 0.46 | 104 | 56.5 | 11 |
+| 4096 | 16 | 1.32 | 248 | 131.0 | 12 |
+
+The cadence sweep at `k = 16`, with the halving fraction raised and with a new
+trigger that redraws once any cluster has grown to a multiple of its size when
+its list was drawn:
+
+| leaves | fraction | growth | build s | to dense | depth |
+|---|---|---|---|---|---|
+| 2048 | 0.50 | off | 0.45 | 104 | 56.5 |
+| 2048 | 0.90 | off | 0.55 | 30 | 22.0 |
+| 2048 | 0.50 | 4 | 2.63 | 0 | 11.0 |
+| 2048 | 0.50 | 2 | 28.82 | 0 | 11.0 |
+
+Raising the fraction helps and does not fix it. The growth trigger fixes it at
+every size from 512 to 2048, at six times the build cost, because it fires 161
+times at 2048 where the halving fires 13. So the depth was a staleness symptom
+and the trigger was the right instinct, but paying for it by redrawing the
+graph was the wrong price. What the trace said:
+
+```
+REBUILD live=2017 deadend  min=1 med=1 max=32
+REBUILD live=1889 deadend  min=1 med=1 max=160
+MERGE   live=1595 sa=160 sb=16 deg_a=18 deg_b=1
+MERGE   live=1594 sa=176 sb=16 deg_a=17 deg_b=1
+```
+
+**The chain is depth-first.** After 31 merges one cluster is size 32 while
+every other cluster is a singleton. A centroid of `s` cells carries `1/s` of
+the noise, and at 2000 features that noise term is 360 in squared distance
+between two leaves against 333 per level of signal, so a big centroid sits
+closer to any leaf than that leaf's own third cousins do and takes a slot in
+every list at the next redraw. Once a block of 16 has merged its listed
+relatives, the big cluster is the only edge it has left (`deg_b=1`), the mutual
+nearest-neighbour test passes trivially, and the block is absorbed. One block
+per merge: a caterpillar.
+
+### The fix
+
+Stop being depth-first. Each round finds every live cluster's nearest listed
+neighbour in parallel, merges every mutually nearest pair, then updates. Ward
+is reducible, so each such pair is one the sequential linkage would merge and
+the dendrogram is identical (the complete-graph test in `tree::linkage` pins
+that). Sizes stay level-synchronous, so no cluster becomes the attractor, and
+the union lists are only ever one level stale.
+
+| leaves | k | build s | to dense | depth | dense d |
+|---|---|---|---|---|---|
+| 512 | 8 to 128 | 0.06 to 0.18 | 0 | 9 | 9 |
+| 1024 | 8 to 128 | 0.12 to 0.28 | 0 | 10 | 10 |
+| 2048 | 8 to 128 | 0.29 to 0.72 | 0 | 11 | 11 |
+| 4096 | 8 to 128 | 0.63 to 1.19 | 0 | 12 | 12 |
+
+Every `k` from 8, every cadence including never redrawing on the count. The
+chain needed `k = 128` for the same row at 4096, and its `k` grew as
+`1.5 sqrt(n)`; the rounds need 8 and it does not grow. The build seconds were
+taken at load 37 to 50 and are pessimistic; the previous table's were at load
+4 to 13.
+
+The hard regime, 2048 leaves, `k = 16`:
+
+| tree | noise | to dense | to truth | depth | dense d | dense to truth |
+|---|---|---|---|---|---|---|
+| balanced | 0.3 | 0 | 0 | 11 | 11 | 0 |
+| balanced | 1.0 | 0 | 112 | 12 | 12 | 112 |
+| balanced | 1.6 | 137 | 1383 | 15 | 14 | 1317 |
+| unbalanced | 0.3 | 0 | 1021 | 14.5 | 14.5 | 1021 |
+| unbalanced | 1.0 | 146 | 1474 | 15 | 14.5 | 1464 |
+
+Identical to dense wherever dense is exact; where they part, the same distance
+to the truth and a depth within one level. The unbalanced generator is where
+Ward itself is far from the truth, which is the refinement's job, not the
+start's.
+
+### The backend crossover, not yet placed
+
+`resolve_backend` carried placeholder thresholds that sent everything above
+4096 cells to kmknn. The `backend` block ran the three backends interleaved
+per seed, at load 50 to 65:
+
+| leaves | exhaustive s | kmknn s | NN-descent s | trees |
+|---|---|---|---|---|
+| 4096 | 0.78 | 2.98 | 1.33 | identical |
+| 8192 | 1.44 | 8.32 | 2.39 | identical |
+| 16384 | 5.20 | 30.32 | 4.48 | identical |
+
+The one load-independent fact in that table is the last column: NN-descent's
+graph builds the identical tree at every size, so switching to it loses
+nothing the linkage can see. The seconds are unusable for placing the
+crossover and were not used for it. kmknn is out of the automatic path on
+the earlier quiet-machine number, 43.82 s at 8192 against 1.34 s for
+exhaustive at 4096; the threshold stays at 4096 with NN-descent above it, and
+is marked provisional on the constant.
+
+### The end-to-end gate, provisional
+
+`steps`, both starts interleaved per seed, load 44 to 57. Sanity check only.
+
+| leaves | start | linkage | 3 poly | 4 branch | 5 spr | 6 nni | 7 branch | total | RF |
+|---|---|---|---|---|---|---|---|---|---|
+| 8192 | dense ward | 26.39 | 0.15 | 5.49 | 15.06 | 1.99 | 0.36 | 49.44 | 0 |
+| 8192 | graph | 1.38 | 0.13 | 5.32 | 13.66 | 1.73 | 0.38 | 22.60 | 0 |
+| 16384 | dense ward | 100.90 | 0.45 | 10.55 | 40.81 | 3.90 | 0.68 | 157.29 | 0 |
+| 16384 | graph | 3.70 | 0.31 | 9.88 | 35.97 | 3.27 | 0.67 | 53.80 | 0 |
+
+Consistent with SPR at parity between the two starts (the chain start was 3
+to 7x the dense one) and with the linkage no longer setting the asymptote,
+but the machine was at load 50 and the gate is not passed until it is re-run
+quiet.
+
+### Queued for a quiet machine
+
+1. `cargo bench --bench start_tree -- steps`, the gate.
+2. `cargo bench --bench start_tree -- backend`, to place `EXHAUSTIVE_MAX_CELLS`.
+3. `cargo bench --bench start_tree -- drift`, for the build-seconds columns
+   and the cost of the halving redraw against the dry-list one alone.
+
+### What did not work
+
+| attempt | why not |
+|---|---|
+| Raising the halving fraction to 0.9 | depth 22 against 11 at 2048; the graph was not stale, the chain was lopsided |
+| Redrawing once a cluster has grown 4x since its list was drawn | correct tree, 161 redraws for 13, six times the build |
+| Redrawing at 2x growth | correct tree, sixty times the build |

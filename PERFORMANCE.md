@@ -833,18 +833,59 @@ pipeline change can remove them and none should**; resolving them would be
 adding structure the data does not support, which is the failure this method
 advertises itself against.
 
+### Where the collapse should go, if it goes anywhere
+
+The open question above was whether collapsing before the search changes what
+the search finds. Measured at 10k, three arms on the same data and seed, quiet
+box throughout (linkage 5.77 to 6.15 s across the arms, so comparable).
+
+| | no collapse | collapse late, on the finished tree | collapse early, step 4.5 |
+|---|---|---|---|
+| Robinson-Foulds | 2659 | 2632 | **2614** |
+| distance recovery | **0.466268** | 0.466231 | 0.465463 |
+| final loglik | -11253193.873 | **-11253188.256** | -11253191.449 |
+| total seconds | **616.26** | 619.0 | 863.63 |
+| 5 spr seconds | **451.01** | 451.01 | 589.28 |
+| 5 spr rounds, moves | 12, 4755 | 12, 4755 | 14, 4227 |
+| 6 nni seconds | **106.22** | 106.22 | 169.02 |
+| 6 nni moves | 47 | 47 | 75 |
+| final zero leaf, internal | 129, 32 | 129, **0** | 117, 25 |
+
+**The same pass is a different size depending on where it runs.** At step 4.5 it
+takes 19,998 nodes to 17,747, so 2,251 removed, 64 resolutions worth 628 nats,
+26 s. On the finished tree the identical call removes 25. So 2,251 of the 2,389
+zero branches step 4 makes are internal and collapsible, and step 5 currently
+absorbs nearly all of them itself as a side effect of its regrafts.
+
+Early collapse wins on Robinson-Foulds, 45 splits over no collapse and 18 over
+collapsing late, so the search does build on structure the data does not
+support. Three things stop that being a recommendation.
+
+- **It costs 247 s, 40 per cent, and SPR got slower on the smaller tree**: 589 s
+  against 451, fewer moves over more rounds. The collapsed tree has genuine
+  high-degree polytomies where the uncollapsed one had chains of zero-length
+  binary nodes, so every regraft landing near one pays a bigger star
+  resolution. Removing 2,251 nodes bought quality, not speed.
+- **Distance recovery moves the other way**, 0.465463 against 0.466268. Small,
+  and the two metrics measure different things, but they disagree.
+- **One seed.** 45 splits is 0.2 per cent of 19,994, and there is no
+  seed-to-seed spread at 10k to compare it against; the recorded spread is three
+  to five splits at 2,048 leaves. Whether 45 at 10,000 clears it is unmeasured
+  and needs a second 863 s run.
+
 ### What is left for the owner
 
 Two separable decisions, and only the first is about the pipeline order.
 
-1. A **collapse** after step 4, or after step 7, buys 27 splits at 10k and 2 at
-   5k for under 3 s, and it only ever removes structure, so it cannot
-   hallucinate. Smaller than re-running step 3 and it does not touch the order
-   `src/bonsai.rs` calls not negotiable. Unmeasured: whether collapsing before
-   step 5 rather than after changes what the search then finds. That needs a
-   full run and was not done.
-2. The 129 zero-length leaf edges stay. If they render badly, the answer is in
-   the rendering or in the caveat, not in the search.
+1. **Late collapse** is the cheap, safe option: 2.75 s, 27 splits at 10k and 2
+   at 5k, drives the internal zero edges to zero, and cannot affect the search
+   because it runs after it. **Early collapse** is 18 splits better again for
+   247 s and a small loss in distance recovery, and it changes what the search
+   sees, which is the part wanting a second seed before anyone commits. Neither
+   touches the step order `src/bonsai.rs` calls not negotiable; both are an
+   addition rather than a rearrangement.
+2. The 129 zero-length leaf edges stay whatever is decided. If they render
+   badly, the answer is in the rendering or in the caveat, not in the search.
 
 Nothing in the pipeline was changed. Both probes (`harness leak` and
 `harness resolve`) live in a scratchpad copy of the comparison harness, not in

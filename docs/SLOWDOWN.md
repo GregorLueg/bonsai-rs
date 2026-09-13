@@ -26,8 +26,10 @@ for about 24 days and blocks the two 5k replicates behind it. Kill it.**
 Ninety-one of the hundred rounds at 10k did nothing, which is roughly 1900 s of
 the 2129 s. With a sane floor SPR at 10k should be on the order of nine rounds,
 about 200 s at the measured 21 s a round, and the pipeline about 3x the 5k time
-for 2x the cells rather than 14.5x. That is an inference from the per-round
-cost; the whole-pipeline number at a raised floor is being measured now.
+for 2x the cells rather than 14.5x. That was an inference from the per-round
+cost when written; the coordinator's floored 10k run (measured 2026-09-13,
+their numbers, not mine) came in 3.87x faster end to end with a tree 37 nats
+better, and NNI at 47 moves and 106 s instead of 89 and 199.
 
 The linkage start is **not** degrading: mean leaf depth is `log2(n) + 0.24` at
 both 5k and 10k, and Robinson-Foulds to the truth is 40.1 and 42.3 per cent of
@@ -189,6 +191,19 @@ The mechanism, from the code and the resume table:
   to `n`, so this is not a cliff at 10k. 5k converged at round 9 because its
   round 9 happened to round negative on every neutral candidate; the resumed
   5k round also found nothing. That is luck, not a margin.
+- **The zero-length branches are not SPR's doing** (added 16:00, from the
+  coordinator's floored 10k run). With the cycle removed the post-SPR tree has
+  688 zero-length branches and 32 polytomies against 684 and 35, under one per
+  cent of movement, so the pool predates the churn. The 1250 and 2500 rungs
+  agree: after step 4 and before any SPR they already carry 282 and 558
+  zero-length branches, 23 per cent of the edges. The likely source, not yet
+  confirmed by anyone: `tree::linkage` sets every branch to 1.0, so step 3's
+  resolver runs on a tree with nothing to resolve (measured `gain 0.00` on the
+  linkage path at both sizes), and step 4 then drives a fifth of the branches
+  to exactly zero after the resolver has already had its turn. SPEC.md section
+  6 says zero branches from the solve are expected; section 9.2's resolver is
+  meant to consume them and on this path it never sees them. The implementer
+  is testing that with a three-stage run.
 - Raising the floor to `1e-4` stops it dead on the same tree.
 
 What this does **not** yet say, and the ladder will: how many of the 4843 moves
@@ -210,14 +225,26 @@ the count over 1250, 5000 (native) and 10000 is 8, 20, 89, which is `n^0.66`
 then `n^2.15`; the 2500 and 5000 subsample rungs will say whether that knee is
 real or a seed effect.
 
-Not settled: whether the count grows because SPR left more behind at 10k or
-because the interchange neighbourhood grows. The obvious reading, that the
-truncated SPR left work for NNI, is **not** supported: by round 10 SPR at 10k
-was in the noise regime and was not going to find those interchanges in
-another thousand rounds; every one of the 89 NNI moves is a move SPR's beam
-does not propose. The subsample ladder (1250, 2500, 5000 cells drawn from the
-10k Sanity output, same genes, same noise) gives NNI moves against `n` with
-the preprocessing held fixed, and is running.
+**Corrected 2026-09-13 16:00, after the floor fix was measured.** The first
+version of this section said: "the obvious reading, that the truncated SPR
+left work for NNI, is not supported: by round 10 SPR at 10k was in the noise
+regime and was not going to find those interchanges in another thousand
+rounds; every one of the 89 NNI moves is a move SPR's beam does not propose."
+That was an inference, flagged as one, and it was wrong. With the
+scale-relative floor in place NNI at 10k performs **47 moves, not 89**, and
+takes 106 s instead of 199. So about half the interchanges were cleaning up
+after the cycle: 91 rounds of making and unmaking polytomies left the tree in
+a state SPR itself would never have reached, and the beam's failure to find
+those moves was a consequence of the churn, not evidence of a different
+neighbourhood. The remaining 47 against 20 at 5k is still 2.35x for 2x cells
+and is the part that is unexplained; the seed spread at 1250 (8 and 1) says
+one run per size cannot pin an exponent on it.
+
+The lesson for the record: "SPR could not have found these" was argued from
+what SPR was doing in the noise rounds, not from what the tree looked like
+after them. The measurement that would have settled it before the fix was a
+NNI-only run from a tree at the raised floor, which was available at 12:44
+(`resume_10k_mg1e-4.log`) and was not run.
 
 ### 3. Linkage start: settled, does not degrade
 
@@ -290,11 +317,12 @@ default floor exactly as 2500 did.
   remaining 91 rounds accepted one to a few noise moves each. The floored 10k
   run the coordinator started will give the measured figure.
 - Why NNI's move count grows superlinearly: 8 and 1 at 1250 (two seeds), 20 at
-  5k native, 89 at 10k native. The seed-to-seed spread at 1250 is a factor of
+  5k native, 47 at 10k native once the SPR cycle is gone (89 before; see the
+  correction in section 2). The seed-to-seed spread at 1250 is a factor of
   eight, so nothing about the exponent can be said from three sizes and four
-  runs. It is real work (all gains above 0.08 nats), it is 8 per cent of the
-  10k run, and its per-round cost is linear, so a fix would be to cut the
-  round count, not the round. Not urgent.
+  runs. It is real work (all gains above 0.08 nats), its per-round cost is
+  linear, so a fix would be to cut the round count, not the round. Not
+  urgent; the ladder on the fixed floor is the measurement.
 - Any exponent on native realistic data beyond the two rungs; the 10k rung is
   contaminated by the SPR tail.
 - Whether the 91 noise rounds changed the 10k tree's quality. RF after SPR is

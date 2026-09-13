@@ -41,6 +41,10 @@ use crate::tree::cluster::reroot_for_display;
 use crate::tree::linkage::{LinkageParams, linkage_tree};
 use crate::utils::traits::{BonsaiFloat, narrow};
 
+////////////
+// Consts //
+////////////
+
 /// Branch length the initial star hangs every leaf on, before step 1 optimises
 /// it.
 ///
@@ -50,25 +54,29 @@ use crate::utils::traits::{BonsaiFloat, narrow};
 /// so a branch of one is a diffusion of one signal standard deviation.
 const INITIAL_STAR_BRANCH: f64 = 1.0;
 
+//////////////////
+// BonsaiParams //
+//////////////////
+
 /// Knobs for the whole pipeline, one field per stage.
 ///
 /// Every field has its own documented `Default`, so the usual call passes
 /// `None` and never names any of them.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BonsaiParams {
-    /// Feature selection and the scale transform (SPEC.md section 3).
+    /// Feature selection and the scale transform.
     pub ingest: IngestParams,
     /// How the initial topology is built, steps 1 and 2 or a linkage.
     pub start: StartTree,
     /// Knobs for the linkage, ignored unless `start` selects it.
     pub linkage: LinkageParams,
-    /// The greedy star primitive (section 9.1) and polytomy resolution (9.2).
+    /// The greedy star primitive and polytomy resolution.
     ///
     /// Steps 2 and 3 only. Steps 5 and 6 run the same primitive but take their
     /// settings from `spr.star` and `nni.star`, so raising `min_gain` here
     /// leaves their move-acceptance floor at the default.
     pub star: StarParams,
-    /// Candidate-pair restriction (section 11).
+    /// Candidate-pair restriction.
     ///
     /// Not optional in practice. Scanning every pair makes step 2 `O(n^3 p)`
     /// and 94 per cent of the runtime; measured, it scales as `n^2.9` without
@@ -91,6 +99,10 @@ pub struct BonsaiParams {
     pub reroot: bool,
 }
 
+///////////////
+// StartTree //
+///////////////
+
 /// How the initial topology is built.
 ///
 /// Search steps 1 and 2, or a linkage in their place. The refinement of steps 3
@@ -109,6 +121,10 @@ pub enum StartTree {
     Linkage,
 }
 
+////////////////
+// StepReport //
+////////////////
+
 /// What one step of the search cost and what it bought.
 #[derive(Clone, Copy, Debug)]
 pub struct StepReport {
@@ -125,6 +141,10 @@ pub struct StepReport {
     /// crossing an FFI boundary.
     pub gain: f64,
 }
+
+//////////////////
+// BonsaiResult //
+//////////////////
 
 /// A finished reconstruction.
 #[derive(Clone, Debug)]
@@ -158,10 +178,104 @@ impl<T: BonsaiFloat> BonsaiResult<T> {
     }
 }
 
+/////////////
+// Helpers //
+/////////////
+
+/// Append a step report, computing its gain from the previous one.
+///
+/// ### Params
+///
+/// * `step` - Which of the seven steps
+/// * `loglik` - Loglikelihood after it
+/// * `steps` - Reports so far
+fn record(step: &'static str, loglik: f64, steps: &mut Vec<StepReport>) {
+    let gain = steps.last().map_or(0.0, |last| loglik - last.loglik);
+    steps.push(StepReport { step, loglik, gain });
+}
+
+/// A star tree over `n_leaves` cells, every branch at [`INITIAL_STAR_BRANCH`].
+///
+/// ### Params
+///
+/// * `n_leaves` - Number of cells
+///
+/// ### Returns
+///
+/// The star, or `EmptyInput` if there are fewer than two cells.
+fn star_of(n_leaves: usize) -> Result<Tree, BonsaiErrors> {
+    if n_leaves < 2 {
+        return Err(BonsaiErrors::EmptyInput {
+            n_cells: n_leaves,
+            n_features: 0,
+        });
+    }
+    let mut parent = vec![n_leaves as u32; n_leaves];
+    parent.push(crate::tree::NO_NODE);
+    let mut branch = vec![INITIAL_STAR_BRANCH; n_leaves];
+    branch.push(0.0);
+    Tree::from_parents(parent, branch, n_leaves)
+}
+
+/// Optimise every branch length in place.
+///
+/// ### Params
+///
+/// * `tree` - Tree to optimise, modified in place
+/// * `leaves` - Transformed leaf data
+/// * `params` - Pipeline knobs, for the branch-length settings
+///
+/// ### Returns
+///
+/// The loglikelihood at the optimum.
+fn optimise_all<T: BonsaiFloat>(
+    tree: &mut Tree,
+    leaves: Leaves<'_, T>,
+    params: &BonsaiParams,
+) -> Result<f64, BonsaiErrors> {
+    let mut state = NodeState::new(
+        tree.n_nodes(),
+        leaves.n_features,
+        leaves.means,
+        leaves.precisions,
+    )?;
+    optimise_branch_lengths(tree, &mut state, Some(params.branch))
+}
+
+/// Posterior mean and standard deviation for every node, in raw units.
+///
+/// The posterior at a node is the whole tree collapsed onto it, which is what
+/// [`collapse_onto_every_node`] computes; this turns its precisions into
+/// standard deviations and both blocks back into the caller's units.
+///
+/// ### Params
+///
+/// * `tree` - The finished tree
+/// * `leaves` - Transformed leaf data
+/// * `data` - The ingest result, for converting back to raw units
+///
+/// ### Returns
+///
+/// Means and standard deviations, row-major `[node][feature]`, raw units.
+fn posteriors<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+    data: &PreparedData<T>,
+) -> Result<(Vec<T>, Vec<T>), BonsaiErrors> {
+    let (means, precisions) =
+        collapse_onto_every_node(tree, leaves.means, leaves.precisions, leaves.n_features)?;
+    let sds: Vec<T> = precisions.iter().map(|&w| narrow(1.0 / w.sqrt())).collect();
+    Ok((data.restore_scale(&means)?, data.restore_scale(&sds)?))
+}
+
+////////////
+// Bonsai //
+////////////
+
 /// Reconstruct a tree from a matrix of measurements and their error bars.
 ///
-/// The whole pipeline: ingest (SPEC.md section 3), the seven search steps of
-/// section 9, and the collapse this crate adds after them.
+/// The whole pipeline: ingest, the seven search steps of, and the collapse this
+/// crate adds after them.
 ///
 /// ### Params
 ///
@@ -269,14 +383,13 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
 
 /// Run the refinement steps on a tree that already exists.
 ///
-/// Steps 3 to 7 of SPEC.md section 9: resolve polytomies, optimise the branch
-/// lengths, SPR, NNI, optimise again. Steps 1 and 2 build a tree from nothing;
-/// this improves one that is already there.
+/// Resolve polytomies, optimise the branch lengths, SPR, NNI, optimise again.
+/// Steps 1 and 2 build a tree from nothing; this improves one that is already
+/// there.
 ///
-/// That is what backbone mode's final pass needs (SPEC.md section 15), and what
-/// a caller with a tree from elsewhere wants. The paper recommends seeding
-/// the search with cells grouped by an external clustering, which is the same
-/// entry point.
+/// That is what backbone mode's final pass needs, and what a caller with a tree
+/// from elsewhere wants. The paper recommends seeding the search with cells
+/// grouped by an external clustering, which is the same entry point.
 ///
 /// The returned `steps` start at step 3, since 1 and 2 did not happen.
 ///
@@ -398,92 +511,6 @@ fn refine_from<T: BonsaiFloat>(
         node_sds,
         steps,
     })
-}
-
-/// Append a step report, computing its gain from the previous one.
-///
-/// ### Params
-///
-/// * `step` - Which of the seven steps
-/// * `loglik` - Loglikelihood after it
-/// * `steps` - Reports so far
-fn record(step: &'static str, loglik: f64, steps: &mut Vec<StepReport>) {
-    let gain = steps.last().map_or(0.0, |last| loglik - last.loglik);
-    steps.push(StepReport { step, loglik, gain });
-}
-
-/// A star tree over `n_leaves` cells, every branch at [`INITIAL_STAR_BRANCH`].
-///
-/// ### Params
-///
-/// * `n_leaves` - Number of cells
-///
-/// ### Returns
-///
-/// The star, or `EmptyInput` if there are fewer than two cells.
-fn star_of(n_leaves: usize) -> Result<Tree, BonsaiErrors> {
-    if n_leaves < 2 {
-        return Err(BonsaiErrors::EmptyInput {
-            n_cells: n_leaves,
-            n_features: 0,
-        });
-    }
-    let mut parent = vec![n_leaves as u32; n_leaves];
-    parent.push(crate::tree::NO_NODE);
-    let mut branch = vec![INITIAL_STAR_BRANCH; n_leaves];
-    branch.push(0.0);
-    Tree::from_parents(parent, branch, n_leaves)
-}
-
-/// Optimise every branch length in place.
-///
-/// ### Params
-///
-/// * `tree` - Tree to optimise, modified in place
-/// * `leaves` - Transformed leaf data
-/// * `params` - Pipeline knobs, for the branch-length settings
-///
-/// ### Returns
-///
-/// The loglikelihood at the optimum.
-fn optimise_all<T: BonsaiFloat>(
-    tree: &mut Tree,
-    leaves: Leaves<'_, T>,
-    params: &BonsaiParams,
-) -> Result<f64, BonsaiErrors> {
-    let mut state = NodeState::new(
-        tree.n_nodes(),
-        leaves.n_features,
-        leaves.means,
-        leaves.precisions,
-    )?;
-    optimise_branch_lengths(tree, &mut state, Some(params.branch))
-}
-
-/// Posterior mean and standard deviation for every node, in raw units.
-///
-/// The posterior at a node is the whole tree collapsed onto it, which is what
-/// [`collapse_onto_every_node`] computes; this turns its precisions into
-/// standard deviations and both blocks back into the caller's units.
-///
-/// ### Params
-///
-/// * `tree` - The finished tree
-/// * `leaves` - Transformed leaf data
-/// * `data` - The ingest result, for converting back to raw units
-///
-/// ### Returns
-///
-/// Means and standard deviations, row-major `[node][feature]`, raw units.
-fn posteriors<T: BonsaiFloat>(
-    tree: &Tree,
-    leaves: Leaves<'_, T>,
-    data: &PreparedData<T>,
-) -> Result<(Vec<T>, Vec<T>), BonsaiErrors> {
-    let (means, precisions) =
-        collapse_onto_every_node(tree, leaves.means, leaves.precisions, leaves.n_features)?;
-    let sds: Vec<T> = precisions.iter().map(|&w| narrow(1.0 / w.sqrt())).collect();
-    Ok((data.restore_scale(&means)?, data.restore_scale(&sds)?))
 }
 
 ///////////

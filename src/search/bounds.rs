@@ -1,4 +1,4 @@
-//! Upper bounds on merge scores (SPEC.md section 10).
+//! Upper bounds on merge scores
 //!
 //! **Not an optimisation.** The naive search is `O(n^3 p)`: every round scores
 //! every pair, because a merge moves the root and the root enters every other
@@ -35,14 +35,13 @@
 //!
 //! ### Honesty about what this is not
 //!
-//! It is not a strict mathematical bound, and SPEC.md section 10.2 says so. The
-//! linearisation can underestimate. [`EllipsoidBoundsParams::verify`] turns
-//! that from an argument into a measurement: it scores every offered pair every
-//! round, counts how often a true gain exceeds its recorded bound, and replays
-//! the primitive's walk to count how often that cost the answer. On this
-//! crate's fixtures the first number is about one in a thousand and the second
-//! is zero. Both are tabulated, with the diagnosis, in
-//! [`EllipsoidBoundsParams::default`].
+//! It is not a strict mathematical bound. The linearisation can underestimate.
+//! [`EllipsoidBoundsParams::verify`] turns that from an argument into a
+//! measurement: it scores every offered pair every round, counts how often a
+//! true gain exceeds its recorded bound, and replays the primitive's walk to
+//! count how often that cost the answer. On this crate's fixtures the first
+//! number is about one in a thousand and the second is zero. Both are
+//! tabulated, with the diagnosis, in [`EllipsoidBoundsParams::default`].
 //!
 //! ### The derivative
 //!
@@ -110,9 +109,9 @@ const GROW: f64 = 1.05;
 /// stops being dominated by the granularity.
 const ADAPT_MIN_CHUNKS: usize = 4;
 
-////////////////
-// Parameters //
-////////////////
+///////////////////////////
+// EllipsoidBoundsParams //
+///////////////////////////
 
 /// Tuning knobs for [`EllipsoidBounds`].
 ///

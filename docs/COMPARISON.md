@@ -6,11 +6,10 @@ produced.
 
 **What may and may not be said here.** Every claim below is anchored to either a
 measurement of inputs and outputs, or to a statement in the paper. Nothing here
-is anchored to the published source, which no session writing this crate has
-read; `PROVENANCE.md` sets out why, and why that does not change with time.
-Running a program to observe its output is black-box observation. Explaining why
-its code behaves as it does is not, and there is no version of this crate at
-which that becomes acceptable.
+is anchored to the published source. `PROVENANCE.md` sets out why, and why that
+does not change with time. Running a program to observe its output is black-box
+observation. Explaining why its code behaves as it does is not, and there is no
+version of this crate at which that becomes acceptable.
 
 ## The arrangement
 
@@ -26,20 +25,21 @@ selection applied identically to both. The `512_s32` configuration is the same
 
 ## Speed and quality
 
-| cells | genes | | seconds | peak RSS | Robinson-Foulds | distance recovery | loglikelihood |
-|---|---|---|---|---|---|---|---|
-| 512 | 2,382 | bonsai-rs | 210 | | 189 | 0.588 | -527,761 |
-| 512 | 2,382 | published | 554 | 567 MB | 146 | 0.633 | -527,255 |
-| 512 | 2,382 | truth | | | 0 | 0.733 | |
-| 512 s32 | 2,302 | bonsai-rs | 63 | | 327 | 0.221 | -514,991 |
-| 512 s32 | 2,302 | published | 371 | 558 MB | 240 | 0.303 | -513,553 |
-| 512 s32 | 2,302 | truth | | | 0 | 0.500 | |
-| 5,000 | 2,701 | bonsai-rs | 164 | | 1,295 | 0.666 | -5,557,976 |
-| 5,000 | 2,701 | published | 4,880 | 3,156 MB | 1,937 | 0.496 | -5,563,770 |
-| 5,000 | 2,701 | truth | | | 0 | 0.679 | |
-| 10,000 | 2,767 | bonsai-rs | 2,384 | | 2,661 | 0.465 | -11,253,231 |
-| 10,000 | 2,767 | published | 17,389 | 5,772 MB | 5,149 | 0.281 | -11,280,721 |
-| 10,000 | 2,767 | truth | | | 0 | 0.461 | |
+
+|      cells |    genes |         method | seconds | peak RSS | Robinson-Foulds | distance recovery | loglikelihood |
+|------------|----------|----------------|---------|----------|-----------------|-------------------|---------------|
+|        512 |    2_382 | bonsai-rs      |     210 |          |             189 |             0.588 |      -527,761 |
+|        512 |    2_382 | published      |     554 |   567 MB |             146 |             0.633 |      -527,255 |
+|        512 |    2_382 | truth          |         |          |               0 |             0.733 |               |
+|    512 s32 |    2_302 | bonsai-rs      |      63 |          |             327 |             0.221 |      -514,991 |
+|    512 s32 |    2_302 | published      |     371 |   558 MB |             240 |             0.303 |      -513,553 |
+| 512 s32 | 2_302 | truth | | | 0 | 0.500 | |
+| 5,000 | 2_701 | bonsai-rs | 164 | | 1,295 | 0.666 | -5,557,976 |
+| 5,000 | 2_701 | published | 4,880 | 3,156 MB | 1,937 | 0.496 | -5,563,770 |
+| 5,000 | 2_701 | truth | | | 0 | 0.679 | |
+| 10,000 | 2_767 | bonsai-rs | 2,384 | | 2,661 | 0.465 | -11,253,231 |
+| 10,000 | 2_767 | published | 17,389 | 5,772 MB | 5,149 | 0.281 | -11,280,721 |
+| 10,000 | 2_767 | truth | | | 0 | 0.461 | |
 
 Robinson-Foulds is to the generating tree, so lower is better. Distance recovery
 is the correlation between tree path distance and true squared Euclidean

@@ -1,9 +1,9 @@
 //! Branch-length optimisation.
 //!
-//! Implements SPEC.md section 6. Collapsing everything but one edge into an
-//! effective leaf on each side reduces the branch-length problem to a
-//! one-dimensional root find whose derivative is available in closed form, so
-//! there is no call to a general-purpose optimiser anywhere in this crate.
+//! Collapsing everything but one edge into an effective leaf on each side
+//! reduces the branch-length problem to a one-dimensional root find whose
+//! derivative is available in closed form, so there is no call to a
+//! general-purpose optimiser anywhere in this crate.
 
 use crate::errors::BonsaiErrors;
 use crate::utils::kernels::edge_loglik;

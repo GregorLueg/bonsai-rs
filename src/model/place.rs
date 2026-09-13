@@ -1,29 +1,18 @@
 //! Placing a node on an existing tree.
 //!
-//! Implements SPEC.md section 7. Used twice by the search: regrafting the
-//! pruned subtree of an SPR move (section 9.3), and adding a cell to an
-//! existing backbone (section 15). Both reduce to the same question, "which
-//! node of this tree should `q` hang off", so both go through [`place`].
+//! Used twice by the search: regrafting the pruned subtree of an SPR move,
+//! and adding a cell to an existing backbone. Both reduce to the same question,
+//! "which node of this tree should `q` hang off", so both go through [`place`].
 //!
 //! ### Why the score is an ordinary edge
 //!
 //! Attaching `q` below `a` gives a tree whose loglikelihood is the old tree's,
-//! plus `q`'s own, plus the contribution of the single edge joining them
-//! (SPEC.md section 7.1, S27). The first two terms do not depend on `a`: the
-//! collapse of the existing tree onto `a` accumulates the same total whatever
-//! `a` is, because the likelihood does not depend on the choice of root (S14).
-//! So the edge term alone ranks attachment points, and the edge term is exactly
-//! what `model::branch` already solves. No new kernel appears here.
-//!
-//! ### What the caller still owes
-//!
-//! Attaching to a node makes a polytomy there, since the node already had
-//! three neighbours in the unrooted sense. SPEC.md section 7.3 says not to
-//! special-case attachment to the middle of an edge but to follow every
-//! attachment with the polytomy resolution of section 9.2, which covers edge
-//! attachment as a special case. That resolution lives in `search`, and this
-//! module does not perform it: [`place`] reports where to attach and with what
-//! branch length, it does not modify the tree.
+//! plus `q`'s own, plus the contribution of the single edge joining them. The
+//! first two terms do not depend on `a`: the collapse of the existing tree onto
+//! `a` accumulates the same total whatever `a` is, because the likelihood does
+//! not depend on the choice of root. So the edge term alone ranks attachment
+//! points, and the edge term is exactly what `model::branch` already solves. No
+//! new kernel appears here.
 
 use crate::errors::BonsaiErrors;
 use crate::model::branch::optimise_edge_loglik;
@@ -147,14 +136,12 @@ pub struct Attachment {
 
 /// Score attaching `q` below a node summarised by the effective leaf `a`.
 ///
-/// SPEC.md section 7.1 (S27):
-///
 /// ```text
 /// dL(t) = -1/2 * sum_g [ log(t + 1/W[g,a] + 1/W[g,q])
 ///                        + (M[g,a] - M[g,q])^2 / (t + 1/W[g,a] + 1/W[g,q]) ]
 /// ```
 ///
-/// which is the edge expression of SPEC.md section 6 with
+/// which is the edge expression with
 /// `s[g] = 1/W[g,a] + 1/W[g,q]` and `d[g] = (M[g,a] - M[g,q])^2`. Those are
 /// what `prep_edge` produces, along with the bracket, on the one pass it makes
 /// over the two arrays, and the maximisation over `t` is what
@@ -249,10 +236,10 @@ pub fn start_points(tree: &Tree, n_starts: usize) -> Vec<u32> {
 
 /// Neighbours of a node in the unrooted sense: its children and its parent.
 ///
-/// The arena is rooted for bookkeeping but the likelihood is not (SPEC.md
-/// section 2, S14), so the search has to be able to walk upwards. Forgetting
-/// the parent here would confine the search to the subtree below its start
-/// point, which is the single easiest way to get this module quietly wrong.
+/// The arena is rooted for bookkeeping but the likelihood is not, so the search
+/// has to be able to walk upwards. Forgetting the parent here would confine the
+/// search to the subtree below its start point, which is the single easiest way
+/// to get this module quietly wrong.
 ///
 /// ### Params
 ///
@@ -270,10 +257,9 @@ fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
 
 /// Find the best node of a tree to attach `q` below.
 ///
-/// The beam search of SPEC.md section 7.2. From each start point, score the
-/// node, score each unvisited neighbour, and recurse into those whose score is
-/// within `tolerance` of the best score seen anywhere so far. The best node
-/// over all start points wins.
+/// From each start point, score the node, score each unvisited neighbour, and
+/// recurse into those whose score is within `tolerance` of the best score seen
+/// anywhere so far. The best node over all start points wins.
 ///
 /// The comparison is against the best seen *before* the neighbour itself is
 /// folded in, so a tolerance of zero means "recurse only into a neighbour that

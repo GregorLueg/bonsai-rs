@@ -1,12 +1,12 @@
 //! The merge score: what does inserting an ancestor above two children of a
 //! star gain?
 //!
-//! Implements SPEC.md section 8. This is the quantity the whole tree search is
-//! a search over, so it is worth being precise about its shape. Both the tree
-//! before the merge and the tree after it are three-leaf stars over the same
-//! three effective leaves: the two children `k` and `l`, and `R`, which is
-//! every other child of the root collapsed into one. The score is the
-//! difference of the two stars' loglikelihoods.
+//! This is the quantity the whole tree search is  a search over, so it is worth
+//! being precise about its shape. Both the tree before the merge and the tree
+//! after it are three-leaf stars over the same three effective leaves: the two
+//! children `k` and `l`, and `R`, which is every other child of the root
+//! collapsed into one. The score is the difference of the two stars'
+//! loglikelihoods.
 //!
 //! Because `R` is obtained by peeling `k` and `l` off the root's own effective
 //! leaf, scoring one pair costs `O(p)` rather than `O(n * p)`.
@@ -14,6 +14,10 @@
 use crate::errors::BonsaiErrors;
 use crate::model::branch::optimise_edge;
 use crate::utils::traits::{BonsaiFloat, wide};
+
+/////////////////
+// MergeParams //
+/////////////////
 
 /// Tuning knobs for the merge-score branch-length solve.
 ///
@@ -253,10 +257,10 @@ impl MergeScratch {
     /// [`MergeScratch::split_derivative`] and `t_ar` by the edge solve, so
     /// [`score_merge`] and [`gain_at`] both call this for the gain alone.
     /// [`crate::search::bounds`] differentiates the score too but does it with
-    /// respect to the centre, through its own chain rule. These are kept because
-    /// they are what pins the two gradient copies against central differences,
-    /// and they are nearly free: this runs once per candidate pair, against the
-    /// tens of `split_derivative` calls the bisection makes.
+    /// respect to the centre, through its own chain rule. These are kept
+    /// because they are what pins the two gradient copies against central
+    /// differences, and they are nearly free: this runs once per candidate
+    /// pair, against the tens of `split_derivative` calls the bisection makes.
     ///
     /// ### Params
     ///
@@ -410,15 +414,6 @@ impl MergeScratch {
         if total <= 0.0 {
             return 0.0;
         }
-        // The optimum sits at an end of the bracket when the derivative does
-        // not change sign across it, and the ends are taken exactly: SPEC.md
-        // section 9.2 keys polytomy resolution on zero-length branches, so a
-        // boundary-optimal split has to come back as `0.0` or as `total` and
-        // not as a hair's breadth from either. The ends are safe to evaluate
-        // because `r1` and `r2` in `split_derivative` carry the effective
-        // leaf's own inverse precision, which the star primitive has already
-        // checked is finite and positive, so neither reciprocal divides by
-        // zero at a zero branch length.
         let mut f_lo = self.split_derivative(total, 0.0, t_ar);
         if f_lo <= 0.0 {
             return 0.0;

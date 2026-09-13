@@ -1,8 +1,8 @@
 //! Backbone mode: reconstruct on a subset, then place the rest.
 //!
-//! SPEC.md section 15. Four steps: preprocess everything, run the standard
-//! algorithm on a random subset to get a backbone, place the remaining cells on
-//! it one at a time, then refine the whole thing.
+//! Four steps: preprocess everything, run the standard algorithm on a random
+//! subset to get a backbone, place the remaining cells on it one at a time,
+//! then refine the whole thing.
 //!
 //! ### What this does and does not buy
 //!
@@ -37,6 +37,10 @@ use crate::tree::{NO_NODE, Tree};
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::{BonsaiFloat, narrow};
 
+////////////
+// Consts //
+////////////
+
 /// Cells in the initial backbone, when the caller does not say.
 ///
 /// The backbone has to be large enough to carry the structure the rest of the
@@ -55,6 +59,10 @@ pub const DEFAULT_BACKBONE_CELLS: usize = 2048;
 /// branch lengths. A quarter means four reoptimisations per doubling.
 /// Ours; see `test_reoptimisation_cadence_changes_the_result`.
 pub const DEFAULT_REGROW_FRACTION: f64 = 0.25;
+
+////////////////////
+// BackboneParams //
+////////////////////
 
 /// Knobs for backbone mode.
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +93,10 @@ impl Default for BackboneParams {
         }
     }
 }
+
+////////////////////
+// BackboneReport //
+////////////////////
 
 /// What the growth phase did.
 #[derive(Clone, Copy, Debug)]

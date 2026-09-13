@@ -1,10 +1,10 @@
 //! Global branch-length optimisation.
 //!
-//! Implements the last paragraph of SPEC.md section 6. Collapsing everything
-//! but one edge into an effective leaf on each side turns that edge into the
-//! one-dimensional problem [`crate::model::branch::optimise_edge`] already
-//! solves; doing it for every edge at once needs the effective leaf on *both*
-//! sides of every edge, which is one sweep in each direction over the arena.
+//! Collapsing everything but one edge into an effective leaf on each side turns
+//! that edge into the one-dimensional problem
+//! [`crate::model::branch::optimise_edge`] already solves; doing it for every
+//! edge at once needs the effective leaf on *both* sides of every edge, which
+//! is one sweep in each direction over the arena.
 //!
 //! The pruning recursion in [`crate::model::likelihood`] supplies one side: for
 //! every node `k`, the subtree below `k`. This module supplies the other, the

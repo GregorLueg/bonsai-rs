@@ -1,18 +1,19 @@
 //! The pruning recursion and the tree loglikelihood.
 //!
-//! Implements SPEC.md sections 4 and 5: every subtree collapses into an
-//! effective leaf carrying a mean and a precision per feature, and the tree
-//! loglikelihood accumulates as that collapse proceeds. This is the
-//! continuous-trait form of Felsenstein's pruning algorithm.
-//!
-//! Values are up to the additive constants dropped in SPEC.md section 3, so
-//! only differences between loglikelihoods are meaningful.
+//! Every subtree collapses into an effective leaf carrying a mean and a
+//! precision per feature, and the tree loglikelihood accumulates as that
+//! collapse proceeds. This is the continuous-trait form of Felsenstein's
+//! pruning algorithm.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::Tree;
 use crate::utils::kernels::prune_general;
 use crate::utils::simd::prune_binary;
 use crate::utils::traits::BonsaiFloat;
+
+///////////////
+// NodeState //
+///////////////
 
 /// Effective means and precisions for every node in a tree.
 ///
@@ -229,11 +230,6 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// [`NodeState::new`]. Both are a mismatched pair of arguments rather than
     /// bad data.
     pub fn prune(&mut self, tree: &Tree) -> f64 {
-        // A real check, not a `debug_assert`: a state built for one tree and
-        // pruned against another indexes entirely within bounds when the state
-        // is the larger of the two, so release builds would return a
-        // well-formed answer computed from the wrong rows. One comparison
-        // against an `O(n * p)` sweep.
         assert_eq!(
             tree.n_nodes(),
             self.n_nodes,
@@ -283,9 +279,9 @@ impl<T: BonsaiFloat> NodeState<T> {
 /// against a slab of equal-length rows indexed by node rather than against
 /// `NodeState` itself, which is what let a second layout share it; that layout
 /// is gone, but the shape is still the right one to write the dispatch between
-/// the binary and polytomy kernels against. The traversal order and the order the per-node
-/// contributions are summed in stay each module's own business, which is what
-/// makes the two independent enough to cross-check.
+/// the binary and polytomy kernels against. The traversal order and the order
+/// the per-node contributions are summed in stay each module's own business,
+/// which is what makes the two independent enough to cross-check.
 ///
 /// ### Params
 ///

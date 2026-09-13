@@ -690,13 +690,91 @@ for a fortnight. With the old absolute floor it fails.
 before the cap at three sizes and that a second run from its output is the
 identity, which is the cycle itself.
 
-### End to end: not yet measured
+### End to end, measured 2026-09-13 on a quiet box
 
-The 10k confirmation run was started and killed mid-SPR when the machine went
-to load 71. What it had produced before the kill matches the baseline exactly
-(`1-2 linkage -22460257.30`, `4 branch -11327994.58`), which is expected: the
-change cannot touch anything before step 5. SPR rounds, total seconds,
-Robinson-Foulds, zero-length branches and polytomies at 5k and 10k are pending
-a quiet window. The projection to confirm or refute is about nine rounds and
-200 s against 100 rounds and 2,129 s, and it is an inference from the measured
-per-round cost, not a measurement.
+Both runs on the harness's cached Sanity output, seed 31, `START=linkage`. The
+box carried nothing else: linkage came in at 5.97 s against the baseline's 5.77
+and step 4 at 26.32 against 25.87, so the seconds are comparable and not a load
+artefact. The baseline is the same data under the absolute floor.
+
+**10,000 cells by 2,767 genes.**
+
+| | absolute `1e-9` | scale-relative | |
+|---|---|---|---|
+| 5 spr seconds | 2129.17 | 451.01 | **4.72x** |
+| 5 spr rounds | 100, cap bound | 12, converged | |
+| 5 spr moves | 4843 | 4755 | |
+| 6 nni seconds | 199.10 | 106.22 | 1.87x |
+| 6 nni moves | 89 | 47 | |
+| total seconds | 2383.75 | 616.26 | **3.87x** |
+| loglik after SPR | -11264121.00 | -11263725.09 | +395.9 nats |
+| final loglik | -11253231.23 | -11253193.87 | +37.4 nats |
+| Robinson-Foulds | 2661 | 2659 | |
+| distance recovery | 0.465032 | 0.466268 | |
+
+**5,000 cells by 2,701 genes**: unchanged, which is the right answer. 9 rounds
+either way, 2142 moves against 2141, final loglik `-5557975.945` both,
+Robinson-Foulds 1295 both, 164.35 s against 167.53. It converged at round 9
+under the old floor by luck rather than margin, and the new floor does not
+change where it lands.
+
+Three results worth separating from the headline.
+
+**The projection was refuted on seconds and confirmed on mechanism.** It said
+nine rounds and 200 s; the answer is twelve rounds and 451 s. The 21 s per round
+it multiplied was the cost of a *settled* round accepting one move. The twelve
+real rounds average 37.6 s, because a round accepting hundreds of moves pays an
+incremental settle and a discarded proposal chunk per acceptance. Rule 4, inside
+the projection rather than in the code.
+
+**The tree is better, not merely equal.** 396 nats after SPR. Cycling through
+neutral regrafts for 91 rounds leaves the tree worse than converging cleanly
+does, so the noise rounds were not free even in quality.
+
+**NNI's move count halved, 89 to 47.** Roughly half of NNI's work at 10k was
+cleaning up after the cycle. `docs/SLOWDOWN.md` section 2 inferred the opposite,
+that the truncated SPR was not leaving work for NNI; the number says it was.
+
+## Where the degenerate branches come from, 2026-09-13
+
+The 10k tree carries 684 zero-length branches after SPR against 5k's 303, and
+they render as a localised fragmented arm that neither the loglikelihood nor
+Robinson-Foulds can see. The obvious suspect was the acceptance cycle above,
+since each noise regraft leaves a polytomy behind. **Measured: it is not.** With
+the cycle gone the count is 688 post-SPR against the baseline's 684, and 161 in
+the final tree against 150. Removing 91 rounds of neutral churn moved it by
+under one per cent.
+
+`harness leak` runs linkage, step 3 and step 4 and counts after each. No search,
+under 40 s at 10k.
+
+| stage | 5k zero branches | 10k zero branches | polytomies |
+|---|---|---|---|
+| 1-2 linkage | 0 | 0 | 0 |
+| 3 polytomy | 0 | 0 | 0 |
+| 4 branch | 1144 | 2389 | 0 |
+
+`tree::linkage` sets every branch to 1.0, so the start is clean and step 3 is a
+measured no-op against a tree that cannot have anything to resolve. Step 4 then
+manufactures the lot: SPEC.md section 6 says driving a branch to exactly zero is
+normal and intended, and section 9.2's resolver is the answer to it, but on the
+linkage path the resolver has already run. The seven-step order in SPEC 9
+assumes step 2 creates the polytomies; with a linkage start there is no step 2.
+The greedy path leaks the same way for whatever step 4 creates on top of step
+2's output.
+
+Two things the counts add. **Step 5 is the cleaner, not the culprit**: 2389 zero
+branches go in and 688 come out, because every regraft landing on a degenerate
+region runs the four-member star and resolves it, and step 7 then takes 684 to
+161. What survives is the residue the search never visited, which is why the
+pathology is localised rather than spread. And **the polytomy count is zero at
+every pre-search stage**: a zero-length branch is not yet a polytomy in the
+arena, so the 30 to 35 polytomies in a final tree are made later by SPR's and
+NNI's splices and are a different quantity from the 684.
+
+No fix attempted. Re-running resolution after step 4 is the obvious move and it
+changes the pipeline order `src/bonsai.rs` calls not negotiable, so it wants the
+owner. One thing to measure before anyone rearranges anything: since step 5
+already removes 71 per cent of them as a side effect, the value of a step 4.5 is
+probably concentrated in the regions the search never visits, and that is a
+count per subtree rather than a global one.

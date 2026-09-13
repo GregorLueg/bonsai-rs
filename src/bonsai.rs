@@ -1,7 +1,14 @@
 //! The whole algorithm: matrix in, tree out.
 //!
-//! Runs the seven steps of SPEC.md section 9 in order. Everything below is
-//! orchestration; the arithmetic lives in `model`, `search` and `tree`.
+//! Runs the seven steps of SPEC.md section 9 in order, then an eighth of our
+//! own. Everything below is orchestration; the arithmetic lives in `model`,
+//! `search` and `tree`.
+//!
+//! **The eighth step is a deviation.** Step 3 is the only step that collapses
+//! zero-length edges and it runs before step 4, so every zero-length edge the
+//! branch solves create afterwards outlives the only pass that would remove
+//! one. See the comment on step 8 for the measurement and for why it runs last
+//! rather than earlier.
 //!
 //! ### Why the order is not negotiable
 //!
@@ -110,7 +117,7 @@ pub enum StartTree {
 /// What one step of the search cost and what it bought.
 #[derive(Clone, Copy, Debug)]
 pub struct StepReport {
-    /// Which of the seven steps this is.
+    /// Which step this is, `"1 star"` through `"8 collapse"`.
     pub step: &'static str,
     /// Tree loglikelihood after the step, up to the constants SPEC.md section 3
     /// drops.
@@ -158,8 +165,8 @@ impl<T: BonsaiFloat> BonsaiResult<T> {
 
 /// Reconstruct a tree from a matrix of measurements and their error bars.
 ///
-/// The whole pipeline: ingest (SPEC.md section 3), then the seven search steps
-/// of section 9.
+/// The whole pipeline: ingest (SPEC.md section 3), the seven search steps of
+/// section 9, and the collapse this crate adds after them.
 ///
 /// ### Params
 ///
@@ -356,6 +363,36 @@ fn refine_from<T: BonsaiFloat>(
     let loglik = optimise_all(&mut tree, leaves, params)?;
     record("7 branch", loglik, &mut steps);
 
+    // Step 8, a deviation. SPEC.md section 9 lists seven steps and this is an
+    // eighth: collapse the internal zero-length edges the branch solves leave
+    // behind, then reoptimise what the collapse changed.
+    //
+    // It exists because step 3 is the only step that collapses, and it runs
+    // before step 4. SPEC.md section 6 is explicit that a branch solve landing
+    // on `t = 0` is normal, so every zero-length edge steps 4 to 7 create
+    // outlives the only pass that would remove it. Measured 2026-09-13 on
+    // realistic data at 10,000 cells by 2,767 genes: 32 internal zero-length
+    // edges survive to the end, and collapsing them takes Robinson-Foulds from
+    // 2659 to 2632 and the loglikelihood from -11253193.9 to -11253188.3 for
+    // 2.75 seconds.
+    //
+    // It runs last on purpose. Collapsing before step 5 instead reaches 2614,
+    // eighteen splits better again, but costs 247 seconds because a collapsed
+    // tree gives every nearby regraft a higher-degree star to resolve, and it
+    // moves distance recovery the wrong way on the one seed measured. Running
+    // after the search cannot change what the search finds, which is the
+    // property that makes this safe to do unconditionally.
+    //
+    // The collapse only ever *removes* structure, so it cannot invent a split
+    // the data does not support. What it cannot touch is a zero-length edge at
+    // a *leaf*, which is not an internal edge: those are the model declining to
+    // separate two cells it has no evidence to separate, and 129 of them
+    // survive this step at 10,000 cells by design.
+    let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
+    tree = resolved.tree;
+    let loglik = optimise_all(&mut tree, leaves, params)?;
+    record("8 collapse", loglik, &mut steps);
+
     // Rerooting is a display choice and carries no information (S14), so it
     // happens after the last thing that cares about branch lengths.
     if params.reroot {
@@ -522,7 +559,7 @@ mod tests {
         let (means, sds, variances, _) = raw_fixture(n, p, 0.3, 11);
         let out = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
 
-        assert_eq!(out.steps.len(), 7);
+        assert_eq!(out.steps.len(), 8);
         for step in out.steps.iter().skip(1) {
             assert!(
                 step.gain >= -1e-9,
@@ -621,7 +658,7 @@ mod tests {
             0,
             "refining a finished tree changed its topology"
         );
-        assert_eq!(again.steps.len(), 5, "refine should report steps 3 to 7");
+        assert_eq!(again.steps.len(), 6, "refine should report steps 3 to 8");
     }
 
     #[test]

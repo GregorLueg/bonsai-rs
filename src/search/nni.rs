@@ -37,6 +37,17 @@
 //! meant to; the collapse alone can lose a split that the resampled star does
 //! not put back.
 //!
+//! The gain is a *difference* of whole-tree loglikelihoods but it is never
+//! formed as one. Every term the two trees share cancels symbolically rather
+//! than numerically: the merge gains are `O(p)` sums over one pair each, and
+//! [`collapse_delta`] is three `O(p)` peels over the members of one star. So
+//! the rounding floor of an interchange gain is `O(p eps)` and not
+//! `O(n p eps)`, and [`StarParams::min_gain`] is the right floor for it at any
+//! `n`. [`crate::search::spr`] scores its candidates the other way, on the
+//! whole-tree figure, and needs a floor that scales with `n p`; measured
+//! 2026-09-13 at 10,000 cells by 2,767 genes, every one of the 89 accepted
+//! interchanges gained between 0.08 and 26 nats and none was rounding.
+//!
 //! ### This is a topology search and only a topology search
 //!
 //! A collapse and re-resolution that puts the same subtrees back where they

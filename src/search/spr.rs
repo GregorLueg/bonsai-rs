@@ -90,7 +90,7 @@
 //! independently and for the same reason.
 
 use crate::errors::BonsaiErrors;
-use crate::model::global::up_part;
+use crate::model::global::{LOGLIK_SCALE_FLOOR, up_part};
 use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place};
@@ -113,7 +113,7 @@ use std::cell::OnceCell;
 /// Default for [`SprParams::max_rounds`].
 ///
 /// A runaway guard and not a working limit. Every accepted move raises the tree
-/// loglikelihood by more than [`StarParams::min_gain`] and the loglikelihood is
+/// loglikelihood by more than [`acceptance_floor`] and the loglikelihood is
 /// bounded above, so the sweeps terminate on their own; this only bounds how
 /// long it can take to notice. One round performs every improving move it
 /// finds, not one, so the count needed is small: measured 2026-08-31 on
@@ -121,7 +121,50 @@ use std::cell::OnceCell;
 /// are already at the step 4 optimum, 24 fixtures from 16 to 64 leaves needed
 /// two to four rounds and never more. A hundred is more than an order of
 /// magnitude of headroom on that.
+///
+/// That argument was only ever as good as the floor behind it. Until
+/// 2026-09-13 the floor was the absolute `StarParams::min_gain`, and on
+/// realistic data at 10,000 cells by 2,767 genes the cap was the only thing
+/// that ended the run: rounds 10 to 100 each accepted one likelihood-neutral
+/// move of gain `5.6e-8`, the rounding noise of a sum of magnitude `1.1e7`,
+/// and the tree cycled with period two. See [`DEFAULT_MIN_RELATIVE_GAIN`].
+/// With the scale-relative floor the cap does not bind, and it stays where it
+/// is as the guard it was written to be.
 const DEFAULT_MAX_ROUNDS: usize = 100;
+
+/// Default for [`SprParams::min_relative_gain`], as a fraction of `|L|`.
+///
+/// The star primitive's `StarParams::min_gain` is a floor on a *merge score*,
+/// a sum over the `p` features of one pair, magnitude `O(p)` and rounding
+/// floor `1.1e-16` per feature. This module accepts on a *whole-tree*
+/// loglikelihood, a sum over every internal node of the tree, magnitude
+/// `O(n p)`. The absolute constant is right for the first quantity and wrong
+/// for the second, and the wrongness grows with the problem: measured
+/// 2026-09-13 on Sanity-preprocessed realistic data at 10,000 cells by 2,767
+/// genes, where `|L|` is `1.1e7`, SPR accepted one likelihood-neutral topology
+/// change of gain `5.6e-8` (about 32 ulps of the sum) in every round from
+/// round 10 to the cap at 100, the tree cycled with period two, and a fresh
+/// prune of the result was bit-identical to round 10's. Ninety-one rounds of
+/// the hundred, roughly 1,900 s of 2,129 s.
+///
+/// So the floor scales with the magnitude of the quantity it gates, in the
+/// same shape [`crate::model::global::optimise_branch_lengths`] already uses:
+/// `min_relative_gain * max(|L|, LOGLIK_SCALE_FLOOR)`, the floor there to stop
+/// the test collapsing when the loglikelihood passes through zero (SPEC.md
+/// section 3.2 leaves it defined only up to an additive constant).
+///
+/// `1e-12` is the tolerance `test_the_incremental_loglik_matches_a_fresh_prune`
+/// already pins the proposal's score to, which is the right number by
+/// construction: a candidate is accepted on an incrementally assembled figure,
+/// and there is no sense in accepting a gain smaller than the disagreement
+/// between that figure and the fresh prune it stands in for. Against the
+/// observed noise it is 200x of headroom (`1.1e-5` against `5.6e-8` at 10k)
+/// and against a real move it is six orders of margin, since accepted SPR
+/// gains at 10k average about 15 nats and the smallest measured on any rung of
+/// the subsample ladder was `2e-5`. At 512 cells the floor is `5e-7`, at 5,000
+/// `5.6e-6`; below about 1,000 cells `StarParams::min_gain` is the binding one
+/// and nothing changes.
+const DEFAULT_MIN_RELATIVE_GAIN: f64 = 1e-12;
 
 /// Fewest candidates a sweep proposes in parallel before deciding any of them.
 ///
@@ -189,9 +232,19 @@ pub struct SprParams {
     /// Beam-search knobs handed to [`place`].
     pub placement: PlacementParams,
     /// Star primitive knobs handed to the polytomy resolution. Its `min_gain`
-    /// is also the smallest loglikelihood improvement that will be accepted as
-    /// a move.
+    /// is also an absolute floor on the loglikelihood improvement that will be
+    /// accepted as a move, but it is a merge-score floor and on any tree worth
+    /// searching [`SprParams::min_relative_gain`] is the binding one; see
+    /// [`acceptance_floor`].
     pub star: StarParams,
+    /// Smallest improvement in the whole-tree loglikelihood that will be
+    /// accepted as a move, as a fraction of `max(|L|, 1)`.
+    ///
+    /// Strictly greater than, and taken together with `star.min_gain` as a
+    /// maximum, so raising either raises the floor. See
+    /// [`DEFAULT_MIN_RELATIVE_GAIN`] for why an absolute floor alone is not
+    /// enough.
+    pub min_relative_gain: f64,
 }
 
 impl Default for SprParams {
@@ -208,8 +261,39 @@ impl Default for SprParams {
             max_rounds: DEFAULT_MAX_ROUNDS,
             placement: PlacementParams::default(),
             star: StarParams::default(),
+            min_relative_gain: DEFAULT_MIN_RELATIVE_GAIN,
         }
     }
+}
+
+///////////////
+// Threshold //
+///////////////
+
+/// Smallest gain, in nats, that this round will accept as a move.
+///
+/// Two floors, whichever is larger. `star.min_gain` is absolute and is the
+/// primitive's merge-score floor, kept so that a caller can still raise the
+/// bar by hand. `min_relative_gain` scales with the magnitude of the thing
+/// actually being compared, which is a whole-tree loglikelihood and grows as
+/// `O(n p)`; see [`DEFAULT_MIN_RELATIVE_GAIN`] for what happens without it.
+/// The `max(|L|, LOGLIK_SCALE_FLOOR)` is
+/// [`crate::model::global::optimise_branch_lengths`]'s guard against a
+/// loglikelihood that happens to sit near zero.
+///
+/// ### Params
+///
+/// * `params` - The round's knobs
+/// * `best` - Loglikelihood of the tree as it currently stands
+///
+/// ### Returns
+///
+/// The floor a proposal's gain has to exceed, strictly.
+fn acceptance_floor(params: &SprParams, best: f64) -> f64 {
+    params
+        .star
+        .min_gain
+        .max(params.min_relative_gain * best.abs().max(LOGLIK_SCALE_FLOOR))
 }
 
 ////////////
@@ -1325,7 +1409,7 @@ pub fn spr_round<T: BonsaiFloat>(
             let Some(proposal) = proposal else {
                 continue;
             };
-            if proposal.loglik <= best + params.star.min_gain {
+            if proposal.loglik <= best + acceptance_floor(&params, best) {
                 continue;
             }
             gains.push(SprGain {
@@ -2567,6 +2651,146 @@ mod tests {
             assert_eq!(splits(&run.tree), splits(&runs[0].tree));
             assert_eq!(run.loglik.to_bits(), runs[0].loglik.to_bits());
             assert_eq!(run.n_moves(), runs[0].n_moves());
+        }
+    }
+
+    /// Magnitude of the whole-tree loglikelihood on the realistic dataset the
+    /// floor failed on: 10,000 cells by 2,767 Sanity-selected genes,
+    /// 2026-09-13. Used as the extrapolation target, so the scaling test is
+    /// checked against the regime that broke rather than the one it runs in.
+    const REALISTIC_LOGLIK: f64 = 1.1e7;
+
+    /// Worst gain accepted on that dataset that turned out to be rounding,
+    /// measured the same day over six resumed rounds.
+    const REALISTIC_NOISE: f64 = 5.96e-8;
+
+    #[test]
+    fn test_the_acceptance_floor_outgrows_the_loglikelihood_rounding_floor() {
+        // A candidate is accepted on `proposal.loglik - best`, and both sides
+        // are sums over every internal node, so the smallest difference the
+        // arithmetic can resolve grows with `|L|`, which is `O(n p)`. An
+        // absolute floor therefore has a size above which it sits below the
+        // noise, and the search accepts neutral topology changes for ever.
+        // That is not hypothetical: with the floor at `StarParams::min_gain`
+        // alone it happened at 10,000 cells, and it was the cap on the rounds
+        // that ended the run.
+        //
+        // Fixtures at this size cannot reach that magnitude, so the noise is
+        // measured over a range of sizes, its growth law is checked, and the
+        // floor is then tested against the noise extrapolated to the magnitude
+        // that broke. That extrapolation is the part a 64-leaf test does not
+        // have and the reason this one exists.
+        let params = SprParams::default();
+        let mut rungs: Vec<(f64, f64)> = Vec::new();
+        for (n, p) in [(16usize, 64usize), (32, 128), (64, 256), (128, 512)] {
+            let (data, w) = dataset(n, p, 5);
+            let leaves = Leaves {
+                means: &data.means,
+                precisions: &w,
+                n_features: p,
+            };
+            let tree = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+            let (down, best) = settled_down(&tree, leaves).expect("settle");
+            let word = leaf_words(&tree);
+            let here = split_fingerprint_with(&tree, &word);
+            let by_word = word_index(&word);
+
+            // The noise is the disagreement between the incrementally
+            // assembled figure a candidate is accepted on and a fresh prune of
+            // the very same tree. Anything below it is not a gain, it is which
+            // way the last bit fell.
+            let mut noise = 0.0f64;
+            let mut seen = 0usize;
+            for x in 0..tree.n_nodes() as u32 {
+                let Some(proposal) =
+                    propose(&tree, &down, x, &params, here, &by_word).expect("propose")
+                else {
+                    continue;
+                };
+                let (_, fresh) = settled_down(&proposal.tree, leaves).expect("settle");
+                noise = noise.max((proposal.loglik - fresh).abs());
+                seen += 1;
+            }
+            assert!(seen > n / 2, "only {seen} candidates at {n} leaves");
+            assert!(
+                acceptance_floor(&params, best) > 100.0 * noise,
+                "at {n} by {p}, |L| = {:.3e}: floor {:.3e} against noise {noise:.3e}",
+                best.abs(),
+                acceptance_floor(&params, best)
+            );
+            rungs.push((best.abs(), noise / best.abs()));
+        }
+
+        // Relative noise over the four rungs grew as the square root of `|L|`,
+        // which is the random walk an unordered `f64` sum accumulates: 1.2e-16
+        // at |L| = 4.7e2 to 6.2e-16 at 1.1e4, a factor of 5 over a factor of
+        // 25. Pin the law rather than the numbers, then extrapolate on it.
+        let (l0, rel0) = rungs[0];
+        let (l1, rel1) = *rungs.last().expect("rungs");
+        assert!(
+            rel1 / rel0 < 4.0 * (l1 / l0).sqrt(),
+            "relative noise grew faster than the square root: {rel0:.3e} to {rel1:.3e}"
+        );
+        // Ten, not a hundred, because the projection is itself pessimistic:
+        // it lands on 2.2e-7 where the value measured on the real 10k dataset
+        // was 6.0e-8, so a small fixture over-predicts the noise by about 4x
+        // and the margin below is against that inflated figure. The hundredfold
+        // check is made directly against the measurement, next.
+        let projected = rel1 * (REALISTIC_LOGLIK / l1).sqrt() * REALISTIC_LOGLIK;
+        assert!(
+            acceptance_floor(&params, -REALISTIC_LOGLIK) > 10.0 * projected,
+            "extrapolated to |L| = {REALISTIC_LOGLIK:.3e}: floor {:.3e} against noise \
+             {projected:.3e}",
+            acceptance_floor(&params, -REALISTIC_LOGLIK)
+        );
+
+        // And against what was actually observed there, rather than projected.
+        assert!(
+            acceptance_floor(&params, -REALISTIC_LOGLIK) > 100.0 * REALISTIC_NOISE,
+            "floor {:.3e} against the measured 10k noise {REALISTIC_NOISE:.3e}",
+            acceptance_floor(&params, -REALISTIC_LOGLIK)
+        );
+
+        // The floor has to stay far below a move that carries information. The
+        // smallest gain accepted on any rung of the 2026-09-13 subsample
+        // ladder was 2e-5 nats at |L| = 1.7e6, so scale that down as the floor
+        // scales and check the margin holds.
+        assert!(
+            acceptance_floor(&params, -REALISTIC_LOGLIK) < 2e-5 * (REALISTIC_LOGLIK / 1.7e6),
+            "the floor would reject a real move"
+        );
+    }
+
+    #[test]
+    fn test_the_sweeps_reach_a_fixed_point_rather_than_cycling() {
+        // The failure the floor allows is not a crash, it is a cycle: every
+        // round accepts one neutral move, the tree changes, the loglikelihood
+        // does not, and the run ends on the cap. So the test is that `spr`
+        // stops on its own and that a second run from its output is the
+        // identity, at several sizes rather than one.
+        for (n, p) in [(16usize, 64usize), (32, 128), (64, 256)] {
+            let (data, w) = dataset(n, p, 7);
+            let leaves = Leaves {
+                means: &data.means,
+                precisions: &w,
+                n_features: p,
+            };
+            let start = searched(n, leaves);
+            let params = SprParams::default();
+            let first = spr(&start, leaves, Some(params)).expect("spr");
+            assert!(
+                first.rounds < params.max_rounds,
+                "{n} by {p} ran to the cap at {} rounds",
+                first.rounds
+            );
+            let again = spr(&first.tree, leaves, Some(params)).expect("spr");
+            assert_eq!(
+                again.n_moves(),
+                0,
+                "{n} by {p} kept moving after it stopped"
+            );
+            assert_eq!(again.tree.branches(), first.tree.branches());
+            assert_eq!(again.loglik.to_bits(), first.loglik.to_bits());
         }
     }
 }

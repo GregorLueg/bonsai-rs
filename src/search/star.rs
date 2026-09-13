@@ -62,6 +62,15 @@ const MIN_CENTRE_MEMBERS: usize = 3;
 /// It still sits far below any gain that carries information, since a real
 /// merge gain is `O(p)` nats. See
 /// `test_the_default_min_gain_clears_the_zero_gain_floor`.
+///
+/// **This is a merge-score floor and nothing else.** It is correct for a sum
+/// of magnitude `O(p)`, which is what the primitive and
+/// [`crate::search::polytomy`] compare, and for the interchanges, whose gain
+/// is a handful of `O(p)` peels around one edge. It is *not* correct for a
+/// whole-tree loglikelihood of magnitude `O(n p)`;
+/// [`crate::search::spr`] compares those and carries its own scale-relative
+/// floor for them. Any new caller has to work out which of the two quantities
+/// it is comparing before reaching for this constant.
 const DEFAULT_MIN_GAIN: f64 = 1e-9;
 
 /// How many bound-ordered pairs [`walk_bounded`] scores before it rechecks the
@@ -167,7 +176,9 @@ pub struct StarParams {
     ///
     /// Strictly greater than: a merge is taken only when its gain exceeds this.
     /// Absolute rather than scaled by the feature count, so a caller running at
-    /// an unusually large `p` should raise it; see `DEFAULT_MIN_GAIN`.
+    /// an unusually large `p` should raise it; see `DEFAULT_MIN_GAIN`, which
+    /// also says why a caller comparing whole-tree loglikelihoods wants a
+    /// different floor rather than this one.
     pub min_gain: f64,
     /// Which pair of the round is merged.
     pub selection: StarSelection,

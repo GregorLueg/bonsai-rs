@@ -365,7 +365,10 @@ const BACKTRACK_SHRINK: f64 = 0.5;
 /// 3.2), so one can sit arbitrarily close to zero on a small enough fixture.
 /// Without a floor the relative test would then demand an improvement of zero
 /// and never terminate.
-const LOGLIK_SCALE_FLOOR: f64 = 1.0;
+///
+/// Shared with [`crate::search::spr`], whose acceptance floor is the same
+/// shape and needs the same guard for the same reason.
+pub(crate) const LOGLIK_SCALE_FLOOR: f64 = 1.0;
 
 /// Stopping rule for [`optimise_branch_lengths`].
 #[derive(Clone, Copy, Debug)]

@@ -119,6 +119,19 @@ const DEFAULT_MAX_ROUNDS: usize = 10_000;
 /// reoptimisation on large ones.
 const DEFAULT_RANDOM_MOVES: usize = 0;
 
+/// Default for [`NniParams::n_restarts`].
+///
+/// Zero: one random phase, if any, then one greedy phase, which is the
+/// composition SPEC.md section 9.4 describes. Measured against iterated local
+/// search on 2026-09-13; see [`nni`].
+const DEFAULT_RESTARTS: usize = 0;
+
+/// Default for [`NniParams::temperature`].
+///
+/// One is the specification's distribution: weights proportional to the
+/// likelihood of the resulting tree. Measured 2026-09-13; see [`nni_random`].
+pub const DEFAULT_RANDOM_TEMPERATURE: f64 = 1.0;
+
 /// Tuning knobs for search step 6.
 #[derive(Clone, Copy, Debug)]
 pub struct NniParams {
@@ -132,6 +145,13 @@ pub struct NniParams {
     pub seed: u64,
     /// Cap on greedy rounds.
     pub max_rounds: usize,
+    /// Number of perturb-and-climb repeats after the first greedy phase, each
+    /// of `n_random` random moves from the best tree so far followed by a
+    /// greedy phase, keeping the best tree seen. Zero runs the two phases once
+    /// each, in the order the specification gives them.
+    pub n_restarts: usize,
+    /// Softmax temperature of the random phase's pair draw.
+    pub temperature: f64,
 }
 
 impl Default for NniParams {
@@ -146,6 +166,8 @@ impl Default for NniParams {
             n_random: DEFAULT_RANDOM_MOVES,
             seed: 0,
             max_rounds: DEFAULT_MAX_ROUNDS,
+            n_restarts: DEFAULT_RESTARTS,
+            temperature: DEFAULT_RANDOM_TEMPERATURE,
         }
     }
 }
@@ -171,6 +193,35 @@ pub struct NniResult {
     /// Number of greedy rounds, the last of which found no improving move.
     /// Zero for a run of the random phase alone.
     pub rounds: usize,
+    /// What every greedy round saw, in order. Empty for the random phase.
+    pub trace: Vec<NniRound>,
+}
+
+/// What scanning one edge produced: that edge's contribution to the round's
+/// tallies, and the proposal itself when it yielded one worth taking.
+type ScannedEdge<T> = (NniRound, Option<(f64, u32, CentreStar<T>)>);
+
+/// Where one greedy round's candidates fell out.
+///
+/// The counts nest: every edge is either eligible or not, every eligible edge
+/// either produced a proposal or the primitive merged nothing, every proposal
+/// either changed a split or rebuilt the tree it came from, and every changed
+/// proposal either cleared [`StarParams::min_gain`] or did not. Kept because
+/// "the phase found nothing" and "the phase rejected everything it found" look
+/// identical from outside and call for opposite fixes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NniRound {
+    /// Edges whose collapse leaves a star of at least four members.
+    pub eligible: usize,
+    /// Of those, edges where the primitive merged at least one pair.
+    pub proposed: usize,
+    /// Of those, proposals whose splits differ from the current tree's.
+    pub changed: usize,
+    /// Of those, proposals whose exact gain clears the floor.
+    pub improving: usize,
+    /// The best exact gain among the changed proposals, whether or not it
+    /// cleared the floor; `NEG_INFINITY` when nothing changed a split.
+    pub best_gain: f64,
 }
 
 ///////////////
@@ -558,6 +609,7 @@ pub fn nni_random<T: BonsaiFloat>(
         let star = StarParams {
             selection: StarSelection::Weighted {
                 seed: rng.next_u64(),
+                temperature: params.temperature,
             },
             ..params.star
         };
@@ -575,6 +627,7 @@ pub fn nni_random<T: BonsaiFloat>(
         loglik,
         n_moves,
         rounds: 0,
+        trace: Vec::new(),
     })
 }
 
@@ -645,6 +698,7 @@ pub fn nni_greedy<T: BonsaiFloat>(
     let mut best: Option<f64> = None;
     let mut n_moves = 0usize;
     let mut rounds = 0usize;
+    let mut trace: Vec<NniRound> = Vec::new();
 
     while rounds < params.max_rounds {
         rounds += 1;
@@ -664,22 +718,31 @@ pub fn nni_greedy<T: BonsaiFloat>(
         // order, so the reduction breaks ties on the lower node id and the
         // winner is the same at any thread count. No float is summed across
         // candidates, so there is nothing else for the order to change.
+        //
+        // The counts ride along with the winner. They are integers and a max,
+        // so the split order cannot change them.
         let edges: Vec<u32> = tree.internal_postorder().collect();
-        let winner = edges
+        let (round, winner) = edges
             .par_iter()
             .map_init(
                 || PeelScratch::<T>::new(leaves.n_features),
-                |scratch, &k| -> Result<Option<(f64, u32, CentreStar<T>)>, BonsaiErrors> {
+                |scratch, &k| -> Result<ScannedEdge<T>, BonsaiErrors> {
+                    let mut seen = NniRound {
+                        best_gain: f64::NEG_INFINITY,
+                        ..NniRound::default()
+                    };
                     let Some(l) = tree.parent(k) else {
-                        return Ok(None);
+                        return Ok((seen, None));
                     };
                     let Some(star) = collapsed_star(&tree, &down, &up, k) else {
-                        return Ok(None);
+                        return Ok((seen, None));
                     };
+                    seen.eligible = 1;
                     let result = resolve_star(star.view(), Some(params.star))?;
                     if result.merges.is_empty() {
-                        return Ok(None);
+                        return Ok((seen, None));
                     }
+                    seen.proposed = 1;
                     // A proposal that puts the same subtrees back where they were is
                     // not an interchange: it is a reoptimisation of the three branches
                     // the star primitive creates at `l`. Those nearly always gain a
@@ -706,22 +769,40 @@ pub fn nni_greedy<T: BonsaiFloat>(
                         })
                         .collect();
                     if rebuilds_the_same_splits(&result, k_lo, k_hi, &member_leaves, n_leaves) {
-                        return Ok(None);
+                        return Ok((seen, None));
                     }
+                    seen.changed = 1;
 
                     let gain: f64 = result.merges.iter().map(|x| x.gain).sum::<f64>()
                         + collapse_delta(&tree, &down, &up, k, l, &star, scratch);
+                    seen.best_gain = gain;
                     if gain > params.star.min_gain {
-                        Ok(Some((gain, k, star)))
+                        seen.improving = 1;
+                        Ok((seen, Some((gain, k, star))))
                     } else {
-                        Ok(None)
+                        Ok((seen, None))
                     }
                 },
             )
             .try_reduce(
-                || None,
-                |a, b| {
-                    Ok(match (a, b) {
+                || {
+                    (
+                        NniRound {
+                            best_gain: f64::NEG_INFINITY,
+                            ..NniRound::default()
+                        },
+                        None,
+                    )
+                },
+                |(ra, a), (rb, b)| {
+                    let round = NniRound {
+                        eligible: ra.eligible + rb.eligible,
+                        proposed: ra.proposed + rb.proposed,
+                        changed: ra.changed + rb.changed,
+                        improving: ra.improving + rb.improving,
+                        best_gain: ra.best_gain.max(rb.best_gain),
+                    };
+                    let winner = match (a, b) {
                         (None, other) | (other, None) => other,
                         (Some(x), Some(y)) => {
                             if y.0 > x.0 || (y.0 == x.0 && y.1 < x.1) {
@@ -730,9 +811,11 @@ pub fn nni_greedy<T: BonsaiFloat>(
                                 Some(x)
                             }
                         }
-                    })
+                    };
+                    Ok((round, winner))
                 },
             )?;
+        trace.push(round);
 
         match winner {
             None => break,
@@ -754,6 +837,7 @@ pub fn nni_greedy<T: BonsaiFloat>(
         loglik,
         n_moves,
         rounds,
+        trace,
     })
 }
 
@@ -776,9 +860,30 @@ pub fn nni<T: BonsaiFloat>(
 ) -> Result<NniResult, BonsaiErrors> {
     let params = params.unwrap_or_default();
     let random = nni_random(tree, leaves, Some(params))?;
-    let mut out = nni_greedy(&random.tree, leaves, Some(params))?;
-    out.n_moves += random.n_moves;
-    Ok(out)
+    let mut best = nni_greedy(&random.tree, leaves, Some(params))?;
+    best.n_moves += random.n_moves;
+
+    // Iterated local search: perturb the best tree so far, climb, keep the
+    // better of the two. Each restart draws from its own seed so that the
+    // walks differ, and the whole thing is still a function of `params.seed`.
+    let mut n_moves = best.n_moves;
+    for restart in 0..params.n_restarts {
+        let perturbed = nni_random(
+            &best.tree,
+            leaves,
+            Some(NniParams {
+                seed: params.seed ^ (restart as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                ..params
+            }),
+        )?;
+        let climbed = nni_greedy(&perturbed.tree, leaves, Some(params))?;
+        n_moves += perturbed.n_moves + climbed.n_moves;
+        if climbed.loglik > best.loglik {
+            best = climbed;
+        }
+    }
+    best.n_moves = n_moves;
+    Ok(best)
 }
 
 ///////////

@@ -127,7 +127,7 @@ const PAR_PAIRS_MIN: usize = 64;
 /// SPEC.md section 9.4. The greedy rule drives search steps 2 and 3 and is the
 /// default; the weighted rule is the random phase of the nearest-neighbour
 /// interchanges.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum StarSelection {
     /// Take the highest-scoring pair of the round.
     #[default]
@@ -166,6 +166,12 @@ pub enum StarSelection {
         /// One draw per round, taken after the pairs have been scored and
         /// ordered, so the sampled pair does not depend on the thread count.
         seed: u64,
+        /// Temperature of the softmax: the gains are divided by this before
+        /// exponentiating, so `1.0` is the specification's distribution and
+        /// larger values flatten it. See
+        /// [`crate::search::nni::DEFAULT_RANDOM_TEMPERATURE`] for why the
+        /// interchanges run it above one.
+        temperature: f64,
     },
 }
 
@@ -1072,6 +1078,7 @@ fn walk_bounded<T: BonsaiFloat>(
 /// * `pairs` - Candidate pairs, as positions into `members`
 /// * `merge` - Branch-length solve knobs
 /// * `min_gain` - Floor a pair must clear to be eligible
+/// * `temperature` - Divisor on the gains before the exponential
 /// * `rng` - Stream the round's single draw is taken from
 ///
 /// ### Returns
@@ -1084,6 +1091,7 @@ fn sample_pair<T: BonsaiFloat>(
     pairs: &[(usize, usize)],
     merge: MergeParams,
     min_gain: f64,
+    temperature: f64,
     rng: &mut SplitMix64,
 ) -> Result<Candidate, BonsaiErrors> {
     let p = work.p;
@@ -1122,12 +1130,12 @@ fn sample_pair<T: BonsaiFloat>(
     let total: f64 = scored
         .iter()
         .filter(eligible)
-        .map(|c| (c.gain - top).exp())
+        .map(|c| ((c.gain - top) / temperature).exp())
         .sum();
     let target = rng.uniform() * total;
     let mut acc = 0.0f64;
     for c in scored.iter().filter(eligible) {
-        acc += (c.gain - top).exp();
+        acc += ((c.gain - top) / temperature).exp();
         if acc >= target {
             return Ok(*c);
         }
@@ -1307,7 +1315,7 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
     let mut since_exact_centre = usize::MAX;
     let mut rng = SplitMix64::new(match params.selection {
         StarSelection::Greedy => 0,
-        StarSelection::Weighted { seed } => seed,
+        StarSelection::Weighted { seed, .. } => seed,
     });
 
     while members.len() > MIN_CENTRE_MEMBERS {
@@ -1369,7 +1377,7 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
                 }
                 scan.best
             }
-            StarSelection::Weighted { .. } => {
+            StarSelection::Weighted { temperature, .. } => {
                 scored_last_round = pairs.len();
                 sample_pair(
                     &work,
@@ -1377,6 +1385,7 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
                     &pairs,
                     params.merge,
                     params.min_gain,
+                    temperature,
                     &mut rng,
                 )?
             }

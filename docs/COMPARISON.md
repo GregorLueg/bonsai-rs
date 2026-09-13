@@ -77,7 +77,7 @@ measured rather than as extrapolated.
 
 ## What the trees look like
 
-![radial layouts at 10,000 cells](figures/n10000_tree_layout.png)
+![radial layouts at 10,000 cells](https://raw.githubusercontent.com/GregorLueg/bonsai-rs/main/docs/figures/n10000_tree_layout.png)
 
 Equal-angle radial layout, radius is cumulative branch length from the root,
 leaves coloured by cutting the *true* tree's topology into ten clades so the
@@ -100,7 +100,7 @@ The same reversal, in a different measure. At 10,000 the published
 implementation's worst clade is split into seven disjoint pieces against
 bonsai-rs's five.
 
-![distance recovery at 10,000 cells](figures/n10000_distance_recovery.png)
+![distance recovery at 10,000 cells](https://raw.githubusercontent.com/GregorLueg/bonsai-rs/main/docs/figures/n10000_distance_recovery.png)
 
 Tree path distance against true squared Euclidean distance, 20,000 randomly
 sampled pairs, the same pairs in both panels. Both show the same qualitative
@@ -116,7 +116,7 @@ subset of pairs carrying the average.
 Both implementations produce trees with zero-length branches, and they produce
 them in different places.
 
-![degenerate regions at 10,000 cells](figures/n10000_degenerate_regions.png)
+![degenerate regions at 10,000 cells](https://raw.githubusercontent.com/GregorLueg/bonsai-rs/main/docs/figures/n10000_degenerate_regions.png)
 
 | tree | zero-length leaf edges | zero-length internal edges | polytomies |
 |---|---|---|---|

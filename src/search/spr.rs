@@ -1840,9 +1840,17 @@ mod tests {
                     after >= before,
                     "seed {seed} round {round}: {before} fell to {after}"
                 );
-                assert_relative_eq!(after, out.loglik, epsilon = 1e-9);
+                // Relative, not absolute: both sides are sums of magnitude
+                // `O(n p)`, so an absolute tolerance is a fixture-size
+                // tolerance and stops meaning anything on real data.
+                assert_relative_eq!(after, out.loglik, max_relative = 1e-12);
                 let claimed: f64 = out.gains.iter().map(|g| g.gain).sum();
-                assert_relative_eq!(after - before, claimed, epsilon = 1e-6);
+                let drift = (after - before - claimed).abs();
+                assert!(
+                    drift <= 1e-12 * after.abs(),
+                    "seed {seed} round {round}: drift {drift:e} on |L| {:e}",
+                    after.abs()
+                );
                 before = after;
                 tree = out.tree;
             }
@@ -1864,7 +1872,7 @@ mod tests {
             let out = spr(&start, leaves, None).expect("spr");
             let after = tree_loglik(&out.tree, leaves).expect("loglik");
             assert!(after >= before, "seed {seed}: {before} fell to {after}");
-            assert_relative_eq!(after, out.loglik, epsilon = 1e-9);
+            assert_relative_eq!(after, out.loglik, max_relative = 1e-12);
             assert!(out.rounds >= 1);
         }
     }

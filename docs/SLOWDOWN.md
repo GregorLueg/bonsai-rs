@@ -16,7 +16,10 @@ merge score of magnitude `O(p)` and is applied unchanged to a whole-tree
 loglikelihood of magnitude `O(n p)`. Resumed from the cached post-round-100 tree,
 each round accepts exactly one move of gain `5.6e-8`, the tree cycles with
 period two, and the fresh loglikelihood does not change. With the floor raised
-to `1e-4` the same tree accepts nothing. **The queued uncapped 10k run
+to `1e-4` the same tree accepts nothing. **The same cycle appears at 2500
+cells**: a subsample of the 10k data converges in 8 rounds and then accepts one
+move of gain `4.19e-9` a round, for 2620 rounds until killed. The native 5k
+run's 9-round convergence was rounding luck. **The queued uncapped 10k run
 (`SPR_MAX_ROUNDS=100000`) will therefore not converge; at 21 s a round it runs
 for about 24 days and blocks the two 5k replicates behind it. Kill it.**
 
@@ -126,11 +129,40 @@ linkage start, default floor. `drift` as above.
 | 11 | 0 | | | | 2486 | 5 |
 
 769 SPR moves in 11 rounds, 31.4 s; NNI 8 moves in 9 rounds, 3.1 s; branch
-3.8 and 3.9 s. At this size the smallest accepted gain in any round is
-`2e-5` and the drift is `1e-9`, so the floor is not reached: the rounding
-noise scales with `|L|` (`1.7e6` here against `1.1e7` at 10k) and the pool of
-neutral candidates with `n`. Every rung's final round finds nothing the way
-the 5k run's did.
+3.8 and 3.9 s. Seed 2 at 1250: 669 SPR moves, converged; NNI 1 move. At this
+size the smallest accepted gain in any round is `2e-5` and the drift is
+`1e-9`, so the floor is not reached.
+
+### The 2500 rung: the cycle again, at a quarter of the size (load 14 to 36)
+
+2500 cells from the 10k output, seed 1, default floor. Killed after 2630
+rounds and 2 h 46 min.
+
+| round | moves | sum gain | smallest gain | drift | nodes | RF to previous | RF to two back |
+|---|---|---|---|---|---|---|---|
+| 1 | 851 | 11060 | 4.1e-8 | 6.5e-9 | 4988 | | |
+| 2 | 294 | 1624 | 2.2e-5 | 3.3e-9 | 4987 | 1961 | |
+| 3 | 99 | 410 | 4.7e-4 | 1.4e-9 | 4984 | 474 | 1964 |
+| 4 | 43 | 62.1 | 6.6e-4 | 1.4e-9 | 4979 | 206 | 471 |
+| 5 | 21 | 25.4 | 2.2e-2 | 1.9e-9 | 4980 | 70 | 201 |
+| 6 | 7 | 6.16 | 6.4e-2 | 2.3e-9 | 4979 | 40 | 73 |
+| 7 | 3 | 0.40 | 3.8e-2 | 3.3e-9 | 4979 | 13 | 38 |
+| 8 | 1 | 0.28 | 0.28 | 1.9e-9 | 4979 | 0 | 15 |
+| 9 | 1 | 1.9e-9 | 1.9e-9 | 1.4e-9 | 4978 | 3 | 1 |
+| 10 | 1 | 6.2e-5 | 6.2e-5 | 4.2e-9 | 4979 | 2 | 4 |
+| 11 to 2630 | 1 each | 4.19e-9 each | 4.19e-9 | 4.19e-9 | 4978, 4979, ... | 0 | 1 |
+
+From round 11 every round accepts the same move of gain `4.19e-9`, which is
+nine ulps of `|L| = 3.2e6`, the node count alternates between 4978 and 4979,
+and the tree is identical to the one two rounds back (RF 1 is the polytomy
+being made and unmade). So the cycle is not a 10k phenomenon: it appears as
+soon as the rounding noise of the whole-tree sum crosses `1e-9`, which at
+`2^-52 |L|` times a few ulps happens somewhere between 1250 (`|L| = 1.7e6`)
+and 2500 (`3.2e6`) cells. The native 5k run converging in 9 rounds was the
+rounding landing negative on its last neutral candidate, nothing more.
+
+Real work at this rung, rounds 1 to 8: 1319 moves, 13190 nats, 57.6 s at
+load 14 to 20. The remaining 2622 rounds gained `1.1e-5` nats over 2 h 45 min.
 
 ## What the numbers say
 
@@ -241,11 +273,28 @@ pessimistic at 10k); NNI 1.17 and 2.44 s, `n^1.06` (load 17 and 15).
 
 ## What I could not settle
 
+Ladder rungs in hand: 1250 seeds 1 and 2 (complete), 2500 seed 1 (SPR
+complete to round 10, then the cycle; no NNI). Not run: 2500 seed 2, 5000
+seed 1, and 5000 seed 1 at the `1e-4` floor. The chain was stopped at 15:38
+because the machine was at load 34 with the floored 10k runs on it. The
+remaining rungs need the machine only for their seconds; their counts are
+load-independent but still need the CPU time, about 3 minutes for 2500 and
+6 for 5000 at ten threads on a quiet box. They are not worth running until
+the scale-relative floor is in, since every rung above 1250 will cycle at the
+default floor exactly as 2500 did.
+
 - The real per-round profile of the 10k SPR run in rounds 1 to 9, and how many
-  of its 4843 moves were noise. Ladder in progress.
-- Why NNI's move count grows superlinearly. Ladder in progress; the candidate
-  explanations left are a larger interchange neighbourhood per leaf and a
-  start that is relatively worse in a way RF does not show.
+  of its 4843 moves were noise. Inferred from the 1250 and 2500 profiles,
+  which converge in 8 to 10 rounds with the move count halving or better each
+  round: the 10k run's first 9 rounds accepted roughly 4700 real moves and the
+  remaining 91 rounds accepted one to a few noise moves each. The floored 10k
+  run the coordinator started will give the measured figure.
+- Why NNI's move count grows superlinearly: 8 and 1 at 1250 (two seeds), 20 at
+  5k native, 89 at 10k native. The seed-to-seed spread at 1250 is a factor of
+  eight, so nothing about the exponent can be said from three sizes and four
+  runs. It is real work (all gains above 0.08 nats), it is 8 per cent of the
+  10k run, and its per-round cost is linear, so a fix would be to cut the
+  round count, not the round. Not urgent.
 - Any exponent on native realistic data beyond the two rungs; the 10k rung is
   contaminated by the SPR tail.
 - Whether the 91 noise rounds changed the 10k tree's quality. RF after SPR is

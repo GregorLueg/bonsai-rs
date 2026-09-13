@@ -18,7 +18,7 @@ name = "bonsai_rs"
 path = "src/lib.rs"
 
 [dependencies]
-ann-search-rs = "0.6.0"
+ann-search-rs = "0.8.4"
 num-traits = "0.2.19"
 rayon = "1.11.0"
 rustc-hash = "2.1.1"
@@ -73,4 +73,22 @@ harness = false
 ## Distance recovery, the paper's Fig. S8 metric. Plain `main`, no criterion.
 [[bench]]
 name = "recovery"
+harness = false
+
+## Does step 2 earn its keep? Four starting trees through the identical
+## refinement. Plain `main`, no criterion.
+[[bench]]
+name = "start_tree"
+harness = false
+
+## Reducibility of the merge score and how far the feature axis can be
+## subsampled. Plain `main`, no criterion.
+[[bench]]
+name = "approx_star"
+harness = false
+
+## Step 6 on the tree step 5 leaves behind, and what the knobs around it buy
+## in loglikelihood and Robinson-Foulds. Plain `main`, no criterion.
+[[bench]]
+name = "nni_real"
 harness = false

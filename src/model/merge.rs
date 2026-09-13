@@ -79,10 +79,18 @@ impl Default for MergeParams {
     /// `split_tol` is looser than the branch-length tolerance in
     /// `model::branch` on purpose: the gain is stationary in the split at the
     /// optimum, so an error of `eps` in the split costs `O(eps^2)` in the score.
+    /// It was `1e-8` while the split was bisected. The secant solve that
+    /// replaced the bisection on 2026-09-12 lands where its iterates took it,
+    /// not on a fixed grid of midpoints, so two solves on inputs that differ
+    /// in the last place can return splits `eps` apart where the bisection
+    /// returned the same bits; at `1e-8` that showed as a `1.4e-9` relative
+    /// drift between the exact and incremental centre in
+    /// `search::bounds`. Two more digits cost two more derivative passes of
+    /// twenty and put the drift back under the noise.
     fn default() -> Self {
         Self {
             coord_sweeps: 2,
-            split_tol: 1e-8,
+            split_tol: 1e-10,
             max_split_iter: 40,
         }
     }
@@ -410,10 +418,16 @@ impl MergeScratch {
     /// Optimise how the total `k`-to-`l` length divides between the two child
     /// branches, with `t_ar` held fixed.
     ///
-    /// Bracketed on `(0, total)` and solved by bisection on the analytic
-    /// derivative. Bisection rather than a Newton step because the second
-    /// derivative is not available and the bracket is already the right order
-    /// of magnitude, so few halvings are needed.
+    /// Bracketed on `(0, total)` and solved on the analytic derivative by
+    /// regula falsi with the Illinois modification, which is a secant step
+    /// that never leaves the bracket and halves a stale end's weight so the
+    /// bracket cannot stall on one side. No second derivative is available, so
+    /// Newton is out; plain bisection was what ran until 2026-09-12, and at the
+    /// shipped tolerance it cost 29 derivative passes per sweep, 58 per pair,
+    /// which on the four-member stars search step 5 resolves after every
+    /// regraft was 37 per cent of that step's single-thread time. The secant
+    /// reaches the same tolerance in a handful; the count is recorded in
+    /// `PERFORMANCE.md`.
     ///
     /// ### Params
     ///
@@ -436,23 +450,48 @@ impl MergeScratch {
         // leaf's own inverse precision, which the star primitive has already
         // checked is finite and positive, so neither reciprocal divides by
         // zero at a zero branch length.
-        if self.split_derivative(total, 0.0, t_ar) <= 0.0 {
+        let mut f_lo = self.split_derivative(total, 0.0, t_ar);
+        if f_lo <= 0.0 {
             return 0.0;
         }
-        if self.split_derivative(total, total, t_ar) >= 0.0 {
+        let mut f_hi = self.split_derivative(total, total, t_ar);
+        if f_hi >= 0.0 {
             return total;
         }
         let (mut lo, mut hi) = (0.0f64, total);
+        // Which end the last step moved: `1` for `lo`, `-1` for `hi`, `0` for
+        // neither yet. Two moves of the same end in a row is the stall the
+        // Illinois halving breaks.
+        let mut moved = 0i8;
 
         for _ in 0..params.max_split_iter {
             if hi - lo <= params.split_tol * total {
                 break;
             }
-            let mid = 0.5 * (lo + hi);
-            if self.split_derivative(total, mid, t_ar) > 0.0 {
+            let secant = (lo * f_hi - hi * f_lo) / (f_hi - f_lo);
+            let mid = if secant > lo && secant < hi {
+                secant
+            } else {
+                0.5 * (lo + hi)
+            };
+            let f_mid = self.split_derivative(total, mid, t_ar);
+            if f_mid == 0.0 {
+                return mid;
+            }
+            if f_mid > 0.0 {
                 lo = mid;
+                f_lo = f_mid;
+                if moved == 1 {
+                    f_hi *= 0.5;
+                }
+                moved = 1;
             } else {
                 hi = mid;
+                f_hi = f_mid;
+                if moved == -1 {
+                    f_lo *= 0.5;
+                }
+                moved = -1;
             }
         }
         0.5 * (lo + hi)

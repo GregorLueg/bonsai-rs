@@ -129,6 +129,17 @@ pub enum BonsaiErrors {
         reason: String,
     },
 
+    /// A neighbour-search backend failed while building the graph the linkage
+    /// or the candidate restriction runs over.
+    ///
+    /// Carries the backend's own message rather than wrapping its error type,
+    /// so `ann-search-rs` does not appear in this crate's public surface.
+    #[error("Neighbour graph could not be built: {reason}")]
+    NeighbourGraph {
+        /// What the backend reported
+        reason: String,
+    },
+
     // -- numerics --
     /// A bracketed root find failed to converge.
     #[error(

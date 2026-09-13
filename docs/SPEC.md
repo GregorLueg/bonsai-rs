@@ -359,6 +359,31 @@ Seven steps:
 6. Nearest-neighbour interchanges.
 7. Final global branch-length optimisation.
 
+**Deviation: an eighth step, 2026-09-13.** Step 3 is the only step that
+collapses zero-length edges, and it runs before step 4. Section 6 is explicit
+that a branch solve landing on `t = 0` is normal, so every zero-length edge
+steps 4 to 7 create outlives the only pass that would remove one. This crate
+therefore runs the collapse of section 9.2 once more after step 7, followed by
+a branch reoptimisation.
+
+Measured on Sanity-preprocessed data at 10,000 cells by 2,767 genes: 32
+internal zero-length edges survive step 7, and removing them takes
+Robinson-Foulds from 2659 to 2632 and the loglikelihood from -11253193.9 to
+-11253188.3, for 2.75 seconds.
+
+It runs last rather than before step 5, which was the other candidate.
+Collapsing early reaches 2614, eighteen splits better again, but costs 247
+seconds because a collapsed tree hands every nearby regraft a higher-degree
+star, and it moves distance recovery the wrong way on the one seed measured.
+Running after the search cannot change what the search finds, which is what
+makes it safe unconditionally, and the collapse only ever removes structure so
+it cannot invent a split the data does not support.
+
+What it does not touch is a zero-length edge at a **leaf**, which is not an
+internal edge. Those are the model declining to separate two cells it has no
+evidence to separate, 129 of them at that size, and they are the answer rather
+than a defect.
+
 ### 9.1 The star primitive (SI.C.2)
 
 **One routine drives steps 2, 3 and 6.** Given a node `X` and the star of its

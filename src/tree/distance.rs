@@ -9,26 +9,34 @@
 //! So this is the measurement to compare two implementations on, and the one
 //! that would catch a search that found a plausible topology by accident.
 //!
-//! ### On squared distances
-//!
-//! Tree path distance is compared against **squared** Euclidean distance, not
-//! Euclidean. Under the model a branch of length `t` is a diffusion of variance
-//! `t` per feature, so the expected squared displacement across a path is the
-//! summed branch length. That is the relation the model actually asserts;
-//! correlating against unsquared distance would be measuring something the
-//! method never claimed.
+//! Nothing in the search calls any of this. It is scored once, from
+//! `benches/recovery.rs`, so it is not a target for vectorisation however much
+//! [`data_distances`] and [`pearson`] look like one: a kernel the pipeline never
+//! runs cannot be worth a lane. [`data_distances`] is parallel because it is
+//! `O(pairs * p)` and the ceiling is two million pairs; [`pearson`] is `O(n)`
+//! against that and is left alone.
+
+use rayon::prelude::*;
 
 use crate::tree::Tree;
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::{BonsaiFloat, wide};
+
+////////////
+// Consts //
+////////////
 
 /// Pair count above which the metrics subsample rather than enumerate.
 ///
 /// All pairs is `n * (n - 1) / 2`, which is 2 million at 2048 leaves and 450
 /// million at 30 thousand, so the full set stops being storable well before the
 /// search stops being runnable. Two million pairs estimates a correlation far
-/// past any precision the comparison needs. Chosen 2026-09-05 on that argument.
+/// past any precision the comparison needs.
 pub const MAX_PAIRS: usize = 2_000_000;
+
+///////////////
+// Functions //
+///////////////
 
 /// Path distances from one node to every other, along the tree.
 ///
@@ -97,10 +105,6 @@ pub fn leaf_pairs(n_leaves: usize, max_pairs: usize, seed: u64) -> Vec<(usize, u
         return out;
     }
 
-    // Sampling with replacement and then deduplicating would bias towards the
-    // pairs drawn twice; drawing distinct ordered pairs and normalising is
-    // uniform over unordered pairs and needs no rejection loop beyond the
-    // degenerate i == j.
     let mut rng = SplitMix64::new(seed);
     let mut out = Vec::with_capacity(max_pairs);
     while out.len() < max_pairs {
@@ -161,7 +165,7 @@ pub fn data_distances<T: BonsaiFloat>(
     pairs: &[(usize, usize)],
 ) -> Vec<f64> {
     pairs
-        .iter()
+        .par_iter()
         .map(|&(i, j)| {
             let (a, b) = (i * n_features, j * n_features);
             let mut acc = 0.0f64;

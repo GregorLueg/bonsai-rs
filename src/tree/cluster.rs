@@ -1,5 +1,4 @@
-//! Unsupervised clustering by iterative branch cutting, and the root selection
-//! that follows from it (SPEC.md section 9 step 7, section 7.2).
+//! Unsupervised clustering by iterative branch cutting.
 //!
 //! Cut a branch and the tree falls into two pieces; cut `k - 1` branches and it
 //! falls into `k`. The clustering of the Methods picks those branches greedily,
@@ -76,23 +75,17 @@
 use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Fraction of the cut branch that ends up below the new root, on the side of
 /// the node the branch hangs from.
-///
-/// Ours, chosen 2026-08-31. The midpoint is the only split that does not depend
-/// on which end of the branch you name first, and any split at all preserves
-/// every leaf-to-leaf path length, since the two halves sum to the original. A
-/// half is also exact in binary floating point, so the two pieces of a branch
-/// add back to it bit for bit.
 pub const ROOT_SPLIT: f64 = 0.5;
 
-/////////////////
-// The results //
-/////////////////
+////////////////
+// Clustering //
+////////////////
 
 /// A partition of the leaves into clusters, and what it cost.
 ///
@@ -128,9 +121,9 @@ impl Clustering {
     }
 }
 
-//////////////////
+///////////////////
 // The objective //
-//////////////////
+///////////////////
 
 /// Summed pairwise distance between every pair of leaves of a tree.
 ///
@@ -232,15 +225,6 @@ pub fn cluster(tree: &Tree, n_clusters: usize) -> Clustering {
 
 /// Nodes spread over the tree by the cutting procedure, one per cluster.
 ///
-/// What SPEC.md section 7.2 asks for as the start points of the placement beam
-/// search: the centres of the distance-based clustering, rather than an
-/// arbitrary spread. Centres come back with the largest cluster first, which
-/// matters where the caller gives the first start point a privileged position,
-/// as [`crate::model::place::place`] does with its shared visited set.
-///
-/// Fewer than `n_centres` nodes come back when the tree has fewer leaves than
-/// that, since a cluster per leaf is as fine as the partition goes.
-///
 /// ### Params
 ///
 /// * `tree` - Tree to spread points over
@@ -258,10 +242,6 @@ pub fn cluster_centres(tree: &Tree, n_centres: usize) -> Vec<u32> {
 ////////////////////
 
 /// The branch the clustering would cut first, identified by its lower node.
-///
-/// SPEC.md section 9 step 7 puts the root here. The choice affects the drawing
-/// and nothing else: the loglikelihood is independent of the root (SPEC.md
-/// section 2, S14).
 ///
 /// ### Params
 ///
@@ -298,23 +278,6 @@ pub fn root_edge(tree: &Tree) -> Result<u32, BonsaiErrors> {
 /// per-leaf data the caller holds, a [`crate::model::likelihood::NodeState`]
 /// included, indexes the result unchanged.
 ///
-/// ### The degree-two root
-///
-/// The result's root has exactly two children, which is what "on a branch"
-/// means. That is the ordinary rooted representation of an unrooted tree and it
-/// is what every tree in this crate already looks like, [`Tree::balanced_binary`]
-/// included; the pruning recursion scores it identically to the same tree rooted
-/// anywhere else. What a degree-two node *is* degenerate for is branch-length
-/// optimisation, as the docs in [`crate::model::global`] set out: only the sum
-/// of the two branches below it is identifiable, so the optimiser sees a flat
-/// direction along them. That is a reason to reroot for display after the search
-/// rather than during it, not a reason to avoid it.
-///
-/// If the old root had exactly two children it is suppressed, its two branches
-/// merged into one, since rerooting elsewhere would otherwise leave it with a
-/// single child and no arena holds that. So the result has the same node count
-/// as the input for a binary-rooted tree, and one more for a polytomous one.
-///
 /// ### Params
 ///
 /// * `tree` - Tree to reroot
@@ -349,9 +312,6 @@ pub fn reroot(tree: &Tree, edge: u32) -> Result<Tree, BonsaiErrors> {
     parent.push(NO_NODE);
     branch.push(0.0);
 
-    // Everything off the root-ward path keeps its parent; the path from `above`
-    // up to the old root reverses, each node inheriting the length of the edge
-    // it used to point up along.
     let mut chain = vec![above];
     let mut walk = above;
     while let Some(p) = tree.parent(walk) {
@@ -374,9 +334,6 @@ pub fn reroot(tree: &Tree, edge: u32) -> Result<Tree, BonsaiErrors> {
         prev = u;
     }
 
-    // The old root loses one child to the reversal; if it had only two it is now
-    // a degree-two node hanging in the middle of the tree, which the arena
-    // cannot hold and which contributes nothing anyway.
     let orphaned = match chain.len() {
         1 => edge,
         k => chain[k - 2],
@@ -399,10 +356,6 @@ pub fn reroot(tree: &Tree, edge: u32) -> Result<Tree, BonsaiErrors> {
 }
 
 /// Reroot a tree onto the branch the clustering would cut first.
-///
-/// [`root_edge`] then [`reroot`]. This is SPEC.md section 9 step 7 in full, and
-/// it is a display step: the loglikelihood is unchanged (SPEC.md section 2,
-/// S14).
 ///
 /// ### Params
 ///

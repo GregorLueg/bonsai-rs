@@ -772,9 +772,80 @@ every pre-search stage**: a zero-length branch is not yet a polytomy in the
 arena, so the 30 to 35 polytomies in a final tree are made later by SPR's and
 NNI's splices and are a different quantity from the 684.
 
-No fix attempted. Re-running resolution after step 4 is the obvious move and it
-changes the pipeline order `src/bonsai.rs` calls not negotiable, so it wants the
-owner. One thing to measure before anyone rearranges anything: since step 5
-already removes 71 per cent of them as a side effect, the value of a step 4.5 is
-probably concentrated in the regions the search never visits, and that is a
-count per subtree rather than a global one.
+### Is the residual a defect or an honest report? Measured
+
+Counting the degenerate branches says they exist, not whether removing them
+would help. The test that decides it: take the finished tree, run
+`resolve_polytomies` on it (which collapses the zero-length internal edges on
+entry and then re-resolves), reoptimise the branch lengths, and score. If
+Robinson-Foulds to the generating tree improves, the structure is a defect; if
+it is flat or worse, the residual is the model reporting honestly that those
+cells are unresolvable. 2.75 s at 10k, 0.62 s at 5k.
+
+| | 10k before | 10k after | 5k before | 5k after |
+|---|---|---|---|---|
+| Robinson-Foulds | 2659 | 2632 | 1295 | 1293 |
+| distance recovery | 0.466268 | 0.466231 | 0.665756 | 0.665638 |
+| loglik | -11253193.873 | -11253188.256 | -5557975.945 | -5557974.987 |
+| zero-length branches | 161 | 129 | 56 | 51 |
+| internal nodes | 19967 | 19942 | 9981 | 9979 |
+
+Robinson-Foulds improves, 27 splits at 10k. **But not for the reason the test
+was built to detect.** The pass made 7 resolutions worth 2.307 nats over the
+whole tree and removed 25 internal nodes. Adding structure bought nothing worth
+naming; the 27 splits are the collapse deleting splits the data does not
+support, one improvement in Robinson-Foulds per wrong split removed. So what the
+linkage path is missing after step 4 is the **collapse**, not the resolver that
+happens to run it on entry, which is consistent with step 5 having already done
+the resolving as a side effect of 71 per cent of its regrafts.
+
+### The two counts are not the same thing, and neither is the arm
+
+Three quantities get conflated here, so they are separated once:
+
+- A **zero-length branch** leaves the node in the arena with its degree intact.
+  It is invisible to anything that tests degree.
+- A **polytomy** is a node of degree above three. It exists only once a splice
+  or a collapse has made one, which is why the count is zero at every
+  pre-search stage and 30 to 35 in a final tree. The 684 and the 31 are
+  different phenomena and reading them as one leads straight to the wrong fix.
+- A zero-length branch at a **leaf** edge is neither, and cannot be removed by
+  any collapse or resolution, because a leaf edge is not an internal edge.
+
+Splitting the residual on that last line is what settles the question:
+
+| tree | zero at a leaf edge | zero at an internal edge |
+|---|---|---|
+| 10k after SPR | 634 | 54 |
+| 10k final | 129 | 32 |
+| 10k final, after the resolve pass | 129 | 0 |
+| 5k final | 52 | 4 |
+| 10k generating tree | 0 | 0 |
+
+Four fifths of the residual is cells sitting at exactly zero distance from their
+parent. The resolve pass takes the internal ones to zero and leaves all 129 leaf
+ones exactly as they were. Those are the degenerate leaves that render as a
+fragmented arm, and they are the boundary case SPEC.md section 6 describes:
+`f(0) >= 0`, so the optimum is `t = 0`, so the model found no evidence
+separating that cell from its neighbour. The generating tree has none, so they
+are a statement about noise in the input rather than about the tree. **No
+pipeline change can remove them and none should**; resolving them would be
+adding structure the data does not support, which is the failure this method
+advertises itself against.
+
+### What is left for the owner
+
+Two separable decisions, and only the first is about the pipeline order.
+
+1. A **collapse** after step 4, or after step 7, buys 27 splits at 10k and 2 at
+   5k for under 3 s, and it only ever removes structure, so it cannot
+   hallucinate. Smaller than re-running step 3 and it does not touch the order
+   `src/bonsai.rs` calls not negotiable. Unmeasured: whether collapsing before
+   step 5 rather than after changes what the search then finds. That needs a
+   full run and was not done.
+2. The 129 zero-length leaf edges stay. If they render badly, the answer is in
+   the rendering or in the caveat, not in the search.
+
+Nothing in the pipeline was changed. Both probes (`harness leak` and
+`harness resolve`) live in a scratchpad copy of the comparison harness, not in
+this crate.

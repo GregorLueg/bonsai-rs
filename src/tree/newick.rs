@@ -743,8 +743,8 @@ mod tests {
 
     #[test]
     fn test_the_writer_refuses_the_one_tree_the_reader_will_not_take_back() {
-        // Adversarial review 2026-08-27, N15. The arena holds a lone leaf and
-        // `tree::cluster` relies on that, but Newick has no form for one: the
+        // The arena holds a lone leaf and `tree::cluster` relies on that, but
+        // Newick has no form for one: the
         // writer emitted `"only;"` and the reader rejected it, so the two
         // disagreed about what a tree is. The writer now refuses instead.
         let tree = Tree::from_parents(vec![NO_NODE], vec![0.0], 1).expect("one leaf is an arena");
@@ -884,8 +884,8 @@ mod tests {
 
     #[test]
     fn test_a_trailing_comma_is_an_unnamed_leaf() {
-        // Adversarial review 2026-08-27, N15. Deliberate and standard, but it
-        // means a typo is a wrong topology rather than an error, so it is
+        // Deliberate and standard, but it means a typo is a wrong topology
+        // rather than an error, so it is
         // pinned here rather than left to be rediscovered.
         let (tree, names) = parse_newick("(a,b,);").expect("valid Newick");
         assert_eq!(names, vec!["a", "b", ""]);

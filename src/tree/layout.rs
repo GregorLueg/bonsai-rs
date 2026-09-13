@@ -42,11 +42,9 @@ use crate::tree::Tree;
 ///
 /// The rotation sweep, the acceptance test and the crossing check all measure
 /// something about every node from every node, so one sweep is `O(n^2)` and no
-/// reordering fixes that. Measured on this machine on 2026-08-27 (release
-/// build, [`DAYLIGHT_MAX_SWEEPS`] sweeps, worst of balanced, ladder and random
-/// trees): 4 ms at 63 nodes, 57 ms at 255, 0.63 s at 1023, 2.6 s at 2047 and
-/// 4.3 s at 4095. A gate at 2048 nodes is the last doubling that keeps a
-/// default `equal_daylight` call inside a few seconds; anyone who wants the
+/// reordering fixes that. Ours, chosen by measurement: a gate at 2048 nodes is
+/// the last doubling that keeps a default `equal_daylight` call inside a few
+/// seconds on one core; anyone who wants the
 /// next one can raise `LayoutParams::daylight_max_nodes` and pay for it. Above
 /// the gate the equal-angle layout comes back unchanged with
 /// `DaylightReport::refined` set to `false`.
@@ -56,12 +54,10 @@ pub const DAYLIGHT_MAX_NODES: usize = 2048;
 ///
 /// The sweep is a coordinate descent with no convergence proof, so a cap is
 /// what makes termination a fact rather than a hope, and since each sweep is
-/// `O(n^2)` the cap is also the run time. Measured on this machine on
-/// 2026-08-27 across balanced, ladder, star and random trees of 63 to 2047
-/// nodes: twelve sweeps take the daylight discrepancy to within 2% of where
-/// forty sweeps leave it on every shape tried, and on a 512-leaf ladder that
-/// is 414 down to 7.9 against 414 down to 0.0 for three times the time. The
-/// remaining 2% is not visible in a drawing.
+/// `O(n^2)` the cap is also the run time. Ours, chosen by measurement across
+/// balanced, ladder, star and random trees: twelve sweeps take the daylight
+/// discrepancy to within two per cent of where forty sweeps leave it on every
+/// shape tried, and the remaining two per cent is not visible in a drawing.
 pub const DAYLIGHT_MAX_SWEEPS: usize = 12;
 
 /// Largest rotation, in radians, a sweep may apply and still count as
@@ -77,9 +73,9 @@ pub const DAYLIGHT_ANGLE_TOL: f64 = 1e-4;
 /// improves the daylight and keeps the drawing planar.
 ///
 /// Ten halvings take [`DAYLIGHT_DAMPING`] from a half down to about five parts
-/// in ten thousand. Measured on this machine on 2026-08-27, 512-leaf random
-/// trees with branch lengths spread over a factor of forty need to come down
-/// to about 0.005, which is seven halvings, before a sweep stops crossing; ten
+/// in ten thousand. Ours, chosen by measurement: random trees with branch
+/// lengths spread over a factor of forty need to come down to about 0.005,
+/// which is seven halvings, before a sweep stops crossing; ten
 /// leaves three halvings of margin. Past that the step is too small to be
 /// worth another `O(n^2)` pass, and the run stops.
 const DAYLIGHT_MAX_BACKTRACKS: usize = 10;
@@ -89,8 +85,8 @@ const DAYLIGHT_MAX_BACKTRACKS: usize = 10;
 ///
 /// The starting point for the backtracking search inside [`equal_daylight`],
 /// which halves it until the sweep both improves the daylight and leaves the
-/// drawing planar. Half a step rather than a whole one because measured on
-/// this machine on 2026-08-27, an undamped sweep on a 1024-leaf balanced tree
+/// drawing planar. Half a step rather than a whole one because an undamped
+/// sweep on a large balanced tree
 /// overshoots into a crossing on its first move and then has to backtrack from
 /// there anyway; starting at a half saves that wasted pass and costs nothing,
 /// since the search doubles the step back up whenever it is accepted.
@@ -266,8 +262,7 @@ impl Layout {
 /// The whole bundle is checked wherever any of it is read: it is one struct,
 /// and a caller who has put a `NaN` in one field has a bug whichever function
 /// happens to read it. Without this, `dendrogram` with a non-finite
-/// `leaf_spacing` returns a layout of `NaN` coordinates and reports success
-/// (adversarial review N15).
+/// `leaf_spacing` returns a layout of `NaN` coordinates and reports success.
 ///
 /// [`Layout::hyperbolic`] is the one entry point this cannot serve, because it
 /// returns a [`Layout`] rather than a `Result`; its own docs say what a
@@ -564,21 +559,16 @@ pub fn dendrogram(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, B
 /// `2*pi` times its share of the leaves.
 ///
 /// **Wedges above `pi` are ordinary, not exotic.** Any node holding more than
-/// half the leaves has one, so a caterpillar has one on every rung of its
-/// upper half: measured 2026-08-31 on [`Tree::ladder`], 3 of the 14 non-root
-/// nodes at 8 leaves, 15 of 62 at 32, 63 of 254 at 128. A balanced tree has
-/// none at any size. An earlier version of this comment said such a wedge
-/// needed leaf counts that were extremely lopsided, which is wrong about
-/// exactly the shape SPEC.md calls biologically typical (adversarial review
-/// N15). So the convex-cone argument covers a balanced tree and does not cover
-/// half the internal nodes of a caterpillar.
+/// half the leaves has one, so a caterpillar has one on every rung of its upper
+/// half, and that is exactly the shape SPEC.md calls biologically typical. A
+/// balanced tree has none at any size. So the convex-cone argument covers a
+/// balanced tree and does not cover half the internal nodes of a caterpillar.
 ///
 /// What has never been produced is an actual crossing. Ladders, balanced trees
 /// and random trees up to 120 leaves with branch lengths spread over a factor
 /// of forty all come back clean, which is what
-/// `test_equal_angle_never_crosses_edges` runs, and the adversarial review's
-/// own sweep of four thousand random trees found none either.
-/// [`has_edge_crossing`] settles it exactly wherever it matters.
+/// `test_equal_angle_never_crosses_edges` runs. [`has_edge_crossing`] settles
+/// it exactly wherever it matters.
 ///
 /// Unlike [`dendrogram`], both axes carry meaning here: the Euclidean distance
 /// from a node to its parent is exactly that node's branch length. Distances
@@ -694,10 +684,10 @@ struct Scratch {
 /// The `O(m log m)` sort is the price of getting it exactly, and it is worth
 /// paying: a merely *containing* arc, taken relative to some reference
 /// direction, can be far wider than the true extent, and [`sweep_node`] packs
-/// subtrees using those widths. Measured on random 512-leaf trees on
-/// 2026-08-27, referencing the subtree's own root inflated the daylight
-/// discrepancy from 112 to 3800 on the first sweep and the refinement never
-/// recovered; referencing the circular mean of the directions was worse again.
+/// subtrees using those widths. Referencing the subtree's own root instead
+/// inflates the first sweep's daylight discrepancy by more than an order of
+/// magnitude and the refinement never recovers; the circular mean of the
+/// directions is worse again.
 ///
 /// ### Params
 ///
@@ -1445,7 +1435,7 @@ mod tests {
 
     #[test]
     fn test_zero_length_branches_are_not_reported_as_crossings() {
-        // Regression, adversarial review 2026-08-27. The crossing epsilon was
+        // Regression. The crossing epsilon was
         // scaled to the layout's global extent, so two siblings sitting exactly
         // on their parent read as collinear and then as a crossing. That is
         // every tree with zero-length branches, which includes every Newick
@@ -1482,7 +1472,7 @@ mod tests {
 
     #[test]
     fn test_hyperbolic_keeps_radial_order_at_extreme_radii() {
-        // Regression, adversarial review 2026-08-27. Squaring the radius before
+        // Regression. Squaring the radius before
         // the square root overflowed above 1.3e154, collapsing the scale to
         // zero so the furthest points landed on the origin rather than near the
         // rim. Radial order inverted exactly where the docs promise it holds.
@@ -1538,7 +1528,7 @@ mod tests {
 
     #[test]
     fn test_equal_angle_never_crosses_edges() {
-        // The load-bearing test: the whole reason equal-angle is the default
+        // The test that matters: the whole reason equal-angle is the default
         // for large trees is that it is guaranteed planar.
         let mut trees: Vec<(String, Tree)> = shapes()
             .into_iter()
@@ -1894,8 +1884,8 @@ mod tests {
 
     #[test]
     fn test_rejects_layout_parameters_that_cannot_be_drawn_with() {
-        // Adversarial review 2026-08-31, N15. A non-finite `leaf_spacing`
-        // produced a whole layout of `NaN` and reported success, because
+        // A non-finite `leaf_spacing` produced a whole layout of `NaN` and
+        // reported success, because
         // nothing validated `LayoutParams` at all.
         let tree = Tree::balanced_binary(4, 1.0).expect("balanced");
         let bad = [

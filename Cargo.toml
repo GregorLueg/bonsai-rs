@@ -43,52 +43,52 @@ opt-level = 2
 ###########
 
 ## Pruning sweep timings and the numerical cross-check against the numpy
-## reference. Plain `main`, no criterion.
+## reference.
 [[bench]]
 name = "prune_sweep"
 harness = false
 
 ## One full round of candidate-pair scoring, which is what decides whether the
-## tree search is viable. Plain `main`, no criterion.
+## tree search is viable.
 [[bench]]
 name = "merge_scan"
 harness = false
 
 ## Single-threaded throughput per kernel, for identifying which wall each one
-## hits. Plain `main`, no criterion.
+## hits.
 [[bench]]
 name = "kernels"
 harness = false
 
-## End-to-end scaling of the whole search. Plain `main`, no criterion.
+## End-to-end scaling of the whole search.
 [[bench]]
 name = "pipeline"
 harness = false
 
-## Per-step attribution within the search. Plain `main`, no criterion.
+## Per-step attribution within the search.
 [[bench]]
 name = "steps"
 harness = false
 
-## Distance recovery, the paper's Fig. S8 metric. Plain `main`, no criterion.
+## Distance recovery, the paper's Fig. S8 metric.
 [[bench]]
 name = "recovery"
 harness = false
 
 ## Does step 2 earn its keep? Four starting trees through the identical
-## refinement. Plain `main`, no criterion.
+## refinement.
 [[bench]]
 name = "start_tree"
 harness = false
 
 ## Reducibility of the merge score and how far the feature axis can be
-## subsampled. Plain `main`, no criterion.
+## subsampled.
 [[bench]]
 name = "approx_star"
 harness = false
 
 ## Step 6 on the tree step 5 leaves behind, and what the knobs around it buy
-## in loglikelihood and Robinson-Foulds. Plain `main`, no criterion.
+## in loglikelihood and Robinson-Foulds.
 [[bench]]
 name = "nni_real"
 harness = false

@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_rejects_non_finite_and_negative_branch_lengths() {
-        // Regression, adversarial review 2026-08-27. The arena validated the
+        // Regression. The arena validated the
         // topology and nothing else, so a NaN or negative branch built a tree
         // whose loglikelihood was silently NaN. `t = -1/w` is worse still: it
         // makes `1 + t * w` exactly zero and every kernel divides by it.

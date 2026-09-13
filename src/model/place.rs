@@ -43,19 +43,16 @@ use crate::utils::traits::BonsaiFloat;
 /// greedy hill-climbing and infinity is an exhaustive scan; both are supported
 /// and both are used by the tests.
 ///
-/// Ours, not theirs, and set by measurement on 2026-08-27. Simulated data on
-/// balanced trees of 64 and 256 leaves and a ladder of 128 leaves, 64 features,
-/// three seeds, sixteen queries each; a query is a second noisy measurement of
-/// a cell already in the tree, and it counts as recovered when a single-start
-/// search returns the same node as the exhaustive scan. Over the grid
-/// `{2, 2.5, 3, 3.5, 4, 6}` this is the smallest value that recovers 48 out of
-/// 48. The ones below it fail only on the ladder, and they fail badly rather
-/// than marginally: 3.5 loses one query by 10 nats, 2.0 loses five by 55.
+/// Ours, not theirs, and set by measurement over a grid from 2 to 6: this is
+/// the smallest value that returns the exhaustive scan's node on every fixture
+/// swept. A query is a second noisy measurement of a cell already in the tree,
+/// and the values below this one fail on ladders only, badly rather than
+/// marginally.
 ///
-/// Cost is shape-dependent and worth knowing. The balanced fixtures score 13
-/// of 127 and 18 of 511 nodes; the ladder scores 137 of 255, and does not score
-/// more than that at any wider tolerance, so on the shape that needs the beam
-/// the beam is already covering everything it will ever cover.
+/// Cost is shape-dependent and worth knowing. A balanced tree scores a tenth of
+/// its nodes or fewer; a ladder scores half, and does not score more than that
+/// at any wider tolerance, so on the shape that needs the beam the beam is
+/// already covering everything it will ever cover.
 ///
 /// It is an absolute loglikelihood difference and does not scale with the
 /// feature count, deliberately: what is being compared is the gap between two
@@ -65,31 +62,20 @@ const DEFAULT_TOLERANCE: f64 = 4.0;
 
 /// Number of start points the beam search fans out from.
 ///
-/// The reference uses `log(n)` centres from a distance-based clustering; our
-/// count is ours to choose (SPEC.md section 7.2). Measured on 2026-08-27 on the
-/// fixtures described on [`DEFAULT_TOLERANCE`]: at the shipped tolerance the
-/// extra starts changed no answer there and cost scored nodes, 13 against 23 on
-/// the 127-node fixture, 18 against 29 on the 511-node one, and 137 against 144
-/// on the ladder.
+/// The paper describes `log(n)` centres from a distance-based clustering; our
+/// count is ours to choose (SPEC.md section 7.2), and set by measurement over
+/// the fixtures described on [`DEFAULT_TOLERANCE`]. A balanced tree recovers
+/// every query from a single start at every tolerance tried. A ladder does not,
+/// and what it loses it loses badly rather than marginally, in the same cliff
+/// [`DEFAULT_TOLERANCE`] describes; eight starts closes it and fewer do not.
 ///
-/// That first measurement was too small to see the failure. Re-measured on
-/// 2026-08-28 over 144 queries (three shapes, nine seeds, sixteen queries each,
-/// 64 features, noise 0.3), the balanced fixtures still recover 144 out of 144
-/// from a single start at every tolerance tried, but a 128-leaf ladder at the
-/// shipped tolerance of 4 recovers 138 from one start, 142 from four and 144
-/// from eight. The six it loses are lost badly, not marginally: the worst is
-/// 197 nats short of the optimum and the six together are 1073, which is the
-/// same cliff [`DEFAULT_TOLERANCE`] describes. Tightening to a tolerance of 2
-/// makes it worse again, 90 from one start against 139 from eight.
-///
-/// Eight ships because on the shape that fails it is nearly free: 20294 scored
-/// nodes against 19050, six per cent. The 77 per cent it costs on the balanced
-/// fixtures is ten extra node scores per query on a 127-node tree, which is not
-/// what will decide whether this is fast enough. A caller placing millions of
-/// cells against a fixed backbone, and willing to accept the ladder case, can
-/// drop it to one through [`PlacementParams::n_starts`]. Eight is also roughly
-/// `log2(n)` over the few hundred nodes a backbone round works with, the same
-/// order as the reference's `log(n)`.
+/// Eight ships because on the shape that fails it is nearly free, and what it
+/// costs on the shapes that do not fail is a handful of extra node scores per
+/// query. A caller placing millions of cells against a fixed backbone, and
+/// willing to accept the ladder case, can drop it to one through
+/// [`PlacementParams::n_starts`]. Eight is also roughly `log2(n)` over the few
+/// hundred nodes a backbone round works with, the same order as the `log(n)`
+/// the paper describes.
 const DEFAULT_STARTS: usize = 8;
 
 /// Tuning knobs for the beam search of SPEC.md section 7.2.
@@ -234,7 +220,7 @@ pub struct Placement {
 /// internal nodes by height, so an even sweep over indices samples the leaves
 /// broadly and then samples every level of the internal skeleton.
 ///
-/// The root always comes first. That is load-bearing rather than cosmetic:
+/// The root always comes first. That is not cosmetic:
 /// start points share one visited set (see [`place`]), so the first start is
 /// the only one guaranteed to explore unimpeded, and putting the root there
 /// makes a multi-start search provably no worse than a single search from the

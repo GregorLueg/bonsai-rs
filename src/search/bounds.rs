@@ -72,8 +72,8 @@ const DEFAULT_NSTEPS: f64 = 48.0;
 ///
 /// One merge moves the centre about two to three units of the metric, so below
 /// this every round redraws and the bounds pay for themselves twice over while
-/// pruning nothing. Measured 2026-08-31 at 48 members: at `nsteps = 1` every
-/// round redrew and the star scored more pairs than the exhaustive scan.
+/// pruning nothing: at `nsteps = 1` every round redraws and the star scores
+/// more pairs than the exhaustive scan.
 const NSTEPS_MIN: f64 = 1.0;
 
 /// Largest value the online sizing will grow `nsteps` to.
@@ -152,7 +152,7 @@ impl Default for EllipsoidBoundsParams {
     ///
     /// ### Where these came from
     ///
-    /// Measured 2026-08-31 on an M1 Max, clustered stars of 128 members by 200
+    /// Ours, chosen by measurement over clustered stars of 128 members by 200
     /// features, four seeds, wrapping [`crate::search::star::AllPairs`] so the
     /// comparison is the `349,500` pairs a star scores exhaustively in 1.68
     /// seconds. "Bounded" is the pairs the provider scored to build bounds,
@@ -875,9 +875,9 @@ impl<C> EllipsoidBounds<C> {
     /// wrong signal and measurement says so.** The walk cannot stop inside a
     /// chunk, so on a star of any size it bottoms out at one chunk and stays
     /// there, the schedule reads every round as shallow, and `nsteps` grows
-    /// until it hits whatever cap it was given: measured 2026-08-31 at 128
-    /// members, a depth-only schedule ended pinned at the cap from every
-    /// starting value, so the cap and not the schedule was choosing the answer.
+    /// until it hits whatever cap it was given: a depth-only schedule ends
+    /// pinned at the cap from every starting value, so the cap and not the
+    /// schedule is choosing the answer.
     ///
     /// What is missing is the other half of the trade. A smaller ellipsoid
     /// redraws more often and walks less; a larger one does the reverse; the

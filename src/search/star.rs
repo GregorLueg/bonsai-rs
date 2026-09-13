@@ -48,7 +48,7 @@ const MIN_CENTRE_MEMBERS: usize = 3;
 ///
 /// A merge whose gain is indistinguishable from zero is not worth making, and
 /// accepting one costs a round of the scan while pretending to have learnt
-/// something. The floor it has to clear was measured on 2026-08-27: for
+/// something. Ours, chosen by measurement. The floor it has to clear: for
 /// members that are exactly identical on zero-length branches, where the true
 /// gain is exactly zero, `score_merge` returns `7.1e-15` at 64 features and
 /// `-3.6e-12` at 32768, both of which are `1.1e-16` per feature. That is one
@@ -56,9 +56,8 @@ const MIN_CENTRE_MEMBERS: usize = 3;
 /// be, so the floor scales with the feature count and not with anything else.
 ///
 /// At the ten thousand features this crate expects the floor is `1.1e-12`, so
-/// `1e-9` clears it by a factor of 900: just under three orders of magnitude,
-/// not the four an earlier version of this comment claimed (adversarial review
-/// N3). At a million features the floor is `1.1e-10` and the headroom is nine.
+/// `1e-9` clears it by a factor of 900, just under three orders of magnitude.
+/// At a million features the floor is `1.1e-10` and the headroom is nine.
 /// It still sits far below any gain that carries information, since a real
 /// merge gain is `O(p)` nats. See
 /// `test_the_default_min_gain_clears_the_zero_gain_floor`.
@@ -79,17 +78,9 @@ const DEFAULT_MIN_GAIN: f64 = 1e-9;
 /// The walk is inherently sequential and the scan inside it is not, so this
 /// trades parallelism against overshoot: a chunk of one is the tightest
 /// possible stop and runs on one thread, a chunk of everything is the full
-/// parallel scan and stops nowhere. Measured 2026-08-31 on an M1 Max at 128
-/// members by 200 features, four seeds, exhaustive candidates under
-/// [`crate::search::bounds::EllipsoidBounds`] at `nsteps = 48`. Pairs scored is
-/// the whole star's, against 349,500 for the unbounded scan; seconds are the
-/// whole star on the default thread pool.
-///
-/// | chunk | pairs scored | seconds |
-/// |---|---|---|
-/// | 4 | 34,726 | 0.366 |
-/// | 16 | 35,536 | 0.270 |
-/// | 64 | 38,837 | 0.270 |
+/// parallel scan and stops nowhere. Ours, chosen by measurement: pairs scored
+/// grows steadily with the chunk while the wall time is flat above sixteen, so
+/// sixteen is where the overshoot stops paying for itself.
 /// | 256 | 54,666 | 0.350 |
 ///
 /// `16` is the knee: it costs the same wall time as `64` and scores nine per
@@ -116,10 +107,9 @@ const CENTRE_EXACT_EVERY: usize = 32;
 /// candidates in parallel and resolves the four-member star each regraft
 /// leaves behind, six pairs, from inside that loop; a parallel scan there
 /// hands half of six pairs to a worker that is busy with a whole other
-/// proposal, and the caller waits on it. Measured 2026-09-12 on an M1 Max,
-/// ten threads, 2048 leaves by 2000 features at noise 1.6: 3.0 ms per
-/// resolution summed over threads against 0.7 ms sequential. A merge scan
-/// over a real star is thousands of pairs and is not affected.
+/// proposal, and the caller waits on it. Ours, chosen by measurement: a
+/// parallel scan there costs several times what the sequential one does. A
+/// merge scan over a real star is thousands of pairs and is not affected.
 const PAR_PAIRS_MIN: usize = 64;
 
 /// How the primitive picks the pair to merge in a round.
@@ -154,12 +144,11 @@ pub enum StarSelection {
     /// **How random this actually is.** The weights are a softmax over
     /// quantities whose gaps are `O(p)` nats, so the distribution concentrates
     /// on the greedy pick as the feature count grows. That is the specification
-    /// taken literally and not a shortcut: measured 2026-08-31 through
-    /// [`crate::search::nni::nni_random`] at 32 leaves over eight seeds, eight
-    /// of eight seeds moved the tree off its starting topology at 8 features,
-    /// four of eight at 32, and two and three of eight at 128 and 512. A caller
-    /// relying on this to escape a local optimum at ten thousand features
-    /// should expect it to behave close to greedy.
+    /// taken literally and not a shortcut. Measured through
+    /// [`crate::search::nni::nni_random`], the fraction of seeds that move the
+    /// tree off its starting topology at all falls away by a couple of hundred
+    /// features, so a caller relying on this to escape a local optimum at ten
+    /// thousand features should expect it to behave close to greedy.
     Weighted {
         /// Seed of the splitmix64 stream the draws come from.
         ///
@@ -213,13 +202,11 @@ pub struct StarParams {
     /// recompute does not, and the error compounds across a whole star. An
     /// exact recompute every `CENTRE_EXACT_EVERY` rounds caps that.
     ///
-    /// **Measured 2026-08-31 and it is safe.** At 128 members by 200 features
-    /// over eight seeds, the worst relative deviation from the exact value at
-    /// any round of a star is `1.5e-14` in the precision and `2.4e-12` in the
-    /// mean with no recompute at all, and `3.2e-15` and `7.2e-13` with one
-    /// every thirty-two rounds. Both are orders below the `1e-16` per feature a
-    /// merge gain itself rounds to, and the trees come out identical on every
-    /// fixture in this crate. See
+    /// **Measured, and it is safe.** The worst relative deviation from the
+    /// exact value at any round of a star is `O(1e-14)` in the precision and
+    /// `O(1e-12)` in the mean even with no recompute at all, orders below the
+    /// `1e-16` per feature a merge gain itself rounds to, and the trees come out
+    /// identical on every fixture in this crate. See
     /// `test_the_incremental_centre_leaf_does_not_drift` for the table and
     /// `crate::search::bounds`'s
     /// `test_incremental_centre_matches_the_exact_recompute` for the trees.
@@ -699,11 +686,10 @@ fn update_centre_leaf<T: BonsaiFloat>(
 /// worse because the subtraction happens in the numerator *and* the small `WR`
 /// then divides it. The accumulation is in `f64` regardless of storage type.
 ///
-/// The adversarial review asked for the fixture that shows it biting and it is
-/// now `test_the_peel_loses_the_remainder_when_one_member_dominates`. Measured
-/// 2026-08-31, six members on zero-length branches with one carrying the whole
-/// star's precision and sitting inside the peeled pair, relative error in the
-/// remainder's mean against a re-accumulation:
+/// `test_the_peel_loses_the_remainder_when_one_member_dominates` is the fixture
+/// that shows it biting: six members on zero-length branches with one carrying
+/// the whole star's precision and sitting inside the peeled pair, relative
+/// error in the remainder's mean against a re-accumulation:
 ///
 /// | dominance | rel err in `MR` | features with `WR <= 0` |
 /// |---|---|---|
@@ -1643,8 +1629,8 @@ mod tests {
 
     /// The incremental centre update stays inside the gains' own rounding.
     ///
-    /// **Measured 2026-08-31**, eight seeds, worst relative deviation from the
-    /// exact recompute at any round of the star:
+    /// Worst relative deviation from the exact recompute at any round of the
+    /// star, over eight seeds:
     ///
     /// | members | features | recompute | precision | mean |
     /// |---|---|---|---|---|
@@ -1825,7 +1811,7 @@ mod tests {
 
     #[test]
     fn test_degenerate_input_errors_rather_than_returning_an_unresolved_star() {
-        // Regression, adversarial review 2026-08-27. A single non-finite value
+        // Regression. A single non-finite value
         // anywhere made every candidate gain non-finite, so the round found no
         // best pair, the loop exited normally, and the caller got `Ok` with
         // zero merges and no diagnostic. On a 10k by 20k input matrix one stray
@@ -1886,7 +1872,7 @@ mod tests {
 
     #[test]
     fn test_loglikelihood_never_decreases_across_a_merge() {
-        // The load-bearing test. The primitive claims a gain from a closed-form
+        // The test that matters. The primitive claims a gain from a closed-form
         // three-leaf expression; `NodeState::prune` knows nothing about any of
         // that and scores the whole tree from the leaves up. A sign error or a
         // mis-peeled remainder shows up here as a merge that made the tree
@@ -2050,10 +2036,10 @@ mod tests {
     fn test_the_default_min_gain_clears_the_zero_gain_floor() {
         /// Measured magnitude of the zero-gain floor, per feature.
         ///
-        /// 2026-08-27: one `f64` rounding of an `O(p)` sum, so the floor
-        /// tracks the feature count. `7.1e-15` at 64 features and `-3.6e-12`
-        /// at 32768 both come to `1.1e-16` per feature; this is that with an
-        /// order of headroom.
+        /// One `f64` rounding of an `O(p)` sum, so the floor tracks the
+        /// feature count. `7.1e-15` at 64 features and `-3.6e-12` at 32768 both
+        /// come to `1.1e-16` per feature; this is that with an order of
+        /// headroom.
         const FLOOR_PER_FEATURE: f64 = 1e-15;
 
         // Identical members on zero-length branches have a true merge gain of
@@ -2160,8 +2146,8 @@ mod tests {
 
     #[test]
     fn test_the_peel_loses_the_remainder_when_one_member_dominates() {
-        // The fixture the doc comment on `peel` asks for (adversarial review
-        // N1). Nothing here is a bug: the peel is a subtraction and this is
+        // The fixture the doc comment on `peel` asks for. Nothing here is a
+        // bug: the peel is a subtraction and this is
         // what a subtraction does. What the test pins is where the loss starts
         // and that it is monotone in the dominance, so a change to the
         // accumulation that moved either would be caught.
@@ -2226,8 +2212,8 @@ mod tests {
 
     #[test]
     fn test_one_diverged_pair_does_not_stop_the_star() {
-        // Adversarial review 2026-08-27, N9. A non-finite gain is dropped
-        // because letting it win would stop the whole primitive; a diverged
+        // A non-finite gain is dropped because letting it win would stop the
+        // whole primitive; a diverged
         // branch-length solve used to propagate out of the scan's `try_reduce`
         // and stop the primitive anyway, which is the same outcome by another
         // route. It is now dropped like any other unscoreable pair.

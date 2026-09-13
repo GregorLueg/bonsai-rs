@@ -932,7 +932,7 @@ mod tests {
 
     #[test]
     fn test_true_tree_beats_a_shuffled_one_under_the_likelihood() {
-        // The load-bearing test: the simulator and `NodeState::prune` must
+        // The test that matters: the simulator and `NodeState::prune` must
         // agree about what a tree means. With small error bars the true
         // topology has to score higher than a permuted one on the same cells.
         let params = SimulationParams {

@@ -5,7 +5,7 @@
 //! over UMAP and tSNE, and the one Robinson-Foulds cannot see, since a tree with
 //! the right topology and useless branch lengths scores RF 0.
 //!
-//! Measured 2026-09-05, `simulate_binary`, seed 41, correlation against the
+//! Reference figures, `simulate_binary`, seed 41, correlation against the
 //! **true** positions:
 //!
 //! | cells | features | noise | generating tree | ours | RF |

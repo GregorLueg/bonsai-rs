@@ -1,21 +1,18 @@
 //! A starting tree from a neighbour-graph linkage.
 //!
 //! Search step 2 builds the initial topology by greedy likelihood-driven
-//! agglomeration (SPEC.md section 9.1). Measured 2026-09-12, it does not earn
-//! its keep: a Ward linkage over the same transformed means reaches the same
-//! Robinson-Foulds distance and the same loglikelihood after steps 3 to 7, at a
-//! fraction of the cost. The numbers are in `PERFORMANCE.md`.
+//! agglomeration (SPEC.md section 9.1). It does not earn its keep: a Ward
+//! linkage over the same transformed means reaches the same Robinson-Foulds
+//! distance and the same loglikelihood after steps 3 to 7, at a fraction of the
+//! cost. `docs/PERFORMANCE.md` has the numbers.
 //!
 //! What this module does *not* do is score anything with the model. It hands
 //! the refinement a structurally sensible tree and gets out of the way. That is
-//! a low bar on purpose: measured at 2048 cells by 2000 features, refinement
-//! reaches Robinson-Foulds 0 even from a uniformly random topology, so the
-//! linkage only has to beat random, which it does by a wide margin in wall time
-//! rather than in recovery.
+//! a low bar on purpose: refinement reaches Robinson-Foulds 0 even from a
+//! uniformly random topology, so the linkage only has to beat random, which it
+//! does in wall time rather than in recovery.
 //!
 //! ### Why Ward and not the merge score
-//!
-//! Two reasons, both measured on 2026-09-12.
 //!
 //! Ward is reducible, so every mutually nearest pair is a pair the naive scan
 //! merges at some point, and merging all of them at once builds the same
@@ -47,16 +44,15 @@
 //!
 //! ### Rounds, not a chain
 //!
-//! The first version walked a nearest-neighbour chain, and at `k = 16` it
-//! built caterpillars: depth 131 against `log2(n) = 12` at 4096 leaves,
-//! measured 2026-09-12. The chain is depth-first, so one cluster reaches size
-//! 32 while everything else is a singleton. A big centroid carries `1/size` of
-//! the noise, which at 2000 features puts it closer to every leaf than that
-//! leaf's own third cousins are, so it takes a slot in every list; once a
-//! block has merged all its listed relatives the big cluster is its only edge
-//! left, the mutual test passes trivially, and the block is absorbed. Merging
-//! every mutual pair per round keeps the live clusters at similar sizes, and
-//! the sweep in `benches/start_tree.rs` records what that bought.
+//! A nearest-neighbour chain builds caterpillars here, an order of magnitude
+//! deeper than `log2(n)`. The chain is depth-first, so one cluster runs away
+//! while everything else is still a singleton. A big centroid carries `1/size`
+//! of the noise, which at a few thousand features puts it closer to every leaf
+//! than that leaf's own third cousins are, so it takes a slot in every list;
+//! once a block has merged all its listed relatives the big cluster is its only
+//! edge left, the mutual test passes trivially, and the block is absorbed.
+//! Merging every mutual pair per round keeps the live clusters at similar
+//! sizes. `benches/start_tree.rs` is the sweep.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};
@@ -74,12 +70,11 @@ use rustc_hash::FxHashSet;
 
 /// Neighbours kept per cluster.
 ///
-/// Sixteen, matching [`crate::search::candidates::KnnCandidatesParams`].
-/// Measured 2026-09-12 in the `drift` block of `benches/start_tree.rs`, 2000
-/// features, exhaustive backend, two seeds: at every `k` from 8 to 128 and
-/// every size from 512 to 4096 the rounds reproduce the dense Ward tree
-/// exactly, at depth `log2(n)`. Under the chain this replaced `k = 16` was
-/// 248 splits and depth 131 at 4096, and the `k` needed grew as `1.5 sqrt(n)`.
+/// Ours, chosen by measurement; matches
+/// [`crate::search::candidates::KnnCandidatesParams`]. At every `k` from 8 to
+/// 128 the rounds reproduce the dense Ward tree exactly, at depth `log2(n)`, so
+/// the value is set by the cost of the graph and not by recovery. The `drift`
+/// block of `benches/start_tree.rs` is the sweep.
 const DEFAULT_K: usize = 16;
 
 /// Rebuild the graph once the live cluster count has fallen to this fraction of
@@ -91,26 +86,20 @@ const DEFAULT_K: usize = 16;
 /// set half the size of the last, so the rebuilds are a geometric series and
 /// cost a constant multiple of the first one.
 ///
-/// Swept 2026-09-12 at `k = 16` over 0, 0.5, 0.75 and 0.9 (`benches/start_tree.rs`,
-/// `drift`): every setting, including never redrawing on the count and leaving
-/// only the dry-list redraw, reproduces the dense tree at depth `log2(n)` from
-/// 512 to 4096 leaves. So the cadence does not decide recovery; it was the
-/// depth-first chain that did, and the rounds fixed it. Halving is kept as the
-/// bound on staleness; the build-second differences between the settings were
-/// inside the noise of a machine at load 40.
+/// Ours, chosen by measurement. Every cadence swept, including never redrawing
+/// on the count and leaving only the dry-list redraw, reproduces the dense tree
+/// at depth `log2(n)`, so the cadence does not decide recovery. Halving is kept
+/// as the bound on staleness.
 const DEFAULT_REBUILD_FRACTION: f64 = 0.5;
 
 /// Cells up to which the exhaustive backend is used; NN-descent above it.
 ///
-/// **Provisional.** The only timings taken so far (`backend` block of
-/// `benches/start_tree.rs`, 2026-09-12) were at load 50 to 65 and are not
-/// usable for placing the crossover. What is usable from that run is
-/// load-independent: at 4096, 8192 and 16384 leaves by 2000 features,
-/// `k = 16`, NN-descent's graph produced the identical tree to the exhaustive
-/// one, so nothing the linkage can see is lost by switching. kmknn is out of
-/// the automatic path on the one quiet-machine number there is, 43.82 s at
-/// 8192 against 1.34 s for exhaustive at 4096: k-means pruning buys nothing
-/// at this dimension. The quiet re-run of the crossover is queued.
+/// Ours, and deliberately conservative. NN-descent's graph produces the
+/// identical tree to the exhaustive one at every size measured, so nothing the
+/// linkage can see is lost by switching and the crossover is a pure cost
+/// decision. kmknn is out of the automatic path: k-means pruning buys nothing
+/// at this dimension. The `backend` block of `benches/start_tree.rs` is where
+/// to re-place this if the exhaustive build starts to show.
 const EXHAUSTIVE_MAX_CELLS: usize = 4_096;
 
 /// Metric the graph is built in. Plain Euclidean on the transformed means: the
@@ -511,10 +500,8 @@ fn nearest(
 /// dendrogram (Murtagh 1983). Taking them all per round is what keeps the live
 /// clusters level-synchronous: nothing grows far ahead of its neighbours, so no
 /// centroid becomes the low-noise attractor that crowds the true relatives out
-/// of every list. Measured 2026-09-12 against the depth-first chain this
-/// replaced: at 2048 leaves and `k = 16` the chain reached size 32 after 31
-/// merges while every other cluster was a singleton, and ended at depth 56
-/// against a dense linkage's 11.
+/// of every list. The depth-first chain this replaced did exactly that, and
+/// ended several times deeper than a dense linkage.
 ///
 /// Per-slot searches are independent and run in parallel; the collection order
 /// is the live order, so the result is the same at any thread count.

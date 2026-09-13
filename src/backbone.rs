@@ -8,14 +8,10 @@
 //!
 //! It replaces the standard search's cost on `n` cells with its cost on the
 //! backbone plus one placement per remaining cell. The merge step is what it
-//! avoids, and measured at 200 features the merge is `n^1.64` while step 5 is
-//! `n^1.98` and ninety per cent of the runtime. **So on the current search this
-//! trades away the cheap step and keeps the expensive one**, because the final
-//! refinement runs SPR over every cell however the backbone was built. It is
-//! written now because it composes: when SPR is sub-quadratic, this is what
-//! turns the remaining cost into something atlas-scale.
-//!
-//! Be honest about that when quoting numbers for it.
+//! avoids, and the merge is not the expensive step: SPR is, and the final
+//! refinement runs SPR over every cell however the backbone was built. **So on
+//! its own this trades away the cheap step and keeps the expensive one.** It is
+//! worth having because it composes with anything that makes SPR cheaper.
 //!
 //! ### The one place this differs from the standard algorithm's answer
 //!
@@ -25,11 +21,10 @@
 //! algorithm's. The paper is explicit that backbone mode trades accuracy for
 //! time. What that costs is measured in the tests rather than assumed.
 //!
-//! This used to add "unlike SPEC sections 10 and 11 whose whole point is that
-//! they are", which overstated both. Neither is a guarantee: `candidates` can
-//! miss a best pair that is in no neighbour list, and `bounds` says in its own
-//! docs that section 10.2's bound is not strict. Both are very good in practice
-//! rather than exact, and the numbers are in their modules.
+//! Nothing else in the search is exact either. `candidates` can miss a best
+//! pair that is in no neighbour list, and section 10.2's bound is not strict.
+//! Both are very good in practice rather than guaranteed, and their own modules
+//! say so.
 
 use crate::bonsai::{BonsaiParams, BonsaiResult, bonsai_prepared, refine};
 use crate::errors::BonsaiErrors;
@@ -46,11 +41,11 @@ use crate::utils::traits::{BonsaiFloat, narrow};
 ///
 /// The backbone has to be large enough to carry the structure the rest of the
 /// cells will be placed against; too small and every placement is deciding
-/// between branches that are not there yet. The reference suggests ten
+/// between branches that are not there yet. The paper suggests ten
 /// thousand. This crate's default is smaller because the standard search is
 /// still `n^1.8`, so a ten thousand cell backbone is most of the total cost;
-/// raise it once that changes. Chosen 2026-09-05 as a starting point, not from
-/// a recovery measurement.
+/// raise it once that changes. Ours, and a starting point rather than a
+/// recovery measurement.
 pub const DEFAULT_BACKBONE_CELLS: usize = 2048;
 
 /// Fraction of growth after which the branch lengths are reoptimised.
@@ -58,7 +53,7 @@ pub const DEFAULT_BACKBONE_CELLS: usize = 2048;
 /// The Methods note the backbone changes appreciably as cells are added, so a
 /// tree grown far past its last optimisation is being placed against stale
 /// branch lengths. A quarter means four reoptimisations per doubling.
-/// Chosen 2026-09-05; see `test_reoptimisation_cadence_changes_the_result`.
+/// Ours; see `test_reoptimisation_cadence_changes_the_result`.
 pub const DEFAULT_REGROW_FRACTION: f64 = 0.25;
 
 /// Knobs for backbone mode.
@@ -603,7 +598,7 @@ mod tests {
     #[test]
     fn test_growth_puts_every_cell_in_and_keeps_them_in_order() {
         // The contract is that leaf `i` is cell `i`, and growth numbers leaves
-        // in arrival order, so the permutation at the end is load-bearing.
+        // in arrival order, so the permutation at the end is what makes it right.
         let (n, p) = (64usize, 64usize);
         let (data, _) = fixture(n, p, 0.2, 5);
         let (out, report) = backbone(

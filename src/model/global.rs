@@ -381,18 +381,15 @@ pub struct GlobalBranchParams {
 }
 
 impl Default for GlobalBranchParams {
-    /// Defaults chosen by measurement, 2026-08-27.
+    /// Ours, chosen by measurement.
     ///
     /// Each edge's proposal is that edge's exact conditional optimum rather
     /// than a small step, so the outer iteration converges linearly at a rate
-    /// set only by how strongly the edges couple. Measured on the fixtures in
-    /// this module, 2026-08-27 (7 to 16 leaves, 64 to 1024 features, branch
-    /// lengths started a factor of four either side of the optimum): 7
-    /// iterations for a star, 16 for a ladder and 19 to 22 for balanced binary
-    /// trees, from which `max_iter` is a runaway guard at roughly three times
-    /// the worst case rather than a working limit. The starting point barely
-    /// matters, which is what one would expect of an iteration whose every
-    /// component step is an exact solve.
+    /// set only by how strongly the edges couple. On the fixtures in this
+    /// module it takes tens of iterations at worst, from which `max_iter` is a
+    /// runaway guard at roughly three times that rather than a working limit.
+    /// The starting point barely matters, which is what one would expect of an
+    /// iteration whose every component step is an exact solve.
     ///
     /// `tol` is far tighter than the search needs. Branch lengths feed the
     /// merge scores, and where this loop stops should never be what separates
@@ -757,9 +754,9 @@ mod tests {
     /// be driven down to the square root of the smallest change in the
     /// loglikelihood the iteration can see; past that the line search cannot
     /// separate an improving step from a rounding error. Measured on the
-    /// fixtures below, 2026-08-27: the iteration stalls at a worst scaled
-    /// residual of `4.2e-7` and stays there whatever tolerance it is given, so
-    /// this is the floor and not a stopping rule that could be tightened.
+    /// fixtures below, the iteration stalls just under this and stays there
+    /// whatever tolerance it is given, so this is the floor and not a stopping
+    /// rule that could be tightened.
     const STATIONARY_RESIDUAL: f64 = 1e-6;
 
     /// Relative displacement used to show a branch length is at a maximum.
@@ -863,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_up_values_match_an_explicit_reroot() {
-        // The load-bearing test. Rerooting at the parent and deleting the
+        // The test that matters. Rerooting at the parent and deleting the
         // subtree is an independent route to the same effective leaf, sharing
         // nothing with the sweep but the pruning recursion itself.
         let p = 24usize;

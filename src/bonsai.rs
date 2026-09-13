@@ -7,20 +7,18 @@
 //! **The eighth step is a deviation.** Step 3 is the only step that collapses
 //! zero-length edges and it runs before step 4, so every zero-length edge the
 //! branch solves create afterwards outlives the only pass that would remove
-//! one. See the comment on step 8 for the measurement and for why it runs last
-//! rather than earlier.
+//! one. See the comment on step 8 for why it runs last rather than earlier.
 //!
 //! ### Why the order is not negotiable
 //!
-//! Two of the steps only work where they are placed, and both were established
-//! by measurement rather than read off the specification.
+//! Two of the steps only work where they are placed, and neither constraint is
+//! in the specification.
 //!
 //! Steps 5 and 6 must follow step 4. Both SPR and NNI reject a proposal whose
 //! topology fingerprint is unchanged, because otherwise they accept moves that
 //! only reoptimise branch lengths and never terminate on topology. Run before
 //! the branch lengths are optimised, that filter rejects the only improvements
-//! available and recovery gets *worse*: a ladder that reaches Robinson-Foulds 0
-//! from optimised lengths reaches only 24 of 44 without.
+//! available and topology recovery gets *worse*.
 //!
 //! Step 3 must follow step 2 rather than being folded into it. Polytomies are
 //! created by step 2 when an optimal branch length comes out at zero, and the
@@ -98,13 +96,10 @@ pub struct BonsaiParams {
 /// Search steps 1 and 2, or a linkage in their place. The refinement of steps 3
 /// to 7 is identical either way.
 ///
-/// **Measured 2026-09-12, and the numbers are in `PERFORMANCE.md`.** At 2048
-/// cells by 2000 features a Ward linkage reaches the same Robinson-Foulds
-/// distance and the same loglikelihood as the greedy merge for a quarter of
-/// the wall time, and at 200 features it is very slightly better. The greedy
-/// merge is still the default because it is what SPEC.md section 9 specifies
-/// and because the linkage has not yet been run against the reference
-/// implementation.
+/// **A Ward linkage reaches the same Robinson-Foulds distance and the same
+/// loglikelihood as the greedy merge for a fraction of the wall time**, and
+/// `docs/PERFORMANCE.md` has the numbers. The greedy merge is still the default
+/// because it is what SPEC.md section 9 specifies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StartTree {
     /// The star of SPEC.md section 9.1, agglomerated by the merge score.
@@ -279,7 +274,7 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
 /// this improves one that is already there.
 ///
 /// That is what backbone mode's final pass needs (SPEC.md section 15), and what
-/// a caller with a tree from elsewhere wants. The reference recommends seeding
+/// a caller with a tree from elsewhere wants. The paper recommends seeding
 /// the search with cells grouped by an external clustering, which is the same
 /// entry point.
 ///
@@ -370,24 +365,19 @@ fn refine_from<T: BonsaiFloat>(
     // It exists because step 3 is the only step that collapses, and it runs
     // before step 4. SPEC.md section 6 is explicit that a branch solve landing
     // on `t = 0` is normal, so every zero-length edge steps 4 to 7 create
-    // outlives the only pass that would remove it. Measured 2026-09-13 on
-    // realistic data at 10,000 cells by 2,767 genes: 32 internal zero-length
-    // edges survive to the end, and collapsing them takes Robinson-Foulds from
-    // 2659 to 2632 and the loglikelihood from -11253193.9 to -11253188.3 for
-    // 2.75 seconds.
+    // outlives the only pass that would remove it.
     //
-    // It runs last on purpose. Collapsing before step 5 instead reaches 2614,
-    // eighteen splits better again, but costs 247 seconds because a collapsed
-    // tree gives every nearby regraft a higher-degree star to resolve, and it
-    // moves distance recovery the wrong way on the one seed measured. Running
-    // after the search cannot change what the search finds, which is the
-    // property that makes this safe to do unconditionally.
+    // It runs last on purpose. Collapsing before step 5 instead recovers
+    // slightly more topology but costs two orders of magnitude more time,
+    // because a collapsed tree gives every nearby regraft a higher-degree star
+    // to resolve. Running after the search cannot change what the search finds,
+    // which is the property that makes this safe to do unconditionally.
     //
     // The collapse only ever *removes* structure, so it cannot invent a split
     // the data does not support. What it cannot touch is a zero-length edge at
     // a *leaf*, which is not an internal edge: those are the model declining to
-    // separate two cells it has no evidence to separate, and 129 of them
-    // survive this step at 10,000 cells by design.
+    // separate two cells it has no evidence to separate, and they survive this
+    // step by design.
     let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
     tree = resolved.tree;
     let loglik = optimise_all(&mut tree, leaves, params)?;

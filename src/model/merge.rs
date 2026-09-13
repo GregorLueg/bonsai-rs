@@ -34,59 +34,30 @@ pub struct MergeParams {
 }
 
 impl Default for MergeParams {
-    /// Defaults chosen by measurement, 2026-08-27, on an M1 Max.
+    /// Ours, chosen by measurement; `docs/PERFORMANCE.md` has the sweep.
     ///
     /// Two coordinate sweeps. Stage two is the dominant cost of a merge scan,
-    /// roughly 400 ms per sweep against a 577 ms base at 8192 candidates by
-    /// 2000 features, so this is the most expensive constant in the crate.
+    /// so this is the most expensive constant in the crate, and it is not
+    /// optional either: stage two roughly triples the gain over the unrefined
+    /// split, which is what `test_two_coordinate_sweeps_reach_the_fixed_point`
+    /// pins.
     ///
-    /// It is also not optional: stage two roughly triples the gain over the
-    /// unrefined split, which is what
-    /// `test_two_coordinate_sweeps_reach_the_fixed_point` pins.
-    ///
-    /// **Two sweeps are not the exact fixed point, and the earlier claim that
-    /// they were is wrong** (adversarial review N4). Measured 2026-08-31 over
-    /// 3000 random three-leaf fixtures at 64 features, separation log-uniform
-    /// over `[1e-2, 1e2]`, precision skew between `k` and `l` log-uniform over
-    /// `[1e-3, 1e3]` and `R` placed anywhere between the pair or beyond it,
-    /// scoring the shortfall against twenty sweeps:
-    ///
-    /// | sweeps | worst relative shortfall | fixtures above `1e-6` |
-    /// |---|---|---|
-    /// | 1 | 7.6e-2 | 145 |
-    /// | 2 | 5.4e-3 | 24 |
-    /// | 3 | 1.9e-3 | 16 |
-    /// | 4 | 4.0e-4 | 10 |
-    /// | 8 | 1.7e-4 | 2 |
-    ///
-    /// So the coordinate descent converges slowly on a small corner of the
-    /// space, where the split and the root branch are strongly coupled: the
-    /// worst fixture at two sweeps scored 38.312 nats against 38.522, a gap of
-    /// 0.21 nats, and it was still moving at eight. On the other 99.2 per cent
-    /// two sweeps and twenty agree to the bit. The default stays at two because
-    /// stage two is the dominant cost of the whole search and the shortfall is
-    /// a shortfall in a *candidate's* score rather than an error in the tree,
-    /// but a merge scan that is losing close calls on a coupled fixture is
-    /// where to look first.
-    ///
-    /// The shortfall changes the score and not the answer. Running the whole
-    /// pipeline at two sweeps against eight, over 15 fixtures spanning 32 and 64
-    /// leaves, three noise levels and five seeds, gave **identical trees and
-    /// loglikelihoods agreeing to every printed digit**, Robinson-Foulds 0 in
-    /// every case. The coupled corner does not arise where a real search looks,
-    /// so the default stands. Measured 2026-08-31.
+    /// **Two sweeps are not the exact fixed point.** The coordinate descent
+    /// converges slowly on a small corner of the space, where the split and the
+    /// root branch are strongly coupled; everywhere else two sweeps and twenty
+    /// agree to the bit. The shortfall is in a *candidate's* score rather than
+    /// in the tree, and running the whole pipeline at two sweeps against eight
+    /// gives identical trees, so the default stands. A merge scan losing close
+    /// calls on a coupled fixture is still where to look first.
     ///
     /// `split_tol` is looser than the branch-length tolerance in
     /// `model::branch` on purpose: the gain is stationary in the split at the
-    /// optimum, so an error of `eps` in the split costs `O(eps^2)` in the score.
-    /// It was `1e-8` while the split was bisected. The secant solve that
-    /// replaced the bisection on 2026-09-12 lands where its iterates took it,
-    /// not on a fixed grid of midpoints, so two solves on inputs that differ
-    /// in the last place can return splits `eps` apart where the bisection
-    /// returned the same bits; at `1e-8` that showed as a `1.4e-9` relative
-    /// drift between the exact and incremental centre in
-    /// `search::bounds`. Two more digits cost two more derivative passes of
-    /// twenty and put the drift back under the noise.
+    /// optimum, so an error of `eps` in the split costs `O(eps^2)` in the
+    /// score. It is tighter than it needs to be for that alone because the
+    /// secant solve lands where its iterates take it rather than on a fixed
+    /// grid of midpoints, so two solves on inputs differing in the last place
+    /// can return splits `eps` apart, and that showed up as drift between the
+    /// exact and incremental centre in `search::bounds`.
     fn default() -> Self {
         Self {
             coord_sweeps: 2,
@@ -422,12 +393,10 @@ impl MergeScratch {
     /// regula falsi with the Illinois modification, which is a secant step
     /// that never leaves the bracket and halves a stale end's weight so the
     /// bracket cannot stall on one side. No second derivative is available, so
-    /// Newton is out; plain bisection was what ran until 2026-09-12, and at the
-    /// shipped tolerance it cost 29 derivative passes per sweep, 58 per pair,
-    /// which on the four-member stars search step 5 resolves after every
-    /// regraft was 37 per cent of that step's single-thread time. The secant
-    /// reaches the same tolerance in a handful; the count is recorded in
-    /// `PERFORMANCE.md`.
+    /// Newton is out. Bisection reaches the shipped tolerance too, and is what
+    /// this replaced, but it takes tens of derivative passes per sweep where
+    /// the secant takes a handful, and that is most of the cost of resolving
+    /// the four-member star search step 5 leaves after every regraft.
     ///
     /// ### Params
     ///
@@ -744,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_gain_equals_the_difference_of_two_pruned_tree_loglikelihoods() {
-        // The load-bearing test in this module. `score_merge` computes the gain
+        // The test that matters in this module. `score_merge` computes the gain
         // in closed form from three effective leaves; the pruning recursion in
         // `model::likelihood` computes whole-tree loglikelihoods knowing nothing
         // about any of that. Building both trees explicitly and differencing
@@ -876,8 +845,8 @@ mod tests {
 
     #[test]
     fn test_a_boundary_optimal_split_lands_exactly_on_the_boundary() {
-        // Adversarial review 2026-08-31, N10. The split solve used to bracket
-        // on `(1e-12 * total, total - 1e-12 * total)` and so could never return
+        // The split solve used to bracket on
+        // `(1e-12 * total, total - 1e-12 * total)` and so could never return
         // an end, which turned a zero-length branch into a `1e-12 * total` one
         // and hid the polytomy SPEC.md section 9.2 goes looking for.
         //

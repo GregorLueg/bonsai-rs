@@ -58,10 +58,9 @@ pub(crate) const RESOLVED_STAR_MEMBERS: usize = 3;
 /// Runaway guard on the fixed-point loop, not a working limit.
 ///
 /// The loop's termination argument is the loglikelihood, not the sweep count,
-/// so this should never bind: measured 2026-09-06 across zero-branch stars of
-/// 6 to 12 leaves by 4 to 64 features at precisions from `1e0` to `1e14`, the
-/// loop settled in 1 to 4 sweeps every time. The same role as `MAX_NEWTON_ITER`
-/// in [`crate::model::branch`].
+/// so this should never bind: swept over zero-branch stars across four decades
+/// of precision, the loop settles in a handful of sweeps every time. The same
+/// role as `MAX_NEWTON_ITER` in [`crate::model::branch`].
 ///
 /// It exists because that argument is only sound while `min_gain` clears the
 /// per-feature rounding floor of a merge gain. [`resolve_polytomies`] now
@@ -489,10 +488,9 @@ fn rebuild(
 /// The two places a branch reaches zero are the early return in
 /// [`crate::model::branch::optimise_edge`], which fires when the two effective
 /// leaves already sit closer than their own error bars allow, and the ends of
-/// the split bracket in [`crate::model::merge`]. Both return a literal `0.0`;
-/// the split solve was changed to do so on 2026-08-31 (adversarial review N10,
-/// where it returned `1e-12 * total` instead) precisely so that this test can
-/// be exact. A tolerance would need a scale to be relative to, and nothing in
+/// the split bracket in [`crate::model::merge`]. Both return a literal `0.0`,
+/// precisely so that this test can be exact. A tolerance would need a scale to
+/// be relative to, and nothing in
 /// SPEC.md fixes one: a branch that is merely short is a claim the model is
 /// entitled to make, and collapsing it would be editing the answer.
 ///
@@ -579,17 +577,10 @@ fn collapse_zero_edges(tree: &Tree) -> Result<Option<Tree>, BonsaiErrors> {
 /// The sweep restarts after each one because [`Tree::from_parents`] renumbers
 /// the internal nodes and a cursor into the old numbering means nothing.
 ///
-/// **One pass is not enough, and the collapse is why.** Measured 2026-08-31
-/// over eighteen runs at 64 leaves and 128 features, on trees made by
-/// collapsing the short internal edges of a simulated tree at three thresholds,
-/// up to and including collapsing every edge into one giant star. Against the
-/// same runs with the collapse done once on entry rather than every sweep:
-///
-/// | | entry only | every sweep |
-/// |---|---|---|
-/// | resolutions | 8 to 13 | 28 to 45 |
-/// | gain over the input, nats | 757 to 7316 | 2868 to 7316 |
-/// | total Robinson-Foulds to the truth over the eighteen | 130 | 106 |
+/// **One pass is not enough, and the collapse is why.** Measured against the
+/// same runs with the collapse done once on entry rather than every sweep,
+/// collapsing every sweep makes three to four times as many resolutions, gains
+/// more, and ends closer to the generating tree.
 ///
 /// A resolution that puts its new ancestor at zero distance from its centre has
 /// made another polytomy, and re-resolving it against the moved centre is worth
@@ -604,15 +595,8 @@ fn collapse_zero_edges(tree: &Tree) -> Result<Option<Tree>, BonsaiErrors> {
 ///
 /// One resolution per sweep and one settling of the whole tree per sweep, so
 /// the step is `O(sweeps * n * p)` and `sweeps` grows with the leaf count.
-/// Measured 2026-09-06 at 200 features on the tree search step 2 leaves behind,
-/// timing `NodeState::prune` and `UpState::sweep` separately against the step
-/// as a whole:
-///
-/// | leaves | sweeps | per sweep | down | up | the two as a share |
-/// |---|---|---|---|---|---|
-/// | 1024 | 8 | 1.82 ms | 1.04 | 0.52 | 86 per cent |
-/// | 2048 | 30 | 3.58 ms | 2.08 | 1.13 | 90 per cent |
-/// | 4096 | 107 | 7.20 ms | 4.26 | 2.63 | 96 per cent |
+/// Almost all of a sweep is the down-and-up pass itself, and the share grows
+/// with the tree.
 ///
 /// Everything this module does per sweep is now the remaining 4 per cent, and
 /// the exponent is the two settling sweeps against a resolution count that
@@ -648,8 +632,7 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
     // by more than `min_gain`. At zero the primitive accepts a merge whose gain
     // is a rounding artefact, the resolution lands the ancestor at zero distance
     // from its centre, the next sweep's collapse folds it back, and the same
-    // merge is found again. Adversarial review 2026-09-06 watched that run for
-    // four and a half minutes on a six-leaf star.
+    // merge is found again, on a six-leaf star, without ever terminating.
     let min_gain = params.unwrap_or_default().min_gain;
     if !min_gain.is_finite() || min_gain <= 0.0 {
         return Err(BonsaiErrors::BadParameter {
@@ -1209,8 +1192,8 @@ mod tests {
 
     #[test]
     fn test_the_merge_scans_zero_length_branches_are_the_polytomies_step_three_resolves() {
-        // Adversarial review 2026-08-31. Step 2 leaves a structurally binary
-        // tree whose zero-length internal edges are polytomies in everything
+        // Step 2 leaves a structurally binary tree whose zero-length internal
+        // edges are polytomies in everything
         // but the arena, and step 3 counted degrees only and so did nothing at
         // all on it. This is the pipeline's own step 2 followed by its step 3.
         use crate::search::star::{Star, star_tree};
@@ -1303,8 +1286,7 @@ mod tests {
 
     /// A zero-branch star at `min_gain = 0` used to spin forever: the primitive
     /// accepted a rounding-artefact merge, the next sweep's collapse folded it
-    /// back, and the same merge was found again. Adversarial review 2026-09-06,
-    /// which watched this exact fixture run for four and a half minutes.
+    /// back, and the same merge was found again, without ever terminating.
     #[test]
     fn test_a_non_positive_min_gain_is_rejected_rather_than_spun_on() {
         let (p, n) = (4usize, 8usize);

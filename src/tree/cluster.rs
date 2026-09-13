@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn test_edge_weighting_matches_brute_force() {
-        // The load-bearing identity: `sum_{i<j} d(i,j)` equals the one-pass sum
+        // The identity this rests on: `sum_{i<j} d(i,j)` equals the one-pass sum
         // of `len * a * b` over branches. Everything else in the module is
         // built on it.
         for (name, tree) in shapes() {

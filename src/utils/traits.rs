@@ -35,7 +35,7 @@ use std::ops::{AddAssign, DivAssign, MulAssign, SubAssign};
 /// then cancels: the loss is governed by `|mean| / separation`, and `f32` has
 /// about seven digits to spend on it.
 ///
-/// Measured 2026-08-31, four leaves by 256 features, comparing the difference
+/// Measured on four leaves by 256 features, comparing the difference
 /// of two topologies' loglikelihoods, which is the quantity a search decides
 /// on, against the same computation in `f64`:
 ///
@@ -54,7 +54,7 @@ use std::ops::{AddAssign, DivAssign, MulAssign, SubAssign};
 /// means sit far from zero relative to their spread should centre them before
 /// asking for `f32` storage, or use `f64`. Subtracting a per-feature constant
 /// from every cell leaves the loglikelihood exactly unchanged, since only
-/// differences enter (adversarial review N2).
+/// differences enter.
 pub trait BonsaiFloat:
     Float
     + BonsaiSimd

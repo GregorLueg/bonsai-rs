@@ -109,8 +109,8 @@ impl Default for KnnCandidatesParams {
     ///
     /// ### Where these came from
     ///
-    /// Measured on 2026-08-28 on simulated data (SPEC.md section 13.1) over
-    /// three tree shapes, balanced with constant branches, balanced with random
+    /// Ours, chosen by measurement on simulated data (SPEC.md section 13.1)
+    /// over three shapes, balanced with constant branches, balanced with random
     /// branches and unbalanced, eight seeds each, so 24 replicates per point.
     /// 128 leaves by 200 features, error bars a tenth of the data spread, star
     /// branch lengths optimised first as search step 1 does. The metric is the

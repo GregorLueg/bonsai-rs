@@ -62,13 +62,13 @@ const VARIANCE_TOL: f64 = 1e-12;
 
 /// Default signal-to-noise threshold for retaining a feature.
 ///
-/// Ours, chosen 2026-08-31; the reference's default is 1 and their constants
-/// are not carried over. `S[g]` of SPEC.md section 3.3 is the mean ratio of
+/// Ours, chosen by measurement; the paper's threshold is 1 and no constant of
+/// theirs is carried over. `S[g]` of SPEC.md section 3.3 is the mean ratio of
 /// posterior signal variance to measurement error variance, so `S[g] = 1` is
 /// the point at which a feature carries as much signal as noise and this
 /// threshold keeps features whose signal is at least a quarter of their noise.
 ///
-/// ### What was measured, 2026-08-31
+/// ### What was measured
 ///
 /// `tree::simulate::simulate_binary` at 400 features, of which half were then
 /// replaced by pure noise: the same error bars, but means drawn from those
@@ -96,19 +96,16 @@ const VARIANCE_TOL: f64 = 1e-12;
 ///
 /// `0.25` sits above the 95th percentile of the pure-noise scores at every cell
 /// count tested and below the 5th percentile of the informative scores at every
-/// cell count and noise level tested. The reference's `1` does not: in the
+/// cell count and noise level tested. A threshold of `1` does not: in the
 /// hardest row it would discard most of the informative panel, since a feature
 /// carrying exactly as much signal as noise scores `1` only in expectation and
 /// scatters below it at finite `n`. Only at 64 cells do the two distributions
 /// touch `0.25` at all, and there a handful of noise features leak through.
 ///
-/// ### On tree recovery, corrected 2026-08-31
+/// ### On tree recovery
 ///
-/// An earlier version of this note claimed the greedy star primitive cannot
-/// recover the simulated topology at all, so that Robinson-Foulds could not
-/// arbitrate this constant. That was measured past the point where recovery is
-/// possible for any threshold, and generalised too far. Recovery of
-/// `search::star::star_tree` against `noise_sd`, five seeds per cell, mean RF:
+/// Recovery of `search::star::star_tree` against `noise_sd`, five seeds per
+/// cell, mean Robinson-Foulds:
 ///
 /// | `noise_sd` | 64 leaves, of 122 | 128 leaves, of 250 |
 /// |---|---|---|
@@ -128,14 +125,13 @@ const VARIANCE_TOL: f64 = 1e-12;
 /// It is also mildly awkward for the value chosen here. The two are not
 /// directly comparable, `S` being a per-feature aggregate against a noise level
 /// uniform across features, so `0.25` stands on the distribution separation
-/// above. But the recovery cliff sits nearer the reference's `1` than to it,
-/// and a recovery-driven sweep of this constant is worth doing once polytomy
-/// resolution, SPR and NNI are in and the usable noise range has widened.
+/// above. But the recovery cliff sits nearer `1` than to it, and a
+/// recovery-driven sweep of this constant is worth doing.
 pub const DEFAULT_MIN_SIGNAL_TO_NOISE: f64 = 0.25;
 
 /// Largest variance amplification `v / (v - eps^2)` [`from_sanity`] converts.
 ///
-/// Ours, chosen 2026-08-31. The conversion of SPEC.md section 3.4 multiplies
+/// Ours. The conversion of SPEC.md section 3.4 multiplies
 /// both the posterior mean and the posterior variance by this factor, so it
 /// diverges as the posterior approaches the prior and is undefined once
 /// `eps^2 >= v`. At the cap the returned error bar is about 32 times the

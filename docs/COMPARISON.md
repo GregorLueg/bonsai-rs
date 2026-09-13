@@ -145,6 +145,54 @@ an internal count of exactly zero at every configuration, and it carries a far
 larger degenerate-leaf fraction, 34.9 per cent at 10,000 against bonsai-rs's
 3.3, with up to 513 leaves in a single multifurcation.
 
+## The arm
+
+The bonsai-rs panel at 5,000 and 10,000 cells has a spike sticking out of the
+main mass, and the reference's does not. It is one clade: 241 cells at 10,000,
+112 at 5,000. Four measurements settle what it is.
+
+**It is not a misplaced clade.** In the generating tree those 241 cells are
+spread over seven of the ten top-level clades, 66 here, 58 there, 51, 47, and no
+clade holds even a third of them. At 5,000 cells it is nine of ten. There is no
+true group that was put in the wrong place, because there is no true group.
+
+**The reference builds the same group.** 217 of the 241 arm cells, ninety per
+cent, sit inside a single reference clade of 520 leaves. At 5,000 it is 94 of
+112 inside one clade of 176. Both implementations pull the same cells together,
+independently. That is the strongest evidence that this is a property of the
+data.
+
+**These are the cells the model declines to separate.** 75 of the arm's 241 have
+a zero-length branch of their own, which is 61 per cent of every zero-length leaf
+edge in the tree, against the arm being 2.4 per cent of the cells. 66 of the
+reference's 99 zero-length leaves are arm cells too, and 82 cells are flagged by
+both implementations.
+
+**It is not simply the noisiest cells.** Median per-cell standard deviation is
+1.195 in the arm against 1.138 elsewhere, and the noisiest decile is 12.0 per
+cent of the arm against 9.9 per cent of the rest. At 5,000 cells there is no
+enrichment at all, 8.9 against 10.0. What makes a cell join the arm is its mean
+sitting close to its neighbours' relative to its error bars, which is not the
+same thing as having the largest error bars.
+
+**Why it draws as a spike, and why the reference's does not.** Inside the arm the
+search builds a deep ladder: 31 hops from leaf to root against 17 elsewhere, each
+rung a small but non-zero branch, summing to a root-to-tip length of 0.900
+against 0.621. The radial layout puts radius at cumulative branch length, so the
+chain accumulates outward inside one narrow angular slice. The reference ends the
+same group in multifurcations instead, so nothing accumulates. Two renderings of
+the same statement, that these cells cannot be told apart.
+
+Step 8 is not the answer to it. Collapsing on the finished tree takes the
+internal zero-length edges from 32 to 0 and moves the arm's median radius from
+0.902 to 0.902 and its depth by one hop. The chain is made of small *positive*
+edges, not zero ones, so a collapse cannot reach it by construction.
+
+Nothing here is a defect in the search. Making the arm go away would mean either
+forcing a flat multifurcation where the branch solve found positive optima, or
+moving points away from where their branch lengths put them. Both invent a
+picture the model did not produce.
+
 ## Reproducing
 
 The harness is not part of this crate. What it does is run the published

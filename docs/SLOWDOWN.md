@@ -101,9 +101,36 @@ difference. 5k reproduces the harness exactly: 20 moves, final loglik
 | size | moves | first five gains, nats | last five gains, nats | s per round | load |
 |---|---|---|---|---|---|
 | 5k | 20 | 11.3, 5.1, 6.1, 4.7, 3.6 | 0.13, 3.4, 0.08, 0.23, 0.18 | 1.17 | 17 |
-| 10k | in progress, 26 done at write time | 26.4, 15.1, 12.3, 10.7, 10.1 | round 19: 3.0 | 2.44 | 15 |
+| 10k | 89 | 26.4, 15.1, 12.3, 10.7, 10.1 | 13 of 89 above 10 nats, 31 in 1 to 10, 36 in 0.1 to 1, 10 below 0.1 | 2.44 | 15 to 18 |
 
-Every NNI gain is O(0.1) to O(10) nats. None is rounding.
+10k reproduces the harness exactly too: 89 moves, final loglik
+`-11263727.745`. Every NNI gain is O(0.1) to O(10) nats. None is rounding.
+
+### The subsample ladder, first rung (load 17 to 18)
+
+1250 cells drawn from the 10k Sanity output (seed 1), whole pipeline from the
+linkage start, default floor. `drift` as above.
+
+| round | moves | sum gain | smallest gain | drift | nodes | RF to previous |
+|---|---|---|---|---|---|---|
+| 1 | 455 | 6974 | 2.0e-5 | -9e-10 | 2495 | |
+| 2 | 151 | 961 | 1.2e-3 | -1e-9 | 2495 | 1073 |
+| 3 | 71 | 146 | 1.3e-3 | -3e-9 | 2490 | 283 |
+| 4 | 21 | 24.7 | 8.1e-3 | -2e-9 | 2491 | 110 |
+| 5 | 27 | 30.7 | 3.6e-4 | -1e-9 | 2486 | 54 |
+| 6 | 21 | 21.7 | 1.2e-3 | -7e-10 | 2487 | 52 |
+| 7 | 5 | 14.9 | 0.11 | -1e-9 | 2487 | 21 |
+| 8 | 7 | 7.0 | 0.07 | -2e-9 | 2487 | 16 |
+| 9 | 9 | 8.5 | 0.17 | -2e-9 | 2487 | 14 |
+| 10 | 2 | 0.47 | 0.013 | -1e-9 | 2486 | 11 |
+| 11 | 0 | | | | 2486 | 5 |
+
+769 SPR moves in 11 rounds, 31.4 s; NNI 8 moves in 9 rounds, 3.1 s; branch
+3.8 and 3.9 s. At this size the smallest accepted gain in any round is
+`2e-5` and the drift is `1e-9`, so the floor is not reached: the rounding
+noise scales with `|L|` (`1.7e6` here against `1.1e7` at 10k) and the pool of
+neutral candidates with `n`. Every rung's final round finds nothing the way
+the 5k run's did.
 
 ## What the numbers say
 
@@ -142,10 +169,14 @@ guess and is marked as such.
 
 ### 2. NNI move count: partly settled
 
-Measured: the moves are real, gains of 0.08 to 26 nats, so this is not the SPR
-mechanism. Measured: per-round cost is 1.17 s at 5k and 2.44 s at 10k, `n^1.06`,
-so the 8.9x is entirely the move count. The first gains at 10k are about twice
-the first gains at 5k (26 against 11).
+Measured: all 89 moves at 10k and all 20 at 5k are real, gains of 0.08 to 26
+nats, 44 of the 89 above one nat, so this is not the SPR mechanism. Measured:
+per-round cost is 1.17 s at 5k and 2.44 s at 10k, `n^1.06`, so the 8.9x is
+entirely the move count. The first gains at 10k are about twice the first
+gains at 5k (26 against 11). Measured on the 1250-cell subsample: 8 moves, so
+the count over 1250, 5000 (native) and 10000 is 8, 20, 89, which is `n^0.66`
+then `n^2.15`; the 2500 and 5000 subsample rungs will say whether that knee is
+real or a seed effect.
 
 Not settled: whether the count grows because SPR left more behind at 10k or
 because the interchange neighbourhood grows. The obvious reading, that the

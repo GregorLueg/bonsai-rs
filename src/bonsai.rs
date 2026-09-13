@@ -108,16 +108,36 @@ pub struct BonsaiParams {
 /// Search steps 1 and 2, or a linkage in their place. The refinement of steps 3
 /// to 7 is identical either way.
 ///
-/// **A Ward linkage reaches the same Robinson-Foulds distance and the same
-/// loglikelihood as the greedy merge for a fraction of the wall time**, and
-/// `docs/PERFORMANCE.md` has the numbers. The greedy merge is still the default
-/// because it is what SPEC.md section 9 specifies.
+/// **The linkage is the default and the specified start is not.** On synthetic
+/// data the two are interchangeable. On real Sanity-preprocessed input they are
+/// not: the linkage wins on the loglikelihood and on Robinson-Foulds at every
+/// size measured, and is several times faster. `docs/PERFORMANCE.md` has the
+/// table and the mechanism.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StartTree {
     /// The star of SPEC.md section 9.1, agglomerated by the merge score.
-    #[default]
+    ///
+    /// **This chains on real input, and the chaining grows with the cell
+    /// count.** Leaf depth straight after step 2 runs an order of magnitude
+    /// above `log2(n)`; steps 3 to 7 do not recover from it, and the finished
+    /// tree is worse on the loglikelihood as well as on the topology.
+    ///
+    /// The cause is the merge criterion, not the order pairs are taken in. A
+    /// cluster's effective leaf carries `1/size` of the noise, so a large one
+    /// sits closer to every member than that member's own relatives do and
+    /// absorbs them one at a time. A Ward distance grows with cluster size and
+    /// has no such bias; the merge gain shrinks. Rescheduling the merges does
+    /// not reach it, and `docs/PERFORMANCE.md` records what was tried.
+    ///
+    /// Kept because it is what the paper specifies, so it is what a
+    /// reproduction of the published method has to run. Choose it to compare
+    /// against that method, not to build the best tree.
     GreedyMerge,
     /// Ward linkage over a neighbour graph, [`crate::tree::linkage`].
+    ///
+    /// The default. Stays close to `log2(n)` mean leaf depth at every size
+    /// measured, and hands steps 3 to 7 a tree they refine rather than repair.
+    #[default]
     Linkage,
 }
 
@@ -574,22 +594,32 @@ mod tests {
         // module docs is wrong or a step is broken.
         let (n, p) = (32usize, 128usize);
         let (means, sds, variances, _) = raw_fixture(n, p, 0.3, 11);
-        let out = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
 
-        assert_eq!(out.steps.len(), 8);
-        for step in out.steps.iter().skip(1) {
-            assert!(
-                step.gain >= -1e-9,
-                "step '{}' lost {} nats",
-                step.step,
-                -step.gain
+        // The linkage start reports steps 1 and 2 as one step, so the count is
+        // start-dependent and both are checked.
+        for (start, n_steps) in [(StartTree::Linkage, 7), (StartTree::GreedyMerge, 8)] {
+            let params = BonsaiParams {
+                start,
+                ..Default::default()
+            };
+            let out =
+                bonsai(&means, &sds, n, p, Some(&variances), Some(params)).expect("bonsai");
+
+            assert_eq!(out.steps.len(), n_steps, "{start:?}");
+            for step in out.steps.iter().skip(1) {
+                assert!(
+                    step.gain >= -1e-9,
+                    "{start:?} step '{}' lost {} nats",
+                    step.step,
+                    -step.gain
+                );
+            }
+            assert_relative_eq!(
+                out.steps.last().expect("steps").loglik,
+                out.loglik,
+                max_relative = 1e-12
             );
         }
-        assert_relative_eq!(
-            out.steps.last().expect("steps").loglik,
-            out.loglik,
-            max_relative = 1e-12
-        );
     }
 
     #[test]

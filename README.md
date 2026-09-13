@@ -72,15 +72,24 @@ both scored the same way against the same ground truth:
 
 | cells | genes | | seconds | Robinson-Foulds | distance recovery |
 |---|---|---|---|---|---|
-| 5,000 | 2,701 | bonsai-rs | 164 | 1295 | 0.666 |
+| 512 | 2,382 | bonsai-rs | 5 | 147 | 0.591 |
+| 512 | 2,382 | published | 554 | 146 | 0.633 |
+| 5,000 | 2,701 | bonsai-rs | 169 | 1293 | 0.666 |
 | 5,000 | 2,701 | published | 4,880 | 1937 | 0.496 |
-| 10,000 | 2,767 | bonsai-rs | 2,384 | 2661 | 0.465 |
+| 10,000 | 2,767 | bonsai-rs | 630 | 2632 | 0.466 |
 | 10,000 | 2,767 | published | 17,389 | 5149 | 0.281 |
 
-30x and 7x faster, closer to the generating tree on both metrics, and the
-crossover in quality sits somewhere under 5,000 cells: at 512 the published
-implementation is mildly ahead. `docs/COMPARISON.md` has the full tables, the
-figures and the caveats.
+29x and 28x faster at the two larger sizes, and closer to the generating tree on
+both metrics at both. At 512 cells the two land on the same topology quality and
+the published implementation is mildly ahead on distance recovery, in a hundredth
+of the time. The two are not timed alike and do not get the same hardware;
+`docs/COMPARISON.md` has the full tables, the figures and the caveats.
+
+These are `BonsaiParams::default()`, which starts from a Ward linkage rather than
+the greedy merge of SPEC.md section 9.1. The specified start is still there as
+`StartTree::GreedyMerge` and is what to use for a like-for-like reproduction of
+the published method; `docs/PERFORMANCE.md` has both sets of numbers and why the
+default is what it is.
 
 `docs/PERFORMANCE.md` says how it got there, including the things that did not
 work. `docs/DESIGN.md` says how it is built.

@@ -26,20 +26,26 @@ selection applied identically to both. The `512_s32` configuration is the same
 ## Speed and quality
 
 
-|      cells |    genes |         method | seconds | peak RSS | Robinson-Foulds | distance recovery | loglikelihood |
-|------------|----------|----------------|---------|----------|-----------------|-------------------|---------------|
-|        512 |    2_382 | bonsai-rs      |     210 |          |             189 |             0.588 |      -527,761 |
-|        512 |    2_382 | published      |     554 |   567 MB |             146 |             0.633 |      -527,255 |
-|        512 |    2_382 | truth          |         |          |               0 |             0.733 |               |
-|    512 s32 |    2_302 | bonsai-rs      |      63 |          |             327 |             0.221 |      -514,991 |
-|    512 s32 |    2_302 | published      |     371 |   558 MB |             240 |             0.303 |      -513,553 |
-| 512 s32 | 2_302 | truth | | | 0 | 0.500 | |
-| 5,000 | 2_701 | bonsai-rs | 164 | | 1,295 | 0.666 | -5,557,976 |
-| 5,000 | 2_701 | published | 4,880 | 3,156 MB | 1,937 | 0.496 | -5,563,770 |
-| 5,000 | 2_701 | truth | | | 0 | 0.679 | |
-| 10,000 | 2_767 | bonsai-rs | 2,384 | | 2,661 | 0.465 | -11,253,231 |
-| 10,000 | 2_767 | published | 17,389 | 5,772 MB | 5,149 | 0.281 | -11,280,721 |
-| 10,000 | 2_767 | truth | | | 0 | 0.461 | |
+| cells | genes | method | seconds | peak RSS | Robinson-Foulds | distance recovery | loglikelihood |
+|---|---|---|---|---|---|---|---|
+| 512 | 2,382 | bonsai-rs | 5 | | 147 | 0.591 | -527,499 |
+| 512 | 2,382 | published | 554 | 567 MB | 146 | 0.633 | -527,255 |
+| 512 | 2,382 | truth | | | 0 | 0.733 | |
+| 512 s32 | 2,302 | bonsai-rs | 6 | | 220 | 0.318 | -513,567 |
+| 512 s32 | 2,302 | published | 371 | 558 MB | 240 | 0.303 | -513,553 |
+| 512 s32 | 2,302 | truth | | | 0 | 0.500 | |
+| 5,000 | 2,701 | bonsai-rs | 169 | | 1,293 | 0.666 | -5,557,975 |
+| 5,000 | 2,701 | published | 4,880 | 3,156 MB | 1,937 | 0.496 | -5,563,770 |
+| 5,000 | 2,701 | truth | | | 0 | 0.679 | |
+| 10,000 | 2,767 | bonsai-rs | 630 | | 2,632 | 0.466 | -11,253,188 |
+| 10,000 | 2,767 | published | 17,389 | 5,772 MB | 5,149 | 0.281 | -11,280,721 |
+| 10,000 | 2,767 | truth | | | 0 | 0.461 | |
+
+bonsai-rs rows are `BonsaiParams::default()` as of 2026-09-13, which starts from
+a Ward linkage. An earlier version of this table mixed starts without saying so:
+the 512 rows were the greedy merge of SPEC.md section 9.1 and the 5,000 and
+10,000 rows were the linkage. `docs/PERFORMANCE.md` has both starts at every
+size and why the default changed.
 
 Robinson-Foulds is to the generating tree, so lower is better. Distance recovery
 is the correlation between tree path distance and true squared Euclidean
@@ -48,18 +54,19 @@ row is the generating tree's own value and is the ceiling. Loglikelihoods are
 each implementation's own and are not comparable across the two, since the
 constants dropped at ingest differ.
 
-Robinson-Foulds between the two reconstructions: 113 at 512, 203 at 512 s32,
-1,478 at 5,000 and 4,226 at 10,000.
+**The reversal is narrower than it looked, and the 512 end is a tie.** At 512
+cells the two are level on topology, 147 splits from the truth against 146, and
+the published implementation is ahead on distance recovery, 0.633 against 0.591.
+At the 512 replicate it goes the other way on both, 220 against 240 and 0.318
+against 0.303. By 5,000 bonsai-rs is ahead on both, and at 10,000 the gap is
+wide: 2,632 against 5,149 splits, and 0.466 against 0.281.
 
-**The quality ordering reverses with size.** At 512 cells the published
-implementation is ahead on both metrics. By 5,000 it is behind on both, and at
-10,000 the gap is wide: 2,661 against 5,149 splits from the truth, and 0.465
-against 0.281 on distance recovery. The crossover sits somewhere between 512 and
-5,000 cells and has not been bracketed.
+An earlier version of this section had the published implementation ahead on
+both metrics at 512. That was the greedy-merge start, not the default.
 
 **At 10,000 cells both are near the ceiling on distance recovery and neither is
 near it on topology.** The generating tree itself scores 0.461, and bonsai-rs
-scores 0.465. Scoring above the generating tree is expected rather than
+scores 0.466. Scoring above the generating tree is expected rather than
 suspicious: that tree's branch lengths are diffusion times, the *expected*
 squared displacement, while these are fitted to what was realised.
 
@@ -67,15 +74,13 @@ squared displacement, while these are fitted to what was realised.
 is a gap in the harness rather than a result. The published implementation's
 5,772 MB at 10,000 cells is what a dense `n x n` working set costs.
 
-**Two changes landed after this run and are not in the table.** The
-scale-relative SPR acceptance floor takes the 10,000-cell run from 2,384 s to
-616 s and improves the tree slightly (Robinson-Foulds 2,661 to 2,659,
-loglikelihood by 37 nats); 5,000 is unchanged. The step 8 collapse then takes
-Robinson-Foulds to 2,632 for 2.75 s. So the speed ratio at 10,000 is now nearer
-28x than 7x. A fresh paired run has not been done, so the table stands as
-measured rather than as extrapolated.
-
 ## What the trees look like
+
+**The figures and the three tables below were computed from the 2026-09-13 run
+and have not been recomputed against the trees in the table above.** They
+describe real trees that were really produced, and the qualitative points they
+make still hold, but the counts are not this run's.
+
 
 ![radial layouts at 10,000 cells](https://raw.githubusercontent.com/GregorLueg/bonsai-rs/main/docs/figures/n10000_tree_layout.png)
 

@@ -74,6 +74,15 @@ zero-length binary nodes and a single high-degree polytomy are the same tree to
 the likelihood but not to the search: collapsing the chain hands every regraft
 landing nearby a bigger star to resolve.
 
+**A generator is not the data, and a tie on it is not a tie.** The Ward start
+was adopted because it matched the specified merge start on the synthetic sweep
+and was faster, and "identical tree" went into two doc comments and a table. On
+real Sanity-preprocessed input they are not close: the linkage is better at
+every size, and the specified start chains worse the larger the dataset gets.
+The generator was too easy to separate them, and a measured *tie* is the weakest
+result there is, because it is what both a real equivalence and an insensitive
+benchmark look like. Confirm one on the input you actually ship against.
+
 **Look at core utilisation, not only wall time.** The crate has three parallel
 axes and all three lived in ingest or in search step 2. Once step 2 was replaced
 by a linkage, the pipeline got 1.26x out of ten cores. Nothing in the wall-clock
@@ -86,7 +95,7 @@ numbers said so; it took a run at `RAYON_NUM_THREADS=1` to see it.
 | Wire in the kNN restriction and ellipsoid bounds | 1478.8 s to 37.4 s at 512 by 2000; `n^2.9` to `n^1.8` |
 | Lazy SPR proposal rows | 93.19 s to 6.71 s at 2048 by 200; `n^1.98` to `n^1.47` |
 | Structural NNI filter over the star result | 1.98 s to 0.75 s at 2048 by 200; per round `n^1.53` to `n^1.02` |
-| Ward linkage start replacing search step 2 | 66.08 s to 17.06 s at 2048 by 2000, identical tree |
+| Ward linkage start replacing search step 2 | 66.08 s to 17.06 s at 2048 by 2000, identical tree on synthetic data; strictly better on real, see below |
 | SPR proposals in parallel chunks, restarted on acceptance | 200.04 s to 24.44 s at 16384 by 2000; `n^1.45` to `n^1.31` |
 | SPR acceptance on the candidate's own terms, rows assembled not swept | 127.9 s to 19.1 s at 2048 by 2000, noise 1.6, with the above |
 | Scale-relative SPR acceptance floor | 2383.75 s to 616.26 s at 10,000 by 2,767, and a better tree |
@@ -133,6 +142,7 @@ implicitly, since the arena invariant makes ascending index order a post-order.
 | Parallel pair scan on the four-member star inside the SPR proposal loop | 3.0 ms a resolution summed over threads against 0.7 sequential |
 | Redrawing the linkage graph more often to stop it chaining | the chain was the cause, not the cadence |
 | Collapsing zero-length internal edges before step 5 | 589 s against 451 in SPR, on an eighth fewer nodes |
+| Merging every mutually-best pair a round instead of the single best | step 2 seven to eight times faster and scoring better, and the tree no better; the chaining is in the criterion |
 
 Two deserve a paragraph.
 
@@ -161,6 +171,71 @@ pair had. Measured at 64 and 128 members: 10 to 32 inversions over 61 to 125
 rounds, worst excess 3.6 to 13.2 nats, up to 60 per cent relative. Ward has no
 global remainder term and is reducible by construction, which is a second reason
 to prefer it for the starting tree.
+
+## Which starting tree
+
+`StartTree::Linkage` is the default. `StartTree::GreedyMerge` is search steps 1
+and 2 as SPEC.md section 9.1 specifies them. Use the linkage for any real work;
+use the greedy merge when the point is to reproduce the published method.
+
+Measured 2026-09-13 on Sanity-preprocessed Baron pancreas data, the same gene
+set to both, scored against the generating tree. Robinson-Foulds lower is
+better, distance recovery higher.
+
+| cells | start | Robinson-Foulds | distance recovery | loglikelihood | seconds |
+|---|---|---|---|---|---|
+| 512 | greedy | 175 | 0.600 | -527,518 | 19.9 |
+| 512 | linkage | 147 | 0.591 | -527,499 | 4.8 |
+| 512 s32 | greedy | 310 | 0.228 | -514,593 | 19.5 |
+| 512 s32 | linkage | 220 | 0.318 | -513,567 | 6.2 |
+| 5,000 | greedy | 1,368 | 0.518 | -5,560,648 | 723 |
+| 5,000 | linkage | 1,293 | 0.666 | -5,557,975 | 169 |
+| 10,000 | greedy | 3,305 | 0.260 | -11,270,741 | 3,680 |
+| 10,000 | linkage | 2,632 | 0.466 | -11,253,188 | 630 |
+
+The linkage wins on the loglikelihood and on Robinson-Foulds at all four, on
+distance recovery at three of four, and is three to five times faster. The one
+exception is recovery at 512, where the replicate at the same size goes the
+other way by more than the gap.
+
+**It is not a size threshold.** The obvious reading of the earlier numbers was
+that the greedy merge is fine below a thousand cells or so and the linkage takes
+over above it. That was never measured; when it was, the linkage won at 512 too.
+
+**The mechanism is chaining, and it is in the criterion.** Mean leaf depth
+straight after step 2, against `log2(n)`:
+
+| cells | greedy | linkage | log2(n) |
+|---|---|---|---|
+| 512 | 18.7 | 8.9 | 9.0 |
+| 5,000 | 114.5 | 12.5 | 12.3 |
+| 10,000 | 151.7 | 13.5 | 13.3 |
+
+The linkage lands within a hop of `log2(n)`. The greedy merge overshoots by
+2.1x, 9.3x and 11.4x, so the overshoot grows with the cell count rather than
+being a constant factor, and steps 3 to 7 spend their budget repairing it: at
+10,000 cells the greedy start leaves SPR 11,330 accepted moves over 32 rounds
+and NNI 457 moves over 458, against 4,755 and 47 from the linkage.
+
+A cluster's effective leaf carries `1/size` of the noise, so at a few thousand
+features a large cluster sits closer to every member than that member's own
+relatives do and absorbs them one at a time. Ward has the opposite bias, since
+a Lance-Williams distance to a cluster grows with its size. `src/tree/linkage.rs`
+documents the same trap on the linkage's own earlier chain-based design.
+
+**Rescheduling does not reach it.** Merging every mutually-best pair a round
+rather than the single best was tried on 2026-09-13. Step 2 got seven to eight
+times faster and reached a *better* merge score, and the finished tree did not
+improve: Robinson-Foulds went the wrong way at both sizes tried, 175 to 186 at
+512 and 1,368 to 1,425 at 5,000, and depth only came down to 16.1 and 74.1
+against the linkage's 8.9 and 12.5. The mutual test stops a large cluster taking
+more than one partner a round, but not from being every singleton's preferred
+partner; those singletons are then mutual with nothing, the round starves, and
+the chain builds anyway. The change was reverted.
+
+That a start scoring better on the merge score produces a worse finished tree is
+the other half of the result: on real input the specified criterion is a poor
+proxy for the tree you end up with.
 
 ## Memory
 

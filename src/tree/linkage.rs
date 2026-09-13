@@ -1,16 +1,22 @@
 //! A starting tree from a neighbour-graph linkage.
 //!
 //! Search step 2 builds the initial topology by greedy likelihood-driven
-//! agglomeration (SPEC.md section 9.1). It does not earn its keep: a Ward
-//! linkage over the same transformed means reaches the same Robinson-Foulds
-//! distance and the same loglikelihood after steps 3 to 7, at a fraction of the
-//! cost. `docs/PERFORMANCE.md` has the numbers.
+//! agglomeration (SPEC.md section 9.1). This replaces it, and is the default
+//! ([`crate::bonsai::StartTree`]).
+//!
+//! **It does better than the start it replaces, not merely as well.** On
+//! synthetic data the two reach the same Robinson-Foulds distance and the same
+//! loglikelihood, and an earlier version of this comment said so and stopped
+//! there. On real Sanity-preprocessed input the linkage wins on the
+//! loglikelihood and on Robinson-Foulds at every size measured and is several
+//! times faster; `docs/PERFORMANCE.md` has the table. The specified merge score
+//! chains on real data, and the reason is the size bias
+//! [`crate::bonsai::StartTree::GreedyMerge`] sets out.
 //!
 //! What this module does *not* do is score anything with the model. It hands
-//! the refinement a structurally sensible tree and gets out of the way. That is
-//! a low bar on purpose: refinement reaches Robinson-Foulds 0 even from a
-//! uniformly random topology, so the linkage only has to beat random, which it
-//! does in wall time rather than in recovery.
+//! the refinement a structurally sensible tree and gets out of the way. That
+//! turns out to be enough, and on noisy input it is better than a start chosen
+//! by a criterion with a size bias in it.
 //!
 //! ### Why Ward and not the merge score
 //!

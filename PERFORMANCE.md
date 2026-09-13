@@ -13,7 +13,7 @@ pessimistic and the ratios trustworthy.
 
 ## The rules
 
-Nine, all of them paid for.
+Ten, all of them paid for.
 
 ### 1. Measure a component's share of the whole before optimising it
 
@@ -95,7 +95,18 @@ what is left. The sentence stayed true and stopped being a reason.
 Any comment of the form "X is fine because Y is small" needs re-reading whenever
 Y's denominator changes.
 
-### 9. Look at core utilisation, not only wall time
+### 9. A smaller input is not automatically a cheaper one
+
+Collapsing the zero-length internal edges before step 5 takes the 10k tree from
+19,998 nodes to 17,747. SPR then ran **589 s against 451**, on 2,251 fewer
+nodes: fewer accepted moves, 4,227 against 4,755, over more rounds, 14 against
+12. The mechanism is clean. A chain of zero-length binary nodes and a single
+high-degree polytomy are the same tree to the likelihood, but not to the
+search: collapsing the chain hands every regraft that lands nearby a bigger
+four-member-star resolution to pay for. Removing an eighth of the nodes cost
+138 s in step 5 and saved nothing anywhere.
+
+### 10. Look at core utilisation, not only wall time
 
 The crate names three parallel axes and all three live in ingest or in search
 step 2. Once step 2 was replaced, the pipeline got **1.26x out of ten cores**.
@@ -861,29 +872,36 @@ Early collapse wins on Robinson-Foulds, 45 splits over no collapse and 18 over
 collapsing late, so the search does build on structure the data does not
 support. Three things stop that being a recommendation.
 
-- **It costs 247 s, 40 per cent, and SPR got slower on the smaller tree**: 589 s
-  against 451, fewer moves over more rounds. The collapsed tree has genuine
-  high-degree polytomies where the uncollapsed one had chains of zero-length
-  binary nodes, so every regraft landing near one pays a bigger star
-  resolution. Removing 2,251 nodes bought quality, not speed.
-- **Distance recovery moves the other way**, 0.465463 against 0.466268. Small,
-  and the two metrics measure different things, but they disagree.
-- **One seed.** 45 splits is 0.2 per cent of 19,994, and there is no
-  seed-to-seed spread at 10k to compare it against; the recorded spread is three
-  to five splits at 2,048 leaves. Whether 45 at 10,000 clears it is unmeasured
-  and needs a second 863 s run.
+- **It costs 247 s, 40 per cent, and SPR got slower on the smaller tree.** Rule
+  9, which this measurement is where it came from.
+- **The three metrics rank the three arms differently.** Robinson-Foulds prefers
+  early, the loglikelihood prefers late, distance recovery prefers no collapse
+  at all. Every gap is tiny: 18 splits of 19,994 is 0.09 per cent, 3 nats of
+  11.25 million, 0.0008 of recovery. Three measures disagreeing at that
+  magnitude is the finding, and the honest reading is that **early collapse is
+  not distinguishable from late on quality**.
+- **It does not touch the arm either.** The early arm still ends with 117
+  zero-length leaf edges against no-collapse's 129. Nothing here removes a leaf
+  zero, and a reader could easily conclude otherwise from the 45 splits.
+- **No arm was run at more than one seed**, at either size. 45 splits is 0.2 per
+  cent of 19,994, and this file's own recorded spread, three to five splits at
+  2,048 leaves, gives no basis at all for judging 45 at 10,000. A second seed
+  was deliberately not run: 863 s to sharpen a distinction that would not change
+  the recommendation.
 
 ### What is left for the owner
 
 Two separable decisions, and only the first is about the pipeline order.
 
-1. **Late collapse** is the cheap, safe option: 2.75 s, 27 splits at 10k and 2
-   at 5k, drives the internal zero edges to zero, and cannot affect the search
-   because it runs after it. **Early collapse** is 18 splits better again for
-   247 s and a small loss in distance recovery, and it changes what the search
-   sees, which is the part wanting a second seed before anyone commits. Neither
-   touches the step order `src/bonsai.rs` calls not negotiable; both are an
-   addition rather than a rearrangement.
+1. **Late collapse**, and the case for it is not a quality argument. On quality
+   the three arms are indistinguishable. It wins on everything else: 2.75 s
+   against 247, the best loglikelihood of the three, it drives the internal
+   zero-length edges to exactly zero which is the one structural thing the
+   pipeline never does, and above all **it runs after the search, so it cannot
+   change what the search finds**. Early collapse changes the search's input,
+   which is why its SPR slowed and why it would need seeds before anyone trusted
+   its 45 splits. Neither touches the step order `src/bonsai.rs` calls not
+   negotiable; both are an addition rather than a rearrangement.
 2. The 129 zero-length leaf edges stay whatever is decided. If they render
    badly, the answer is in the rendering or in the caveat, not in the search.
 

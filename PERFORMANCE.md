@@ -589,3 +589,114 @@ quiet.
 | Raising the halving fraction to 0.9 | depth 22 against 11 at 2048; the graph was not stale, the chain was lopsided |
 | Redrawing once a cluster has grown 4x since its list was drawn | correct tree, 161 redraws for 13, six times the build |
 | Redrawing at 2x growth | correct tree, sixty times the build |
+
+## The SPR acceptance floor, 2026-09-13: a constant measured on the wrong quantity
+
+Rule 8, and rule 4 underneath it. `StarParams::min_gain = 1e-9` is a floor on a
+*merge score*, a sum over the `p` features of one pair. Its doc comment measured
+the thing it gates: `1.1e-16` per feature, so `1.1e-12` at ten thousand
+features, and `1e-9` clears that by 900x. Correct, and it has been correct since
+2026-08-27.
+
+`search::spr` then used the same constant for `proposal.loglik > best +
+min_gain`, where both sides are *whole-tree* loglikelihoods, magnitude
+`O(n p)`. At 10,000 cells by 2,767 genes that is `1.1e7` and its rounding floor
+is about `2.4e-9`, so the acceptance floor sat below the noise. What that looks
+like from outside, measured by the diagnostic pass in `docs/SLOWDOWN.md`: from
+round 10 every round accepted exactly one likelihood-neutral topology change of
+gain `5.6e-8`, about 32 ulps of the sum, the tree cycled with period two, and
+the fresh loglikelihood did not move. Ninety-one of a hundred rounds did
+nothing, roughly 1,900 s of 2,129 s, and `DEFAULT_MAX_ROUNDS` was the only thing
+that ended the run. The same cycle appears at 2,500 cells, so it is not a cliff
+at 10k; it is a threshold `|L|` crosses on the way up.
+
+### The fix
+
+`acceptance_floor` in `search::spr`:
+
+```
+max(star.min_gain, min_relative_gain * max(|L|, LOGLIK_SCALE_FLOOR))
+```
+
+the same shape `model::global::optimise_branch_lengths` has always used, with
+`LOGLIK_SCALE_FLOOR` now shared from that module rather than written twice.
+`DEFAULT_MIN_RELATIVE_GAIN = 1e-12` is not a fresh guess: it is the tolerance
+`test_the_incremental_loglik_matches_a_fresh_prune` already pins the proposal's
+score to. A candidate is accepted on an incrementally assembled figure, so
+there is no sense in accepting a gain smaller than the disagreement between
+that figure and the fresh prune it stands in for.
+
+Sized against the arithmetic and then checked against data. Worst disagreement
+between the incremental score and a fresh prune, over every proposal from a
+ladder start:
+
+| leaves by features | \|L\| | worst relative | floor |
+|---|---|---|---|
+| 16 by 64 | 4.65e2 | 1.25e-16 | 1e-9 (absolute binds) |
+| 32 by 128 | 1.52e3 | 1.42e-16 | 1e-9 (absolute binds) |
+| 64 by 256 | 4.50e3 | 2.03e-16 | 1e-9 (absolute binds) |
+| 128 by 512 | 1.14e4 | 6.19e-16 | 1.1e-8 |
+| 10,000 by 2,767 | 1.10e7 | 5.4e-15 (measured on real data) | 1.10e-5 |
+
+Relative noise grows as the square root of `|L|` over those four rungs, which
+is the random walk an unordered `f64` sum accumulates: a factor of 5 over a
+factor of 25. Extrapolated on that law the noise at `|L| = 1.1e7` is `2.2e-7`,
+which over-predicts the `5.96e-8` actually measured there by about 4x, so a
+small fixture is a conservative predictor. The floor clears the measurement by
+180x and sits six orders below a real move: SPR gains at 10k average about 15
+nats, and the smallest accepted on any rung of the subsample ladder was `2e-5`.
+Below about 1,000 cells `star.min_gain` is still the binding one, so small
+fixtures come out bit-identical.
+
+**`min_gain` was not changed for the callers where it is right.** `star` and
+`polytomy` compare merge scores, `O(p)`. So does `nni`, which is worth stating
+because it does not look like it: its gain is a difference of whole-tree
+loglikelihoods but is never formed as one, since the merge gains are `O(p)`
+sums over one pair each and `collapse_delta` is three `O(p)` peels around one
+edge, and every term the two trees share cancels symbolically. Measured
+agreement: all 89 interchanges accepted at 10k gained 0.08 to 26 nats and none
+was rounding.
+
+### The rest of the crate, swept
+
+One more instance, in tests. `test_a_round_never_lowers_the_loglikelihood` and
+`test_the_whole_run_never_lowers_the_loglikelihood` compared whole-tree
+loglikelihoods with `assert_relative_eq!(..., epsilon = 1e-9)`, and `epsilon`
+in `approx` is the absolute threshold. A fixture-size tolerance on an `O(n p)`
+quantity: fine at 32 leaves by 128 features, would fail spuriously at 10k. Now
+`max_relative = 1e-12`, and the drift check against the claimed gains is
+`1e-12 * |L|`.
+
+Checked and deliberately left alone:
+
+- `model::place::DEFAULT_TOLERANCE = 4.0` is a beam width over
+  `attachment_score`, which is `O(p)` and whose gap between neighbouring
+  attachment points is `O(1)` by construction. Absolute is right.
+- `model::branch::BRANCH_TOL`, `ingest::VARIANCE_TOL` and the two layout
+  epsilons are already relative.
+- `search::bounds` thresholds gate merge scores, `O(p)`.
+- `nni.rs` carries two absolute slacks on loglikelihood assertions (`- 1e-6`,
+  `- 1e-9`). They are slack in the permissive direction and still clear the
+  noise at 100,000 cells, so they are wrong in shape and harmless in effect.
+
+### Tests
+
+`test_the_acceptance_floor_outgrows_the_loglikelihood_rounding_floor` measures
+the noise at four sizes, pins its growth law, extrapolates to the magnitude
+that broke, and asserts the floor still clears it. That extrapolation is the
+part a 64-leaf test does not have, and it is why the bug survived a green suite
+for a fortnight. With the old absolute floor it fails.
+`test_the_sweeps_reach_a_fixed_point_rather_than_cycling` asserts `spr` stops
+before the cap at three sizes and that a second run from its output is the
+identity, which is the cycle itself.
+
+### End to end: not yet measured
+
+The 10k confirmation run was started and killed mid-SPR when the machine went
+to load 71. What it had produced before the kill matches the baseline exactly
+(`1-2 linkage -22460257.30`, `4 branch -11327994.58`), which is expected: the
+change cannot touch anything before step 5. SPR rounds, total seconds,
+Robinson-Foulds, zero-length branches and polytomies at 5k and 10k are pending
+a quiet window. The projection to confirm or refute is about nine rounds and
+200 s against 100 rounds and 2,129 s, and it is an inference from the measured
+per-round cost, not a measurement.

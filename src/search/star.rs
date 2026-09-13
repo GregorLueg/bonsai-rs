@@ -218,6 +218,30 @@ pub struct StarParams {
     /// bounds of SPEC.md section 10, where the recompute is the largest term
     /// left; leave it off without them.
     pub incremental_centre: bool,
+    /// Merge every mutually-best pair of the round instead of only the best
+    /// one.
+    ///
+    /// The default schedule takes one pair a round, which is depth-first: the
+    /// cluster that merged last is a candidate again immediately, and a large
+    /// cluster's effective leaf carries `1/size` of the noise, so at a few
+    /// thousand features it sits closer to every member than that member's own
+    /// relatives do. One cluster then runs away while the rest are still
+    /// singletons. [`crate::tree::linkage`] documents the same trap and was
+    /// redesigned around it; this is the same fix for the merge scan.
+    ///
+    /// **Measured on Sanity-preprocessed Baron pancreas data, 2026-09-13.**
+    /// Mean leaf depth straight after step 2, against `log2(n)`: at 512 leaves
+    /// 18.7 against 9.0, at 5,000 leaves 114.5 against 12.3, at 10,000 leaves
+    /// 151.7 against 13.3. The overshoot grows with the cell count, which is
+    /// the runaway and not a constant factor.
+    ///
+    /// **Deviation.** SPEC.md section 9.1 merges one pair a round, and the
+    /// merge gain is not reducible: merging changes the peeled remainder every
+    /// other pair's score depends on, so a batch is scored against the centre
+    /// as it stood at the top of the round. `crate::tree::linkage` sets out why
+    /// Ward can batch and this cannot. The centre is recomputed exactly after
+    /// every batch rather than updated incrementally.
+    pub mutual_rounds: bool,
 }
 
 impl Default for StarParams {
@@ -232,6 +256,7 @@ impl Default for StarParams {
             selection: StarSelection::Greedy,
             merge: MergeParams::default(),
             incremental_centre: false,
+            mutual_rounds: false,
         }
     }
 }
@@ -995,6 +1020,161 @@ fn scan_pairs<T: BonsaiFloat>(
         .try_reduce(|| Scan::EMPTY, |x, y| Ok(x.merge(y)))
 }
 
+/// Score every pair and keep them all, rather than reducing to the best.
+///
+/// [`StarParams::mutual_rounds`] needs each member's own best partner, which a
+/// reduction to one candidate cannot answer. The result is aligned with
+/// `pairs`; a pair whose solve diverged is [`Candidate::NONE`].
+///
+/// ### Params
+///
+/// * `work` - The star's members, branches and centre
+/// * `members` - Node id of each member
+/// * `pairs` - Member index pairs to score
+/// * `merge` - Branch-length solve knobs
+///
+/// ### Returns
+///
+/// One candidate per pair, or the error the solve failed with.
+fn scan_pairs_all<T: BonsaiFloat>(
+    work: &Working<'_, T>,
+    members: &[u32],
+    pairs: &[(usize, usize)],
+    merge: MergeParams,
+) -> Result<Vec<Candidate>, BonsaiErrors> {
+    let p = work.p;
+    if pairs.len() < PAR_PAIRS_MIN {
+        let mut scratch = PairScratch::new(p);
+        return pairs
+            .iter()
+            .map(|&(a, b)| Ok(score_pair(work, members, a, b, merge, &mut scratch)?.best))
+            .collect();
+    }
+    pairs
+        .par_iter()
+        .map_init(
+            || PairScratch::new(p),
+            |scratch, &(a, b)| Ok(score_pair(work, members, a, b, merge, scratch)?.best),
+        )
+        .collect()
+}
+
+/// Pick the pairs that are each other's best partner this round.
+///
+/// SPEC.md section 9.1 merges the single best pair. This takes every pair that
+/// both members rank first, which is the reducibility test a Ward linkage uses
+/// to merge a whole round at once; see [`StarParams::mutual_rounds`] for why
+/// the schedule and not the criterion is what changes.
+///
+/// ### Params
+///
+/// * `cands` - One candidate per entry of `pairs`, from [`scan_pairs_all`]
+/// * `pairs` - Member index pairs, aligned with `cands`
+/// * `n_members` - Number of live members, bounding the member indices
+/// * `min_gain` - Floor a candidate must exceed to be considered
+///
+/// ### Returns
+///
+/// The accepted candidates, ordered by node id so the batch does not depend on
+/// the thread count.
+/// Wire one accepted merge into the arena being built.
+///
+/// The ancestor's rows must already be in `m` and `w`, which is what
+/// `push_ancestor` does: the incremental centre update reads them, and it also
+/// reads the two branches this overwrites, so the caller sequences those.
+///
+/// ### Params
+///
+/// * `accepted` - The merge to apply
+/// * `ancestor` - Node id the ancestor was pushed at
+/// * `m`, `w` - Member means and precisions, ancestor included
+/// * `parent`, `branch` - The arena under construction
+/// * `members` - Live members, updated in place
+/// * `merges` - Merge log, appended to
+/// * `p` - Feature count
+/// * `candidates` - Provider to notify of the merge
+fn finish_merge<T: BonsaiFloat, C: CandidatePairs<T>>(
+    accepted: Candidate,
+    ancestor: u32,
+    m: &[T],
+    w: &[T],
+    parent: &mut Vec<u32>,
+    branch: &mut Vec<f64>,
+    members: &mut Vec<u32>,
+    merges: &mut Vec<StarMerge>,
+    p: usize,
+    candidates: &mut C,
+) {
+    let (k, l) = (accepted.left as usize, accepted.right as usize);
+    parent[k] = ancestor;
+    parent[l] = ancestor;
+    branch[k] = accepted.t_ak;
+    branch[l] = accepted.t_al;
+    parent.push(NO_NODE);
+    branch.push(accepted.t_ar);
+
+    // The ancestor's id exceeds every member's, so appending keeps the
+    // membership ascending and the tie-break in `Candidate::better` is a
+    // tie-break on position as well as on id.
+    members.retain(|&x| x != accepted.left && x != accepted.right);
+    members.push(ancestor);
+
+    let merge = StarMerge {
+        left: accepted.left,
+        right: accepted.right,
+        ancestor,
+        t_left: accepted.t_ak,
+        t_right: accepted.t_al,
+        t_centre: accepted.t_ar,
+        gain: accepted.gain,
+    };
+    let base = ancestor as usize * p;
+    candidates.merged(
+        &merge,
+        EffLeaf {
+            m: &m[base..base + p],
+            w: &w[base..base + p],
+        },
+    );
+    merges.push(merge);
+}
+
+fn mutual_pairs(
+    cands: &[Candidate],
+    pairs: &[(usize, usize)],
+    n_members: usize,
+    min_gain: f64,
+) -> Vec<Candidate> {
+    // Larger gain wins; equal gains break on the smaller pair of node ids, the
+    // same rule as `Candidate::better`.
+    let beats = |x: &Candidate, y: &Candidate| {
+        x.gain > y.gain || (x.gain == y.gain && (x.left, x.right) < (y.left, y.right))
+    };
+
+    let mut best_for = vec![usize::MAX; n_members];
+    for (ci, cand) in cands.iter().enumerate() {
+        if !cand.gain.is_finite() || cand.gain <= min_gain {
+            continue;
+        }
+        let (a, b) = pairs[ci];
+        for m in [a, b] {
+            if best_for[m] == usize::MAX || beats(cand, &cands[best_for[m]]) {
+                best_for[m] = ci;
+            }
+        }
+    }
+
+    let mut out: Vec<Candidate> = (0..cands.len())
+        .filter(|&ci| {
+            let (a, b) = pairs[ci];
+            best_for[a] == ci && best_for[b] == ci
+        })
+        .map(|ci| cands[ci])
+        .collect();
+    out.sort_by_key(|c| (c.left, c.right));
+    out
+}
+
 /// Walk a bound-ordered candidate list, stopping once the best is provably
 /// found.
 ///
@@ -1338,6 +1518,43 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
             wc: &wc,
             p,
         };
+        // A whole round of mutually-best pairs, scored against the centre as it
+        // stands now. Bounds are ignored: they prune to the round's single best
+        // pair, which is not what the mutual test asks for.
+        if params.mutual_rounds {
+            let cands = scan_pairs_all(&work, &members, &pairs, params.merge)?;
+            scored_last_round = pairs.len();
+            if cands.iter().all(|c| !c.gain.is_finite()) && !pairs.is_empty() {
+                return Err(diverged_round(&work, &members, &pairs, params.merge));
+            }
+            let batch = mutual_pairs(&cands, &pairs, members.len(), params.min_gain);
+            if batch.is_empty() {
+                break;
+            }
+            for accepted in batch {
+                let (k, l) = (accepted.left as usize, accepted.right as usize);
+                let ancestor = parent.len() as u32;
+                push_ancestor(&mut m, &mut w, k, l, accepted.t_ak, accepted.t_al, p);
+                finish_merge(
+                    accepted,
+                    ancestor,
+                    &m,
+                    &w,
+                    &mut parent,
+                    &mut branch,
+                    &mut members,
+                    &mut merges,
+                    p,
+                    candidates,
+                );
+                best_gain = accepted.gain;
+            }
+            // The batch merged against one centre, so the incremental update
+            // has nothing to be incremental from. Force the exact recompute.
+            since_exact_centre = usize::MAX;
+            continue;
+        }
+
         // `Candidate::NONE` carries minus infinity, so an empty or entirely
         // non-finite round falls out of the loop here too.
         let best = match params.selection {
@@ -1399,38 +1616,19 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
             );
             since_exact_centre += 1;
         }
-        parent[k] = ancestor;
-        parent[l] = ancestor;
-        branch[k] = best.t_ak;
-        branch[l] = best.t_al;
-        parent.push(NO_NODE);
-        branch.push(best.t_ar);
-
-        // The ancestor's id exceeds every member's, so appending keeps the
-        // membership ascending and the tie-break in `Candidate::better` is a
-        // tie-break on position as well as on id.
-        members.retain(|&x| x != best.left && x != best.right);
-        members.push(ancestor);
-
-        let merge = StarMerge {
-            left: best.left,
-            right: best.right,
+        finish_merge(
+            best,
             ancestor,
-            t_left: best.t_ak,
-            t_right: best.t_al,
-            t_centre: best.t_ar,
-            gain: best.gain,
-        };
-        let base = ancestor as usize * p;
-        candidates.merged(
-            &merge,
-            EffLeaf {
-                m: &m[base..base + p],
-                w: &w[base..base + p],
-            },
+            &m,
+            &w,
+            &mut parent,
+            &mut branch,
+            &mut members,
+            &mut merges,
+            p,
+            candidates,
         );
         best_gain = best.gain;
-        merges.push(merge);
     }
 
     let ancestor_means = m.split_off(n * p);

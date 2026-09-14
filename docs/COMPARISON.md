@@ -89,7 +89,7 @@ is a gap in the harness rather than a result. The published implementation's
 ## What the trees look like
 
 
-![radial layouts at 10,000 cells](https://raw.githubusercontent.com/GregorLueg/bonsai-rs/main/docs/figures/n10000_tree_layout.png)
+![radial layouts at 10,000 cells](../figures/n10000_tree_layout.png)
 
 Equal-angle radial layout, radius is cumulative branch length from the root,
 leaves coloured by cutting the *true* tree's topology into ten clades so the
@@ -113,7 +113,7 @@ every size, including the two where the published implementation is level or
 ahead on the headline metrics. The gap widens with the cell count, from one
 fragment at 512 to fourteen at 10,000.
 
-![distance recovery at 10,000 cells](https://raw.githubusercontent.com/GregorLueg/bonsai-rs/main/docs/figures/n10000_distance_recovery.png)
+![distance recovery at 10,000 cells](../figures/n10000_distance_recovery.png)
 
 Tree path distance against true squared Euclidean distance, 20,000 randomly
 sampled pairs, the same pairs in both panels. Both show the same qualitative
@@ -129,7 +129,7 @@ subset of pairs carrying the average.
 Both implementations produce trees with zero-length branches, and they produce
 them in different places.
 
-![degenerate regions at 10,000 cells](https://raw.githubusercontent.com/GregorLueg/bonsai-rs/main/docs/figures/n10000_degenerate_regions.png)
+![degenerate regions at 10,000 cells](../figures/n10000_degenerate_regions.png)
 
 | tree | zero-length leaf edges | zero-length internal edges | polytomies |
 |---|---|---|---|

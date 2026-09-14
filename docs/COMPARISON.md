@@ -88,11 +88,6 @@ is a gap in the harness rather than a result. The published implementation's
 
 ## What the trees look like
 
-**The figures and the three tables below were computed from the 2026-09-13 run
-and have not been recomputed against the trees in the table above.** They
-describe real trees that were really produced, and the qualitative points they
-make still hold, but the counts are not this run's.
-
 
 ![radial layouts at 10,000 cells](https://raw.githubusercontent.com/GregorLueg/bonsai-rs/main/docs/figures/n10000_tree_layout.png)
 
@@ -108,14 +103,15 @@ loglikelihood surfaces.
 
 | config | bonsai-rs | published |
 |---|---|---|
-| 512 | 19 | 15 |
-| 512 s32 | 24 | 19 |
-| 5,000 | 22 | 29 |
-| 10,000 | 27 | 40 |
+| 512 | **14** | 15 |
+| 512 s32 | **17** | 19 |
+| 5,000 | **22** | 29 |
+| 10,000 | **26** | 40 |
 
-The same reversal, in a different measure. At 10,000 the published
-implementation's worst clade is split into seven disjoint pieces against
-bonsai-rs's five.
+Unlike Robinson-Foulds and distance recovery, this one favours bonsai-rs at
+every size, including the two where the published implementation is level or
+ahead on the headline metrics. The gap widens with the cell count, from one
+fragment at 512 to fourteen at 10,000.
 
 ![distance recovery at 10,000 cells](https://raw.githubusercontent.com/GregorLueg/bonsai-rs/main/docs/figures/n10000_distance_recovery.png)
 
@@ -137,10 +133,12 @@ them in different places.
 
 | tree | zero-length leaf edges | zero-length internal edges | polytomies |
 |---|---|---|---|
-| bonsai-rs 512 | 1 | 1 | 1 |
-| bonsai-rs 512 s32 | 8 | 2 | 1 |
-| bonsai-rs 5,000 | 52 | 4 | 16 |
-| bonsai-rs 10,000 | 122 | 28 | 31 |
+| bonsai-rs 512 | 0 | 0 | 3 |
+| bonsai-rs 512 s32 | 8 | 0 | 3 |
+| bonsai-rs 5,000 | 51 | 0 | 17 |
+| bonsai-rs 10,000 | 129 | 0 | 40 |
+| published 512 | 0 | 0 | 3 |
+| published 512 s32 | 5 | 0 | 7 |
 | published 5,000 | 40 | 0 | 107 |
 | published 10,000 | 99 | 0 | 335 |
 
@@ -154,15 +152,32 @@ noisier input than the rest, median per-cell standard deviation 1.25 against
 1.14 at 10,000 cells, which is the mechanism doing what it says.
 
 **Zero-length internal edges and polytomies** come from splices during SPR and
-NNI. Step 8 exists to collapse the internal ones on the finished tree, which
-drives them to exactly zero without touching the leaf-edge half by construction.
+NNI. Step 8 exists to collapse the internal ones on the finished tree, and on
+these trees it does: the internal count is exactly zero at every configuration,
+against 28 at 10,000 cells before the collapse was added. It does not touch the
+leaf-edge half, by construction. The stage snapshots show where the internal
+ones come from: zero after step 2, 32 after step 5 at 10,000 cells.
 
-The published implementation's zero-length branches are entirely leaf-edge, with
-an internal count of exactly zero at every configuration, and it carries a far
-larger degenerate-leaf fraction, 34.9 per cent at 10,000 against bonsai-rs's
-3.3, with up to 513 leaves in a single multifurcation.
+Both implementations now show an internal count of exactly zero at every
+configuration, so the two differ in the leaf-edge half and in how much of the
+tree sits under a multifurcation. The published implementation carries a far
+larger degenerate-leaf fraction, 34.9 per cent at 10,000 cells against
+bonsai-rs's 4.7, with up to 513 leaves in a single multifurcation against 253,
+and 335 polytomies against 40.
 
 ## The arm
+
+**This section was measured on the 2026-09-13 trees, which the default start
+change has replaced. The spike is still there and its shape is unchanged; the
+per-cell claims below have not been re-derived and one of them is already known
+not to carry over.** On the current 10,000-cell tree the long-radius tail is 250
+leaves against the 241 reported here, at a median depth of 28 hops against 17
+elsewhere and a median radius of 0.967 against 0.621, which is the same
+signature. But only 12 of the tree's 129 zero-length leaf edges fall in it,
+where this section reports 75 of 122. Either the zero-length concentration is
+genuinely gone or the radius cut used to check it is not the clade-based
+definition used below, and that has not been separated. Treat the paragraphs
+that follow as describing the earlier trees until it is.
 
 The bonsai-rs panel at 5,000 and 10,000 cells has a spike sticking out of the
 main mass, and the reference's does not. It is one clade: 241 cells at 10,000,

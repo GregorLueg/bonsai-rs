@@ -73,16 +73,16 @@ both scored the same way against the same ground truth:
 | cells | genes | | seconds | Robinson-Foulds | distance recovery |
 |---|---|---|---|---|---|
 | 512 | 2,382 | bonsai-rs | 5 | 147 | 0.591 |
-| 512 | 2,382 | published | 554 | 146 | 0.633 |
-| 5,000 | 2,701 | bonsai-rs | 169 | 1293 | 0.666 |
-| 5,000 | 2,701 | published | 4,880 | 1937 | 0.496 |
-| 10,000 | 2,767 | bonsai-rs | 630 | 2632 | 0.466 |
-| 10,000 | 2,767 | published | 17,389 | 5149 | 0.281 |
+| 512 | 2,382 | published | 386 | 146 | 0.633 |
+| 5,000 | 2,701 | bonsai-rs | 166 | 1293 | 0.666 |
+| 5,000 | 2,701 | published | 4,868 | 1937 | 0.496 |
+| 10,000 | 2,767 | bonsai-rs | 611 | 2632 | 0.466 |
+| 10,000 | 2,767 | published | 16,062 | 5149 | 0.281 |
 
-29x and 28x faster at the two larger sizes, and closer to the generating tree on
+29x and 26x faster at the two larger sizes, and closer to the generating tree on
 both metrics at both. At 512 cells the two land on the same topology quality and
-the published implementation is mildly ahead on distance recovery, in a hundredth
-of the time. The two are not timed alike and do not get the same hardware;
+the published implementation is mildly ahead on distance recovery, in an
+eightieth of the time. The two are not timed alike and do not get the same hardware;
 `docs/COMPARISON.md` has the full tables, the figures and the caveats.
 
 These are `BonsaiParams::default()`, which starts from a Ward linkage rather than

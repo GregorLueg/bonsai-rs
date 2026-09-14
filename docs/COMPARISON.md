@@ -28,17 +28,17 @@ selection applied identically to both. The `512_s32` configuration is the same
 
 | cells | genes | method | seconds | peak RSS | Robinson-Foulds | distance recovery | loglikelihood |
 |---|---|---|---|---|---|---|---|
-| 512 | 2,382 | bonsai-rs | 5 | | 147 | 0.591 | -527,499 |
-| 512 | 2,382 | published | 554 | 567 MB | 146 | 0.633 | -527,255 |
+| 512 | 2,382 | bonsai-rs | 4.7 | | 147 | 0.591 | -527,499 |
+| 512 | 2,382 | published | 386 | 566 MB | 146 | 0.633 | -527,255 |
 | 512 | 2,382 | truth | | | 0 | 0.733 | |
-| 512 s32 | 2,302 | bonsai-rs | 6 | | 220 | 0.318 | -513,567 |
-| 512 s32 | 2,302 | published | 371 | 558 MB | 240 | 0.303 | -513,553 |
+| 512 s32 | 2,302 | bonsai-rs | 6.1 | | 220 | 0.318 | -513,567 |
+| 512 s32 | 2,302 | published | 368 | 551 MB | 240 | 0.303 | -513,553 |
 | 512 s32 | 2,302 | truth | | | 0 | 0.500 | |
-| 5,000 | 2,701 | bonsai-rs | 169 | | 1,293 | 0.666 | -5,557,975 |
-| 5,000 | 2,701 | published | 4,880 | 3,156 MB | 1,937 | 0.496 | -5,563,770 |
+| 5,000 | 2,701 | bonsai-rs | 166 | | 1,293 | 0.666 | -5,557,975 |
+| 5,000 | 2,701 | published | 4,868 | 2,965 MB | 1,937 | 0.496 | -5,563,770 |
 | 5,000 | 2,701 | truth | | | 0 | 0.679 | |
-| 10,000 | 2,767 | bonsai-rs | 630 | | 2,632 | 0.466 | -11,253,188 |
-| 10,000 | 2,767 | published | 17,389 | 5,772 MB | 5,149 | 0.281 | -11,280,721 |
+| 10,000 | 2,767 | bonsai-rs | 611 | | 2,632 | 0.466 | -11,253,188 |
+| 10,000 | 2,767 | published | 16,062 | 5,686 MB | 5,149 | 0.281 | -11,280,721 |
 | 10,000 | 2,767 | truth | | | 0 | 0.461 | |
 
 bonsai-rs rows are `BonsaiParams::default()` as of 2026-09-13, which starts from
@@ -64,6 +64,18 @@ wide: 2,632 against 5,149 splits, and 0.466 against 0.281.
 An earlier version of this section had the published implementation ahead on
 both metrics at 512. That was the greedy-merge start, not the default.
 
+Robinson-Foulds between the two reconstructions: 57 at 512, 108 at 512 s32,
+1,474 at 5,000 and 4,221 at 10,000. Equal scores against the truth do not on
+their own mean the same tree was found, which is why this is reported too.
+
+**The published implementation is deterministic across runs.** Every
+configuration was run a second time on 2026-09-14, on a quieter machine, and
+returned a byte-identical Newick file at all four sizes. So its quality
+numbers here are reproduced rather than merely recorded. Its wall times moved
+by under half a per cent where the first run had been taken on an idle machine,
+and by 30 per cent at 512 and 8 per cent at 10,000 where it had not, which is
+the load caveat doing what it said it would.
+
 **At 10,000 cells both are near the ceiling on distance recovery and neither is
 near it on topology.** The generating tree itself scores 0.461, and bonsai-rs
 scores 0.466. Scoring above the generating tree is expected rather than
@@ -72,7 +84,7 @@ squared displacement, while these are fitted to what was realised.
 
 **Memory.** Peak resident set is not recorded for bonsai-rs in this run, which
 is a gap in the harness rather than a result. The published implementation's
-5,772 MB at 10,000 cells is what a dense `n x n` working set costs.
+5,686 MB at 10,000 cells is what a dense `n x n` working set costs.
 
 ## What the trees look like
 

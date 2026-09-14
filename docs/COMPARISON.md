@@ -165,6 +165,74 @@ larger degenerate-leaf fraction, 34.9 per cent at 10,000 cells against
 bonsai-rs's 4.7, with up to 513 leaves in a single multifurcation against 253,
 and 335 polytomies against 40.
 
+## Which picture is more faithful to the data
+
+A tree is a claim about distances. If two cells sit far apart in the original
+high-dimensional space, the path between them through the tree should be long.
+That is what the distance-recovery number measures, and it is the thing to
+judge a layout on if the layout is meant to be read rather than admired.
+
+Both implementations run into the same wall: groups of cells the data cannot
+order. The evidence separating them is weaker than the noise. **They write that
+down in two different ways, and the difference is the single biggest reason the
+two pictures do not look alike.**
+
+The reference writes it as a **fan**. It hangs the whole group off one node as
+siblings, saying in effect "these are unordered, here they all are". At 10,000
+cells it makes 335 multifurcations and its largest holds 513 leaves.
+
+This crate writes it as a **ladder**. It picks an order anyway and strings the
+group out one behind the next, each on its own small but non-zero branch. At
+10,000 cells it makes 40 multifurcations, the largest holding 253.
+
+That is the whole of the visual difference. In a radial layout a leaf's radius
+is the sum of every branch length above it, so a fan adds nothing and lands the
+group in a blob, while a ladder adds up: 28 hops of small branches sum to a
+median radius of 0.967 against the tree's typical 0.621, and because a ladder is
+narrow the sum accumulates inside one thin angular slice. Long and thin is what
+a spike is. The reference's picture is tidier because it has flattened the same
+cells, not because it placed them better.
+
+**Measured, the ladder is the more faithful of the two, and by the widest margin
+exactly where a fan looks most defensible.** Pearson correlation between true
+squared Euclidean distance and tree path distance at 10,000 cells, `faithfulness.py`
+in the harness. The two subset rows use every pair in the subset, so they carry
+no sampling error; the first row samples 200,000 pairs, which is why it does
+not match the headline table's 0.466 to three decimals: that one is the
+harness's own sampler at its own seed, and the gap between them is the sampling
+error on the whole-tree figure.
+
+| pairs drawn from | cells | in bonsai-rs's tree | in the reference's tree |
+|---|---|---|---|
+| all cells | 10,000 | 0.470 | 0.278 |
+| the cells bonsai-rs strings into its longest ladder | 250 | 0.604 | 0.576 |
+| the cells the reference fans into its largest multifurcation | 513 | 0.127 | 0.004 |
+
+Three things to take from it.
+
+**A multifurcation is not a way of declining to answer.** It is a positive claim
+that every cell in it is equidistant from every other, and it carries no distance
+information whatever: 0.004 over 513 cells is zero. Over those same 513 cells
+the ladder still recovers 0.127. Refusing to order a group does not preserve
+what you knew about it, it discards it.
+
+**The order the ladder imposes is not noise.** Over the 250 cells in the spike,
+bonsai-rs scores 0.604, above its own whole-tree 0.470 and above the reference's
+0.576 on the same cells. If the chain were an arbitrary ordering of
+indistinguishable cells it would score near zero there, as the fan does. It does
+not.
+
+**So the spike is a feature for anyone reading distances off the picture.** It
+is small positive branches carrying real structure, drawn by a radius that adds
+them up. Flattening it would mean forcing a fan where the branch-length solve
+found positive optima, which is the discard above, performed deliberately.
+
+Two limits on all of this. Path distance saturates against squared Euclidean
+distance at large true distances in both trees, which is the plateau in the
+recovery figure and a property of trees rather than of either implementation.
+And at 10,000 cells the generating tree itself only scores 0.461, so there is
+little headroom left globally however the degenerate regions are drawn.
+
 ## The arm
 
 **This section was measured on the 2026-09-13 trees, which the default start
@@ -230,7 +298,10 @@ picture the model did not produce.
 The harness is not part of this crate. What it does is run the published
 implementation once per configuration on a Sanity-shaped subset that this crate's
 simulation and ingest also consume, score both trees against the truth, and draw
-the figures above from Newick and CSV files only.
+the figures above from Newick and CSV files only. `faithfulness.py` there
+produces the distance-recovery table above; `degeneracy.py` the zero-length and
+polytomy counts; `figures.py` the layouts, the scatters and the clade
+fragmentation.
 
 ## Honest rendering
 
@@ -245,4 +316,12 @@ place, run in the opposite direction.
 
 Overlapping markers at equal radius are leaves with a zero-length branch, not a
 rendering glitch. This matters more for the published implementation's picture
-than for ours, since ten times as many of its leaves are affected.
+than for ours, since seven times as many of its leaves are affected.
+
+The same principle cuts the other way for the spike, and it is worth being
+explicit because the temptation runs in the opposite direction. A ladder of
+small positive branches is ugly and a reader may well ask for it to be
+collapsed. Collapsing it would replace measured positive branch lengths with a
+flat multifurcation, and the section above shows what that costs: a
+multifurcation carries no distance information at all. Tidying the picture would
+mean deleting the part of it that was true.

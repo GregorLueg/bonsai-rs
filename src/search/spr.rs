@@ -2706,7 +2706,13 @@ mod tests {
         // which is the random walk an unordered `f64` sum accumulates: 1.2e-16
         // at |L| = 4.7e2 to 6.2e-16 at 1.1e4, a factor of 5 over a factor of
         // 25. Pin the law rather than the numbers, then extrapolate on it.
+        //
+        // A rung can come out at exactly zero when both sums round the same
+        // way, as the smallest one does on Windows. Zero means below one ulp,
+        // not no noise, so the base is floored at unit roundoff rather than
+        // divided by.
         let (l0, rel0) = rungs[0];
+        let rel0 = rel0.max(f64::EPSILON / 2.0);
         let (l1, rel1) = *rungs.last().expect("rungs");
         assert!(
             rel1 / rel0 < 4.0 * (l1 / l0).sqrt(),

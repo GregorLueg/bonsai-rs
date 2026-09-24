@@ -1,3 +1,9 @@
+[![CI](https://github.com/GregorLueg/bonsai-rs/actions/workflows/test.yml/badge.svg)](https://github.com/GregorLueg/bonsai-rs/actions/workflows/test.yml)
+[![Crates.io](https://img.shields.io/crates/v/bonsai-rs.svg)](https://crates.io/crates/bonsai-rs)
+[![docs.rs](https://img.shields.io/docsrs/bonsai-rs)](https://docs.rs/bonsai-rs)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PyPI](https://img.shields.io/pypi/v/bonsai-rs.svg)](https://pypi.org/project/bonsai-rs/)
+
 # bonsai-rs
 
 Tree representations of high-dimensional data under Brownian motion.

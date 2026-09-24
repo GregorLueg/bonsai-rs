@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-rs"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ann-search-rs",
  "approx",
@@ -102,6 +102,7 @@ dependencies = [
  "rand_distr",
  "rayon",
  "rustc-hash",
+ "sanity-sc-rs",
  "thiserror 2.0.20",
  "wide",
 ]
@@ -1278,6 +1279,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sanity-sc-rs"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f5d015529652def1f995133831c70f4083060348362db44d1cdd97aee4aa3e8"
+dependencies = [
+ "num-traits",
+ "rand 0.9.5",
+ "rand_distr",
+ "rayon",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

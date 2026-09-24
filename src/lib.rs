@@ -21,8 +21,8 @@
 //! per-feature variance at ingest, which removes the diffusion scale from every
 //! kernel. Loglikelihoods drop the `2*pi` and variance terms, both of which are
 //! independent of topology, so absolute values are meaningful only up to an
-//! additive constant. Unlike the reference implementation, this crate works in
-//! the loglikelihood and not twice it.
+//! additive constant. The paper states its acceptance thresholds in twice the
+//! loglikelihood; this crate works in `L`, so anything transcribed is halved.
 //!
 //! ### Parallelism
 //!
@@ -31,17 +31,18 @@
 //! and features at ingest. The feature-axis kernels are sequential by design, so
 //! nothing here nests.
 //!
-//! The tree sweeps are not parallel, and on measurement they do not need to be:
-//! the whole prune is 2.4 per cent of a run and the up-sweep another 0.5, with
-//! the share flat in feature count. A feature-blocked parallel sweep existed
-//! until 2026-09-06 and was deleted once that was measured; it had never been
-//! wired in. Every prune goes through `model::likelihood::NodeState`.
+//! The tree sweeps are sequential. They are a small enough share of a run that
+//! parallelising them buys nothing measurable; see `docs/PERFORMANCE.md`. Every
+//! prune goes through `model::likelihood::NodeState`.
 
 #![warn(missing_docs)]
 // Indexed loops are what the numeric kernels want. Rewriting them as zipped
 // iterators to appease clippy costs readability and, where the compiler stops
 // hoisting the bounds check, throughput.
 #![allow(clippy::needless_range_loop)]
+
+/// Version of this crate, for bindings that vendor it and need to say which.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod backbone;
 pub mod bonsai;

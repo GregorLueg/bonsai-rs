@@ -110,5 +110,8 @@ Same input, same tree, whatever the thread count. Floating-point addition is not
 ## What's tracked outside this file
 
 - The algorithm: `docs/SPEC.md`.
+- How the crate is built and why: `docs/DESIGN.md`.
+- What was optimised, what failed, and the rules: `docs/PERFORMANCE.md`.
+- The black-box comparison and what may be said about it: `docs/COMPARISON.md`.
 - The licence position and disclosure: `PROVENANCE.md`.
 - Change history: `CHANGELOG.md`.

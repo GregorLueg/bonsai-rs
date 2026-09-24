@@ -1,29 +1,18 @@
 //! Placing a node on an existing tree.
 //!
-//! Implements SPEC.md section 7. Used twice by the search: regrafting the
-//! pruned subtree of an SPR move (section 9.3), and adding a cell to an
-//! existing backbone (section 15). Both reduce to the same question, "which
-//! node of this tree should `q` hang off", so both go through [`place`].
+//! Used twice by the search: regrafting the pruned subtree of an SPR move,
+//! and adding a cell to an existing backbone. Both reduce to the same question,
+//! "which node of this tree should `q` hang off", so both go through [`place`].
 //!
 //! ### Why the score is an ordinary edge
 //!
 //! Attaching `q` below `a` gives a tree whose loglikelihood is the old tree's,
-//! plus `q`'s own, plus the contribution of the single edge joining them
-//! (SPEC.md section 7.1, S27). The first two terms do not depend on `a`: the
-//! collapse of the existing tree onto `a` accumulates the same total whatever
-//! `a` is, because the likelihood does not depend on the choice of root (S14).
-//! So the edge term alone ranks attachment points, and the edge term is exactly
-//! what `model::branch` already solves. No new kernel appears here.
-//!
-//! ### What the caller still owes
-//!
-//! Attaching to a node makes a polytomy there, since the node already had
-//! three neighbours in the unrooted sense. SPEC.md section 7.3 says not to
-//! special-case attachment to the middle of an edge but to follow every
-//! attachment with the polytomy resolution of section 9.2, which covers edge
-//! attachment as a special case. That resolution lives in `search`, and this
-//! module does not perform it: [`place`] reports where to attach and with what
-//! branch length, it does not modify the tree.
+//! plus `q`'s own, plus the contribution of the single edge joining them. The
+//! first two terms do not depend on `a`: the collapse of the existing tree onto
+//! `a` accumulates the same total whatever `a` is, because the likelihood does
+//! not depend on the choice of root. So the edge term alone ranks attachment
+//! points, and the edge term is exactly what `model::branch` already solves. No
+//! new kernel appears here.
 
 use crate::errors::BonsaiErrors;
 use crate::model::branch::optimise_edge_loglik;
@@ -43,19 +32,16 @@ use crate::utils::traits::BonsaiFloat;
 /// greedy hill-climbing and infinity is an exhaustive scan; both are supported
 /// and both are used by the tests.
 ///
-/// Ours, not theirs, and set by measurement on 2026-08-27. Simulated data on
-/// balanced trees of 64 and 256 leaves and a ladder of 128 leaves, 64 features,
-/// three seeds, sixteen queries each; a query is a second noisy measurement of
-/// a cell already in the tree, and it counts as recovered when a single-start
-/// search returns the same node as the exhaustive scan. Over the grid
-/// `{2, 2.5, 3, 3.5, 4, 6}` this is the smallest value that recovers 48 out of
-/// 48. The ones below it fail only on the ladder, and they fail badly rather
-/// than marginally: 3.5 loses one query by 10 nats, 2.0 loses five by 55.
+/// Ours, not theirs, and set by measurement over a grid from 2 to 6: this is
+/// the smallest value that returns the exhaustive scan's node on every fixture
+/// swept. A query is a second noisy measurement of a cell already in the tree,
+/// and the values below this one fail on ladders only, badly rather than
+/// marginally.
 ///
-/// Cost is shape-dependent and worth knowing. The balanced fixtures score 13
-/// of 127 and 18 of 511 nodes; the ladder scores 137 of 255, and does not score
-/// more than that at any wider tolerance, so on the shape that needs the beam
-/// the beam is already covering everything it will ever cover.
+/// Cost is shape-dependent and worth knowing. A balanced tree scores a tenth of
+/// its nodes or fewer; a ladder scores half, and does not score more than that
+/// at any wider tolerance, so on the shape that needs the beam the beam is
+/// already covering everything it will ever cover.
 ///
 /// It is an absolute loglikelihood difference and does not scale with the
 /// feature count, deliberately: what is being compared is the gap between two
@@ -65,31 +51,20 @@ const DEFAULT_TOLERANCE: f64 = 4.0;
 
 /// Number of start points the beam search fans out from.
 ///
-/// The reference uses `log(n)` centres from a distance-based clustering; our
-/// count is ours to choose (SPEC.md section 7.2). Measured on 2026-08-27 on the
-/// fixtures described on [`DEFAULT_TOLERANCE`]: at the shipped tolerance the
-/// extra starts changed no answer there and cost scored nodes, 13 against 23 on
-/// the 127-node fixture, 18 against 29 on the 511-node one, and 137 against 144
-/// on the ladder.
+/// The paper describes `log(n)` centres from a distance-based clustering; our
+/// count is ours to choose (SPEC.md section 7.2), and set by measurement over
+/// the fixtures described on [`DEFAULT_TOLERANCE`]. A balanced tree recovers
+/// every query from a single start at every tolerance tried. A ladder does not,
+/// and what it loses it loses badly rather than marginally, in the same cliff
+/// [`DEFAULT_TOLERANCE`] describes; eight starts closes it and fewer do not.
 ///
-/// That first measurement was too small to see the failure. Re-measured on
-/// 2026-08-28 over 144 queries (three shapes, nine seeds, sixteen queries each,
-/// 64 features, noise 0.3), the balanced fixtures still recover 144 out of 144
-/// from a single start at every tolerance tried, but a 128-leaf ladder at the
-/// shipped tolerance of 4 recovers 138 from one start, 142 from four and 144
-/// from eight. The six it loses are lost badly, not marginally: the worst is
-/// 197 nats short of the optimum and the six together are 1073, which is the
-/// same cliff [`DEFAULT_TOLERANCE`] describes. Tightening to a tolerance of 2
-/// makes it worse again, 90 from one start against 139 from eight.
-///
-/// Eight ships because on the shape that fails it is nearly free: 20294 scored
-/// nodes against 19050, six per cent. The 77 per cent it costs on the balanced
-/// fixtures is ten extra node scores per query on a 127-node tree, which is not
-/// what will decide whether this is fast enough. A caller placing millions of
-/// cells against a fixed backbone, and willing to accept the ladder case, can
-/// drop it to one through [`PlacementParams::n_starts`]. Eight is also roughly
-/// `log2(n)` over the few hundred nodes a backbone round works with, the same
-/// order as the reference's `log(n)`.
+/// Eight ships because on the shape that fails it is nearly free, and what it
+/// costs on the shapes that do not fail is a handful of extra node scores per
+/// query. A caller placing millions of cells against a fixed backbone, and
+/// willing to accept the ladder case, can drop it to one through
+/// [`PlacementParams::n_starts`]. Eight is also roughly `log2(n)` over the few
+/// hundred nodes a backbone round works with, the same order as the `log(n)`
+/// the paper describes.
 const DEFAULT_STARTS: usize = 8;
 
 /// Tuning knobs for the beam search of SPEC.md section 7.2.
@@ -161,14 +136,12 @@ pub struct Attachment {
 
 /// Score attaching `q` below a node summarised by the effective leaf `a`.
 ///
-/// SPEC.md section 7.1 (S27):
-///
 /// ```text
 /// dL(t) = -1/2 * sum_g [ log(t + 1/W[g,a] + 1/W[g,q])
 ///                        + (M[g,a] - M[g,q])^2 / (t + 1/W[g,a] + 1/W[g,q]) ]
 /// ```
 ///
-/// which is the edge expression of SPEC.md section 6 with
+/// which is the edge expression with
 /// `s[g] = 1/W[g,a] + 1/W[g,q]` and `d[g] = (M[g,a] - M[g,q])^2`. Those are
 /// what `prep_edge` produces, along with the bracket, on the one pass it makes
 /// over the two arrays, and the maximisation over `t` is what
@@ -234,7 +207,7 @@ pub struct Placement {
 /// internal nodes by height, so an even sweep over indices samples the leaves
 /// broadly and then samples every level of the internal skeleton.
 ///
-/// The root always comes first. That is load-bearing rather than cosmetic:
+/// The root always comes first. That is not cosmetic:
 /// start points share one visited set (see [`place`]), so the first start is
 /// the only one guaranteed to explore unimpeded, and putting the root there
 /// makes a multi-start search provably no worse than a single search from the
@@ -263,10 +236,10 @@ pub fn start_points(tree: &Tree, n_starts: usize) -> Vec<u32> {
 
 /// Neighbours of a node in the unrooted sense: its children and its parent.
 ///
-/// The arena is rooted for bookkeeping but the likelihood is not (SPEC.md
-/// section 2, S14), so the search has to be able to walk upwards. Forgetting
-/// the parent here would confine the search to the subtree below its start
-/// point, which is the single easiest way to get this module quietly wrong.
+/// The arena is rooted for bookkeeping but the likelihood is not, so the search
+/// has to be able to walk upwards. Forgetting the parent here would confine the
+/// search to the subtree below its start point, which is the single easiest way
+/// to get this module quietly wrong.
 ///
 /// ### Params
 ///
@@ -284,10 +257,9 @@ fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
 
 /// Find the best node of a tree to attach `q` below.
 ///
-/// The beam search of SPEC.md section 7.2. From each start point, score the
-/// node, score each unvisited neighbour, and recurse into those whose score is
-/// within `tolerance` of the best score seen anywhere so far. The best node
-/// over all start points wins.
+/// From each start point, score the node, score each unvisited neighbour, and
+/// recurse into those whose score is within `tolerance` of the best score seen
+/// anywhere so far. The best node over all start points wins.
 ///
 /// The comparison is against the best seen *before* the neighbour itself is
 /// folded in, so a tolerance of zero means "recurse only into a neighbour that

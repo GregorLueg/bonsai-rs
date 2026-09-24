@@ -55,18 +55,15 @@
 //! because an interchange edits one internal edge and the star it resolves
 //! summarises the rest of the tree exactly.
 //!
-//! Until 2026-09-12 the terms came from a fresh [`NodeState::prune`] of every
-//! candidate that changed a split. That was measured at 0.03 per cent of the
-//! step on 2026-08-31, at 512 leaves and 200 features and a noise where nothing
-//! is accepted. At noise 1.6, where the step earns its keep, it was 33 to 41
-//! per cent: one candidate in twenty passes the split filter there, every one
-//! of them paid an `O(n p)` sweep, and every accepted one paid a second to
-//! settle the rows. The terms now come from [`LazyRows::loglik`], which reads
-//! the current tree's terms wherever the candidate's subtrees are the current
-//! tree's and recomputes the rest, and an accepted candidate's rows are
-//! assembled from the same rows by [`LazyRows::into_state`] rather than swept.
-//! `test_the_incremental_loglik_matches_a_fresh_prune` pins both against the
-//! sweep, the state to the bit.
+//! The terms come from [`LazyRows::loglik`], which reads the current tree's
+//! terms wherever the candidate's subtrees are the current tree's and
+//! recomputes the rest; an accepted candidate's rows are assembled from the
+//! same rows by [`LazyRows::into_state`] rather than swept. A fresh
+//! [`NodeState::prune`] per candidate is correct and is what this replaced, but
+//! it pays an `O(n p)` sweep for every candidate that passes the split filter,
+//! and at the noise levels where the step earns its keep that is a third of the
+//! step. `test_the_incremental_loglik_matches_a_fresh_prune` pins both against
+//! the sweep, the state to the bit.
 //!
 //! Proposing was what cost before that: settling the tree the cut leaves
 //! behind and the tree the regraft builds, and collapsing the first onto every
@@ -80,14 +77,12 @@
 //! It reoptimises the branch the subtree hangs on, and the three the resolution
 //! makes where the cut left a degree-two node behind, and it gains a little
 //! nearly every time. Accepting those turns the sweep into a very expensive
-//! branch-length descent, which is what steps 4 and 7 already do globally.
-//! Measured 2026-08-31 at 16 and 32 leaves and 256 features, from a ladder at
-//! the step 4 optimum: 55 of 62, 45 of 52 and 101 of 118 accepted moves changed
-//! no split at all, and between them they were worth 9.2, 5.7 and 16.4 nats
-//! against the 103, 101 and 310 that the real moves were worth. So a proposal
-//! whose split fingerprint matches the current tree's is discarded, which is
-//! the deviation SPEC.md section 9.4 records for the interchanges, arrived at
-//! independently and for the same reason.
+//! branch-length descent, which is what steps 4 and 7 already do globally. Left
+//! unfiltered, most accepted moves change no split at all and carry a few per
+//! cent of the nats the real moves carry. So a proposal whose split fingerprint
+//! matches the current tree's is discarded, which is the deviation SPEC.md
+//! section 9.4 records for the interchanges, arrived at independently and for
+//! the same reason.
 
 use crate::errors::BonsaiErrors;
 use crate::model::global::{LOGLIK_SCALE_FLOOR, up_part};
@@ -116,20 +111,15 @@ use std::cell::OnceCell;
 /// loglikelihood by more than [`acceptance_floor`] and the loglikelihood is
 /// bounded above, so the sweeps terminate on their own; this only bounds how
 /// long it can take to notice. One round performs every improving move it
-/// finds, not one, so the count needed is small: measured 2026-08-31 on
-/// simulated data at 256 features, starting from a ladder whose branch lengths
-/// are already at the step 4 optimum, 24 fixtures from 16 to 64 leaves needed
-/// two to four rounds and never more. A hundred is more than an order of
-/// magnitude of headroom on that.
+/// finds, not one, so the count needed is small: simulated fixtures from 16 to
+/// 64 leaves need two to four rounds and never more, and a hundred is more than
+/// an order of magnitude of headroom on that.
 ///
-/// That argument was only ever as good as the floor behind it. Until
-/// 2026-09-13 the floor was the absolute `StarParams::min_gain`, and on
-/// realistic data at 10,000 cells by 2,767 genes the cap was the only thing
-/// that ended the run: rounds 10 to 100 each accepted one likelihood-neutral
-/// move of gain `5.6e-8`, the rounding noise of a sum of magnitude `1.1e7`,
-/// and the tree cycled with period two. See [`DEFAULT_MIN_RELATIVE_GAIN`].
-/// With the scale-relative floor the cap does not bind, and it stays where it
-/// is as the guard it was written to be.
+/// That argument is only ever as good as the floor behind it. An absolute floor
+/// lets a large tree accept rounding noise forever and cycle, at which point
+/// this cap is the only thing that ends the run; see
+/// [`DEFAULT_MIN_RELATIVE_GAIN`]. With the scale-relative floor the cap does
+/// not bind, and it stays where it is as the guard it was written to be.
 const DEFAULT_MAX_ROUNDS: usize = 100;
 
 /// Default for [`SprParams::min_relative_gain`], as a fraction of `|L|`.
@@ -139,13 +129,11 @@ const DEFAULT_MAX_ROUNDS: usize = 100;
 /// floor `1.1e-16` per feature. This module accepts on a *whole-tree*
 /// loglikelihood, a sum over every internal node of the tree, magnitude
 /// `O(n p)`. The absolute constant is right for the first quantity and wrong
-/// for the second, and the wrongness grows with the problem: measured
-/// 2026-09-13 on Sanity-preprocessed realistic data at 10,000 cells by 2,767
-/// genes, where `|L|` is `1.1e7`, SPR accepted one likelihood-neutral topology
-/// change of gain `5.6e-8` (about 32 ulps of the sum) in every round from
-/// round 10 to the cap at 100, the tree cycled with period two, and a fresh
-/// prune of the result was bit-identical to round 10's. Ninety-one rounds of
-/// the hundred, roughly 1,900 s of 2,129 s.
+/// for the second, and the wrongness grows with the problem. On realistic data
+/// at ten thousand cells, where `|L|` is around `1e7`, an absolute floor let
+/// SPR accept one likelihood-neutral move of about 32 ulps of the sum in every
+/// round to the cap, cycling with period two and spending most of the step on
+/// it.
 ///
 /// So the floor scales with the magnitude of the quantity it gates, in the
 /// same shape [`crate::model::global::optimise_branch_lengths`] already uses:
@@ -171,17 +159,10 @@ const DEFAULT_MIN_RELATIVE_GAIN: f64 = 1e-12;
 /// A chunk is proposed against one tree and decided in order; the first
 /// accepted move invalidates the rest of its chunk, which is proposed again
 /// against the new tree. So the chunk bounds the work an acceptance throws
-/// away, and it halves on every acceptance down to this. Measured 2026-09-12
-/// on an M1 Max, ten threads, 2048 leaves by 2000 features from a Ward start
-/// at noise 1.6, where 641 of 27987 candidates are accepted and the same tree
-/// comes out at every floor:
-///
-/// | floor | proposals made | seconds |
-/// |---|---|---|
-/// | 32 | 49614 | 24.1 |
-/// | 16 | 41614 | 20.8 |
-/// | 8 | 37846 | 19.1 |
-/// | 4 | 36206 | 19.3 |
+/// away, and it halves on every acceptance down to this. Ours, chosen by
+/// measurement: the same tree comes out at every floor, and the wall time is
+/// flat below eight while the wasted proposals keep falling, so there is
+/// nothing to buy by going lower.
 ///
 /// Below eight the chunk is too small to keep the pool busy where acceptances
 /// are dense, and above it the discarded proposals cost more than they save.
@@ -200,21 +181,15 @@ pub enum PruneOrder {
     /// Descending length of the branch above the subtree, ties going to the
     /// lower node index.
     ///
-    /// The reference's default, and the reasoning in SPEC.md section 9.3 is
+    /// The paper's default, and the reasoning in SPEC.md section 9.3 is
     /// sound: a long upstream branch means the subtree sits far from its
     /// parent, so it is the one the current topology is least sure of.
     ///
-    /// **It holds up, mildly.** That is an inherited claim, so it was measured
-    /// on 2026-08-31: 24 fixtures at 16, 32 and 64 leaves and 256 features,
-    /// each started from a ladder at the step 4 optimum, ordered against three
-    /// random seeds apiece. Both orders reached a Robinson-Foulds distance of
-    /// zero from the generating tree on every one of the 24, so the ordering
-    /// does not decide whether the search arrives. What it decides is how
-    /// cheaply and how high: at 64 leaves the ordered sweep took 40.5 moves on
-    /// average against random's 45.2, and it finished above the best of the
-    /// three random draws on 8 fixtures out of 8. At 16 leaves that was 7 of 8
-    /// and at 32 leaves only 5 of 8, so the margin is real but small enough to
-    /// be lost in the noise on a small tree.
+    /// **It holds up, mildly.** Measured against a random order: both reach a
+    /// Robinson-Foulds distance of zero from the generating tree on every
+    /// fixture, so the ordering does not decide whether the search arrives. What
+    /// it decides is how cheaply and how high, and the margin grows with the
+    /// tree while being lost in the noise on a small one.
     LongestBranch,
     /// A uniform shuffle of the eligible subtrees, from [`SprParams::seed`].
     Random,
@@ -248,7 +223,7 @@ pub struct SprParams {
 }
 
 impl Default for SprParams {
-    /// The reference's ordering, `DEFAULT_MAX_ROUNDS`, and the shipped
+    /// The paper's ordering, `DEFAULT_MAX_ROUNDS`, and the shipped
     /// placement and star defaults.
     ///
     /// ### Returns
@@ -1818,7 +1793,7 @@ mod tests {
 
     #[test]
     fn test_a_round_never_lowers_the_loglikelihood() {
-        // The load-bearing one. Every round is scored by an independent
+        // The one that matters. Every round is scored by an independent
         // `NodeState::prune` of the tree it produced, never by an incremental
         // figure, and the start is a deliberately wrong topology so that there
         // is plenty for the sweep to do.
@@ -2050,7 +2025,7 @@ mod tests {
             formed += rows.eff.iter().filter(|c| c.get().is_some()).count();
         }
         assert!(total > 0);
-        // Not an invariant, a measurement, recorded 2026-09-05: a twentieth of
+        // Not an invariant, a measurement: the beam forms a small fraction of
         // the arena. A regression here is a regression in the running time even
         // though every answer is still right, which no other test would catch.
         assert!(
@@ -2378,11 +2353,10 @@ mod tests {
             let before = robinson_foulds(&start, &data.tree).expect("rf");
             let out = spr(&start, leaves, None).expect("spr");
             let after = robinson_foulds(&out.tree, &data.tree).expect("rf");
-            // Measured 2026-08-31 over 24 fixtures at 16, 32 and 64 leaves and
-            // 256 features: the distance went to zero on every one, from 16, 44
-            // and 104. The assertion is the measurement rather than a hedge
-            // around it, so a regression that merely improves the tree shows up
-            // here instead of passing quietly.
+            // The distance goes to zero on every fixture here. The assertion
+            // is the measurement rather than a hedge around it, so a regression
+            // that merely improves the tree shows up here instead of passing
+            // quietly.
             assert_eq!(
                 after, 0,
                 "seed {seed}: Robinson-Foulds {before} fell only to {after}"
@@ -2393,7 +2367,7 @@ mod tests {
 
     #[test]
     fn test_the_two_orders_reach_the_same_topology() {
-        // The reference's ordering is inherited rather than derived, so it is
+        // The paper's ordering is inherited rather than derived, so it is
         // checked rather than assumed. Both orders recover the generating tree;
         // see `PruneOrder::LongestBranch` for what separates them, which is
         // move count and the final loglikelihood rather than whether they get
@@ -2662,14 +2636,13 @@ mod tests {
         }
     }
 
-    /// Magnitude of the whole-tree loglikelihood on the realistic dataset the
-    /// floor failed on: 10,000 cells by 2,767 Sanity-selected genes,
-    /// 2026-09-13. Used as the extrapolation target, so the scaling test is
-    /// checked against the regime that broke rather than the one it runs in.
+    /// Magnitude of the whole-tree loglikelihood on the realistic dataset an
+    /// absolute floor failed on, ten thousand cells by a few thousand genes.
+    /// Used as the extrapolation target, so the scaling test is checked against
+    /// the regime that broke rather than the one it runs in.
     const REALISTIC_LOGLIK: f64 = 1.1e7;
 
-    /// Worst gain accepted on that dataset that turned out to be rounding,
-    /// measured the same day over six resumed rounds.
+    /// Worst gain accepted on that dataset that turned out to be rounding.
     const REALISTIC_NOISE: f64 = 5.96e-8;
 
     #[test]
@@ -2760,9 +2733,9 @@ mod tests {
         );
 
         // The floor has to stay far below a move that carries information. The
-        // smallest gain accepted on any rung of the 2026-09-13 subsample
-        // ladder was 2e-5 nats at |L| = 1.7e6, so scale that down as the floor
-        // scales and check the margin holds.
+        // smallest gain accepted on any rung of the subsample ladder was 2e-5
+        // nats at |L| = 1.7e6, so scale that down as the floor scales and check
+        // the margin holds.
         assert!(
             acceptance_floor(&params, -REALISTIC_LOGLIK) < 2e-5 * (REALISTIC_LOGLIK / 1.7e6),
             "the floor would reject a real move"

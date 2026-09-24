@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_the_generating_tree_recovers_its_own_distances() {
-        // The load-bearing test, and the paper's Fig. S8 relation. Under the
+        // The test that matters, and the paper's Fig. S8 relation. Under the
         // model a branch of length `t` diffuses with variance `t` per feature,
         // so summed branch length should track squared Euclidean displacement.
         // On noise-free simulated data the generating tree must show that

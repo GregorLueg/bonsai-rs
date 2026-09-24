@@ -13,4 +13,10 @@ permissions:
 jobs:
   release:
     uses: GregorLueg/personal-actions/.github/workflows/rust-release.yml@v1
+    with:
+      # gh-pages is the Python docs, and mkdocs-material's header shows
+      # GitHub's latest release with no tag filter. Without this the crate's
+      # `v*` tag steals "latest" from `py-v*` and the Python docs advertise a
+      # crate version.
+      python-owns-latest: true
     secrets: inherit

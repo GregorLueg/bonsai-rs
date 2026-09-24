@@ -3,37 +3,21 @@
 //! Portable SIMD via the `wide` crate. This is the only file in the crate that
 //! names a `wide` type; algorithm code stays generic over [`BonsaiSimd`].
 //!
-//! ### What is vectorised, and why those two
+//! ### What is vectorised
 //!
 //! Two kernels: [`edge_newton_simd`], which the bracketed branch-length solve
-//! calls 35 to 45 times per candidate pair, and the `f32` binary prune. Nothing
-//! else, because nothing else runs often enough to matter.
+//! calls tens of times per candidate pair, and the `f32` binary prune. Nothing
+//! else, because nothing else is called often enough for a tier to show up in
+//! the whole run. Kernels are picked by call count, not by how vectorisable
+//! they look; `docs/PERFORMANCE.md` has the measurements and the tiers that
+//! were written and thrown away.
 //!
-//! Picking those by call count rather than by how vectorisable they looked is
-//! the whole trick. `model::merge::MergeScratch::split_derivative` reads like
-//! the hot loop and is not: instrumenting `benches/merge_scan.rs` puts it at
-//! **0.07 calls per pair**, because a pair whose total branch length is zero,
-//! or whose split is optimal at a bracket end, never reaches the bisection. A
-//! `wide::f64x4` tier written for it measured flat, as did batching its
-//! reciprocals. The same `f64x4` treatment applied to `edge_newton` took 14 per
-//! cent off the merge scan.
+//! Neither kernel is auto-vectorised. Both accumulate into floating-point
+//! reductions LLVM may not reorder.
 //!
-//! The compiler will not do this for you. `edge_newton` and `split_derivative`
-//! both accumulate into floating-point reductions that LLVM may not reorder, so
-//! neither is auto-vectorised: scalar divides on aarch64, and on x86-64 the same
-//! at baseline, at `x86-64-v3` and at `x86-64-v4`.
-//!
-//! ### Lane width is set by the target, not by the source
-//!
-//! `wide` compiles to the baseline instruction set. On aarch64 that is NEON, so
-//! an `f64x4` is two registers and an `f32x8` is two. On x86-64 with no
-//! `target-cpu` it is SSE2, and `benches/prune_sweep.rs` built for x86-64 shows
-//! it: 104 128-bit operations at the baseline against 22 256-bit ones at
-//! `x86-64-v3`. `x86-64-v4` is identical to v3, because an `f32x8` already fills
-//! a 256-bit register.
-//!
-//! So AVX2 would widen both kernels on x86 and AVX-512 would need an `f32x16`
-//! and an `f64x8` to reach. Neither is measured; there is no x86 machine here.
+//! `wide` compiles to the target's baseline instruction set, so lane width
+//! follows the build, not the source. On aarch64 that is NEON. On x86-64 with
+//! no `target-cpu` it is SSE2, and `-C target-cpu=x86-64-v3` is worth setting.
 
 use wide::{f32x8, f64x4};
 
@@ -48,8 +32,8 @@ const LANES_F32: usize = 8;
 /// Sets the trade between logarithm throughput and accumulation error. At 32
 /// vectors the block holds 256 features, so the `f32` rounding error inside a
 /// block grows as `sqrt(256) * 6e-8`, around `1e-6` relative, which is
-/// comfortably below the error already present in `f32` input data. Chosen on
-/// that argument, 2026-08-27; no measurement says the exact value matters.
+/// comfortably below the error already present in `f32` input data. Ours,
+/// chosen on that argument; no measurement says the exact value matters.
 const FLUSH_BLOCKS: usize = 32;
 
 /// Vectorised feature-axis kernels, one implementation per storage type.
@@ -239,26 +223,13 @@ fn load4(s: &[f64]) -> f64x4 {
 /// Semantics are identical to [`crate::utils::kernels::edge_newton`]; see that
 /// function for the equations.
 ///
-/// This is the kernel the search spends its time in. Instrumenting
-/// `benches/merge_scan.rs` gives **35 to 45 calls per candidate pair**, against
-/// 0.07 for `model::merge::MergeScratch::split_derivative` and one each for
-/// `prep_edge` and the peel: `model::branch::optimise_edge` is a bracketed
-/// Newton and every iteration is one pass over the feature axis.
+/// This is the kernel the search spends its time in: `optimise_edge` is a
+/// bracketed Newton and every iteration is one pass over the feature axis, so
+/// it runs tens of times per candidate pair.
 ///
 /// Four lanes, two lane accumulators, reduced in a fixed order so the result
-/// does not depend on how the work was scheduled. Accumulation stays in `f64`.
-///
-/// Measured 2026-09-12 on an M1 Max against the scalar tier:
-///
-/// | bench | scalar | here |
-/// |---|---|---|
-/// | `kernels`, ns per feature | 0.95 | 0.71 |
-/// | `merge_scan`, 8192 by 2000, ms | 1365 | 1168 |
-/// | `pipeline`, 2048 by 2000, s | 71.4 | 65.7 |
-///
-/// So a third off the kernel, 14 per cent off the merge scan and 8 per cent off
-/// the whole run. Trees and loglikelihoods are unchanged across all ten
-/// `pipeline` configurations.
+/// does not depend on how the work was scheduled. Accumulation stays in `f64`,
+/// and trees and loglikelihoods are identical to the scalar tier.
 ///
 /// ### Params
 ///
@@ -436,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_extreme_precisions_do_not_leave_f32_range() {
-        // Regression, adversarial review 2026-08-27. Forming `wdk * wdl` before
+        // Regression. Forming `wdk * wdl` before
         // dividing overflowed f32 above 1.8e19 per factor and went subnormal
         // below 1.1e-19, so `reduced.ln()` came back as a signed infinity while
         // the scalar tier, which widens to f64 first, was fine.

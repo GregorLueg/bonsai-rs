@@ -62,13 +62,13 @@ const VARIANCE_TOL: f64 = 1e-12;
 
 /// Default signal-to-noise threshold for retaining a feature.
 ///
-/// Ours, chosen 2026-08-31; the reference's default is 1 and their constants
-/// are not carried over. `S[g]` of SPEC.md section 3.3 is the mean ratio of
+/// Ours, chosen by measurement; the paper's threshold is 1 and no constant of
+/// theirs is carried over. `S[g]` of SPEC.md section 3.3 is the mean ratio of
 /// posterior signal variance to measurement error variance, so `S[g] = 1` is
 /// the point at which a feature carries as much signal as noise and this
 /// threshold keeps features whose signal is at least a quarter of their noise.
 ///
-/// ### What was measured, 2026-08-31
+/// ### What was measured
 ///
 /// `tree::simulate::simulate_binary` at 400 features, of which half were then
 /// replaced by pure noise: the same error bars, but means drawn from those
@@ -96,19 +96,16 @@ const VARIANCE_TOL: f64 = 1e-12;
 ///
 /// `0.25` sits above the 95th percentile of the pure-noise scores at every cell
 /// count tested and below the 5th percentile of the informative scores at every
-/// cell count and noise level tested. The reference's `1` does not: in the
+/// cell count and noise level tested. A threshold of `1` does not: in the
 /// hardest row it would discard most of the informative panel, since a feature
 /// carrying exactly as much signal as noise scores `1` only in expectation and
 /// scatters below it at finite `n`. Only at 64 cells do the two distributions
 /// touch `0.25` at all, and there a handful of noise features leak through.
 ///
-/// ### On tree recovery, corrected 2026-08-31
+/// ### On tree recovery
 ///
-/// An earlier version of this note claimed the greedy star primitive cannot
-/// recover the simulated topology at all, so that Robinson-Foulds could not
-/// arbitrate this constant. That was measured past the point where recovery is
-/// possible for any threshold, and generalised too far. Recovery of
-/// `search::star::star_tree` against `noise_sd`, five seeds per cell, mean RF:
+/// Recovery of `search::star::star_tree` against `noise_sd`, five seeds per
+/// cell, mean Robinson-Foulds:
 ///
 /// | `noise_sd` | 64 leaves, of 122 | 128 leaves, of 250 |
 /// |---|---|---|
@@ -128,14 +125,13 @@ const VARIANCE_TOL: f64 = 1e-12;
 /// It is also mildly awkward for the value chosen here. The two are not
 /// directly comparable, `S` being a per-feature aggregate against a noise level
 /// uniform across features, so `0.25` stands on the distribution separation
-/// above. But the recovery cliff sits nearer the reference's `1` than to it,
-/// and a recovery-driven sweep of this constant is worth doing once polytomy
-/// resolution, SPR and NNI are in and the usable noise range has widened.
+/// above. But the recovery cliff sits nearer `1` than to it, and a
+/// recovery-driven sweep of this constant is worth doing.
 pub const DEFAULT_MIN_SIGNAL_TO_NOISE: f64 = 0.25;
 
 /// Largest variance amplification `v / (v - eps^2)` [`from_sanity`] converts.
 ///
-/// Ours, chosen 2026-08-31. The conversion of SPEC.md section 3.4 multiplies
+/// Ours. The conversion of SPEC.md section 3.4 multiplies
 /// both the posterior mean and the posterior variance by this factor, so it
 /// diverges as the posterior approaches the prior and is undefined once
 /// `eps^2 >= v`. At the cap the returned error bar is about 32 times the
@@ -807,6 +803,52 @@ pub fn from_sanity<T: BonsaiFloat>(
     })
 }
 
+/// [`from_sanity`] straight from a `sanity-sc-rs` run.
+///
+/// Takes `log_fold_changes` as `xstar`, **not** the log transcription quotients
+/// `m + d_c`. S5 inverts a zero-mean `N(0, v)` prior, so the posterior it
+/// undoes is the one on the fold change; handing it `m + d_c` multiplies the
+/// gene mean by a per-cell amplification and invents structure.
+///
+/// Sanity writes gene-major (`g * n_cells + c`); both matrices are transposed
+/// to `[cell][gene]` here.
+///
+/// ### Params
+///
+/// * `out` - A finished Sanity run, from `sanity` or `sanity_select`
+/// * `params` - Knobs, or `None` for [`IngestParams::default`]
+///
+/// ### Returns
+///
+/// As [`from_sanity`], except that `features` and `dropped` index the gene axis
+/// of the counts Sanity was given, not Sanity's output rows.
+#[cfg(feature = "sanity")]
+pub fn from_sanity_output<T: BonsaiFloat + sanity_sc_rs::float::SanityFloat>(
+    out: &sanity_sc_rs::SanityOutput<T>,
+    params: Option<IngestParams>,
+) -> Result<SanityLikelihood<T>, BonsaiErrors> {
+    let (n_cells, n_genes) = (out.n_cells, out.n_genes);
+    let mut means = vec![T::zero(); n_cells * n_genes];
+    let mut sds = vec![T::zero(); n_cells * n_genes];
+    means
+        .par_chunks_mut(n_genes.max(1))
+        .zip(sds.par_chunks_mut(n_genes.max(1)))
+        .enumerate()
+        .for_each(|(cell, (m_row, s_row))| {
+            for g in 0..n_genes {
+                m_row[g] = out.log_fold_changes[g * n_cells + cell];
+                s_row[g] = out.error_bars[g * n_cells + cell];
+            }
+        });
+    let variances: Vec<f64> = out.variance.iter().map(|&v| wide(v)).collect();
+
+    let mut lik = from_sanity(&means, &sds, n_cells, n_genes, &variances, params)?;
+    for k in lik.features.iter_mut().chain(lik.dropped.iter_mut()) {
+        *k = out.genes[*k];
+    }
+    Ok(lik)
+}
+
 ///////////
 // Tests //
 ///////////
@@ -1331,5 +1373,63 @@ mod tests {
                 max_relative = 1e-5
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "sanity"))]
+mod sanity_tests {
+    use super::*;
+    use crate::bonsai::bonsai;
+    use crate::tree::distance::{MAX_PAIRS, distance_recovery};
+    use crate::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand_distr::{Distribution, LogNormal, Poisson};
+    use sanity_sc_rs::input::CountMatrix;
+    use sanity_sc_rs::sanity;
+
+    #[test]
+    fn test_counts_through_sanity_recover_the_tree() {
+        let (n, p) = (64, 300);
+        let sim = simulate_binary::<f64>(Some(SimulationParams {
+            n_leaves: n,
+            n_features: p,
+            seed: 11,
+            ..SimulationParams::default()
+        }))
+        .unwrap();
+
+        // Counts of SPEC 13.1: the noise-free leaf positions, back on the raw
+        // scale, as log fold changes about a per-gene mean quotient.
+        let mut rng = StdRng::seed_from_u64(3);
+        let library = LogNormal::new(8.0f64, 0.3).unwrap();
+        let totals: Vec<f64> = (0..n).map(|_| library.sample(&mut rng).round()).collect();
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        let mut indptr = vec![0usize];
+        for g in 0..p {
+            let log_q = -(p as f64).ln() + 2.0 * (g as f64 / p as f64 - 0.5);
+            let scale = sim.variances[g].sqrt();
+            for c in 0..n {
+                let rate = totals[c] * (log_q + sim.truth[c * p + g] * scale).exp();
+                let k = Poisson::new(rate).unwrap().sample(&mut rng) as u32;
+                if k > 0 {
+                    indices.push(c as u32);
+                    values.push(k);
+                }
+            }
+            indptr.push(indices.len());
+        }
+        let counts = CountMatrix::new(indices, values, indptr, n).unwrap();
+        let out = sanity::<f64>(&counts, &totals, None).unwrap();
+
+        let lik = from_sanity_output(&out, None).unwrap();
+        let n_kept = lik.features.len();
+        let res = bonsai(&lik.means, &lik.sds, n, n_kept, Some(&lik.variances), None).unwrap();
+
+        // Measured 2026-09-24: RF 0 and recovery 0.950. The same run fed the
+        // log transcription quotients lands at RF 100 of 122 and 0.016.
+        assert!(robinson_foulds(&res.tree, &sim.tree).unwrap() <= 6);
+        assert!(distance_recovery(&res.tree, &sim.truth, p, MAX_PAIRS, 0) > 0.8);
     }
 }

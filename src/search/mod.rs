@@ -133,11 +133,8 @@ pub(crate) fn leaves_below(tree: &Tree) -> Vec<usize> {
 /// node is the root, on sibling order, or on internal node numbering. The
 /// fingerprint is the sum of a hash of each split, which is a multiset hash:
 /// the same set of splits gives the same word whatever order they are met in.
-/// It was a sorted vector of the split words until 2026-09-12, which cost a
-/// sort of `n` words per SPR candidate; the sum costs a pass.
-///
 /// Used by both NNI and SPR to reject a proposal that changes no split. That
-/// filter is load-bearing rather than cosmetic: without it, collapsing and
+/// filter decides whether the search terminates: without it, collapsing and
 /// re-resolving a star reports a gain from reoptimising branch lengths while
 /// leaving the topology alone, and the greedy phase does branch-length descent
 /// forever. See the deviation note on SPEC.md section 9.4.
@@ -245,7 +242,7 @@ mod tests {
     use super::*;
     use crate::tree::cluster::reroot;
 
-    /// Regression, 2026-08-31. NNI and SPR independently grew the same split
+    /// Regression. NNI and SPR independently grew the same split
     /// fingerprint, but only SPR's deduplicated. A degree-two root's two
     /// children describe one split, so the raw key carries it twice and the
     /// same unrooted tree compares unequal to itself under a different root.

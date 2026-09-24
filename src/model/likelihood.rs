@@ -1,18 +1,19 @@
 //! The pruning recursion and the tree loglikelihood.
 //!
-//! Implements SPEC.md sections 4 and 5: every subtree collapses into an
-//! effective leaf carrying a mean and a precision per feature, and the tree
-//! loglikelihood accumulates as that collapse proceeds. This is the
-//! continuous-trait form of Felsenstein's pruning algorithm.
-//!
-//! Values are up to the additive constants dropped in SPEC.md section 3, so
-//! only differences between loglikelihoods are meaningful.
+//! Every subtree collapses into an effective leaf carrying a mean and a
+//! precision per feature, and the tree loglikelihood accumulates as that
+//! collapse proceeds. This is the continuous-trait form of Felsenstein's
+//! pruning algorithm.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::Tree;
 use crate::utils::kernels::prune_general;
 use crate::utils::simd::prune_binary;
 use crate::utils::traits::BonsaiFloat;
+
+///////////////
+// NodeState //
+///////////////
 
 /// Effective means and precisions for every node in a tree.
 ///
@@ -211,10 +212,8 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// Per-node contributions are summed within a level and only then added to
     /// the running total, which keeps the association fixed to the tree so that
     /// this routine's own answer does not depend on how the levels happen to be
-    /// walked. That mattered most when a second, feature-blocked implementation
-    /// had to agree with this one; it was deleted on 2026-09-06, but the fixed
-    /// association is still what makes this routine's answer a property of the
-    /// tree rather than of the traversal.
+    /// walked. That is what makes this routine's answer a property of the tree
+    /// rather than of the traversal.
     ///
     /// ### Params
     ///
@@ -231,11 +230,6 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// [`NodeState::new`]. Both are a mismatched pair of arguments rather than
     /// bad data.
     pub fn prune(&mut self, tree: &Tree) -> f64 {
-        // A real check, not a `debug_assert`: a state built for one tree and
-        // pruned against another indexes entirely within bounds when the state
-        // is the larger of the two, so release builds would return a
-        // well-formed answer computed from the wrong rows (adversarial review
-        // N17). One comparison against an `O(n * p)` sweep.
         assert_eq!(
             tree.n_nodes(),
             self.n_nodes,
@@ -246,7 +240,7 @@ impl<T: BonsaiFloat> NodeState<T> {
         // under-filled leaf block leaves zero-precision rows, which the first
         // logarithm turns into `-inf`: a finite-looking `Ok` carrying a
         // meaningless number, since `Leaves` has public fields and nothing ties
-        // its length to the tree (adversarial review 2026-09-06).
+        // its length to the tree.
         assert_eq!(
             tree.n_leaves(),
             self.n_leaf_rows,
@@ -285,9 +279,9 @@ impl<T: BonsaiFloat> NodeState<T> {
 /// against a slab of equal-length rows indexed by node rather than against
 /// `NodeState` itself, which is what let a second layout share it; that layout
 /// is gone, but the shape is still the right one to write the dispatch between
-/// the binary and polytomy kernels against. The traversal order and the order the per-node
-/// contributions are summed in stay each module's own business, which is what
-/// makes the two independent enough to cross-check.
+/// the binary and polytomy kernels against. The traversal order and the order
+/// the per-node contributions are summed in stay each module's own business,
+/// which is what makes the two independent enough to cross-check.
 ///
 /// ### Params
 ///
@@ -382,7 +376,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_rejects_leaf_blocks_that_do_not_fit_the_arena() {
-        // Regression, adversarial review 2026-08-27. An over-long leaf block
+        // Regression. An over-long leaf block
         // panicked inside `copy_from_slice`, in library code, on the crate's
         // most-used type. A block that was not a whole number of rows was
         // accepted and under-filled, leaving zero-precision rows that make the
@@ -415,9 +409,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_the_loglikelihood_is_the_same_at_every_rooting() {
-        // S14, listed in SPEC.md section 13.2 as a required invariant and
-        // untested until the adversarial review wrote it (N6). The root is a
-        // bookkeeping choice: the model is defined on the unrooted tree, so
+        // S14, listed in SPEC.md section 13.2 as a required invariant. The
+        // root is a bookkeeping choice: the model is defined on the unrooted
+        // tree, so
         // moving the root along any edge, which splits that edge in two and
         // reverses the path back to the old root, has to leave the
         // loglikelihood exactly where it was.
@@ -460,10 +454,9 @@ pub(crate) mod tests {
                 let error = (here - base).abs() / base.abs().max(1.0);
                 worst = worst.max(error);
             }
-            // Measured 2026-08-31: 1.9e-16 balanced, 1.3e-16 ladder, 2.9e-16
-            // with zero branches, 1.4e-16 through the polytomy path. The bound
-            // is two orders above that, so it pins the invariant rather than
-            // the summation order.
+            // The worst measured here is `O(1e-16)` relative on every shape,
+            // including the polytomy path. The bound sits two orders above
+            // that, so it pins the invariant rather than the summation order.
             assert!(
                 worst < 1e-14,
                 "{name}: rerooting moved the loglikelihood by {worst:e} relative"
@@ -474,8 +467,8 @@ pub(crate) mod tests {
     #[test]
     #[should_panic(expected = "this state was built for a tree of")]
     fn test_pruning_a_tree_the_state_was_not_built_for_is_caught() {
-        // Adversarial review 2026-08-31, N17. This was a `debug_assert`, so a
-        // release build indexed happily inside the larger state's rows and
+        // This was a `debug_assert`, so a release build indexed happily
+        // inside the larger state's rows and
         // returned a well-formed loglikelihood computed from the wrong ones.
         let p = 4usize;
         let big = Tree::balanced_binary(8, 0.5).expect("big");
@@ -487,12 +480,11 @@ pub(crate) mod tests {
 
     #[test]
     fn test_the_loglikelihood_is_l_and_not_twice_it() {
-        // SPEC.md section 12: the reference works in `2L` throughout and this
-        // crate works in `L`, so any threshold lifted from the paper has to be
-        // halved. That claim was asserted nowhere (adversarial review N5), and
-        // it is not a claim about the constants, none of which are theirs: it is
-        // a claim about the units the whole crate is denominated in, and the
-        // only place to pin it is against the formula as written.
+        // SPEC.md section 12: the paper states thresholds in `2L` and this
+        // crate works in `L`, so anything transcribed has to be halved. Not a
+        // claim about the constants, none of which are theirs: a claim about
+        // the units the whole crate is denominated in, and the only place to
+        // pin it is against the formula as written.
         //
         // S20 transcribed literally, `1/2` and all, in the direct form with the
         // ancestor's mean formed rather than the pairwise identity, over a tree

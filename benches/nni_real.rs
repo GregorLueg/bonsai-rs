@@ -1,9 +1,9 @@
 //! What step 6 does on a tree step 5 leaves behind, and what the knobs around
 //! it buy in loglikelihood and Robinson-Foulds rather than in seconds.
 //!
-//! Written 2026-09-13 for the first realistic comparison (512 Sanity-processed
-//! cells by 2382 genes), where the interchanges gained 9 nats for 31 s while
-//! the reference's equivalent stage gained 419 and moved 36 splits. Steps 1 to
+//! Written for the first comparison on realistic data, where step 6 turned out
+//! to gain far less than the equivalent stage of the published implementation;
+//! `docs/COMPARISON.md` has the numbers. Steps 1 to
 //! 5 are run once per fixture and the trees after steps 4 and 5 are cached as
 //! Newick in the scratch directory, so every variant below starts from the
 //! identical step 5 tree and only the part under test is rerun.
@@ -396,7 +396,7 @@ fn finish(label: &str, mut tree: Tree, fx: &Fixture, params: &BonsaiParams, secs
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    // The linkage start is the baseline from 2026-09-13; the greedy merge is
+    // The linkage start is the baseline; the greedy merge is
     // kept reachable because it is still the crate's default.
     let mut params = BonsaiParams {
         start: match env::var("START").as_deref() {
@@ -576,7 +576,7 @@ fn main() {
             );
         }
         "foreign" => {
-            // A tree from elsewhere (the reference's, say), with `cell<i>`
+            // A tree from elsewhere, with `cell<i>`
             // labels: its loglikelihood as it stands, after our step 7, and
             // whether our steps 5 and 6 find anything left in it.
             let cell_labels: Vec<String> = (0..fx.n).map(|i| format!("cell{i}")).collect();

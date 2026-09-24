@@ -176,7 +176,7 @@ const PROPOSAL_CHUNK_MIN: usize = 8;
 /// candidate is a whole arena, so a chunk holds this many trees at once.
 const PROPOSAL_CHUNK_MAX: usize = 256;
 
-/// Default for [`SprParams::revisit_radius`]: off, every subtree every sweep.
+/// Default for [`SprApprox::revisit_radius`].
 ///
 /// Measured 2026-09-24, steps 5 to 8 from the same step-4 tree, scored against
 /// the generating tree. Synthetic: balanced, random-branch and unbalanced
@@ -195,8 +195,9 @@ const PROPOSAL_CHUNK_MAX: usize = 256;
 ///
 /// Both 512-cell panels come back identical at radius three and five. Three
 /// is too tight at 10,000: step 5 stops early and step 6 inherits the work,
-/// 106 s to 273 s. Timings were taken at a load average of 7 to 16.
-const DEFAULT_REVISIT_RADIUS: usize = 0;
+/// 106 s to 273 s. Five is the smallest radius that held on every dataset.
+/// Timings were taken at a load average of 7 to 16.
+const DEFAULT_REVISIT_RADIUS: usize = 5;
 
 /// Which subtree the sweep considers next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +217,92 @@ pub enum PruneOrder {
     LongestBranch,
     /// A uniform shuffle of the eligible subtrees, from [`SprParams::seed`].
     Random,
+}
+
+/// Knobs of the approximate search, each an approximation that changes the
+/// answer and carries its measurement on its default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SprApprox {
+    /// After the first sweep, propose only subtrees within this many edges of
+    /// a clade the previous sweep's accepted moves created. `0` switches this
+    /// approximation off and proposes every subtree every sweep.
+    ///
+    /// The don't-look bits of TSP local search (Bentley, *ORSA Journal on
+    /// Computing*, 1992): a subtree whose neighbourhood nothing touched last
+    /// sweep is very likely to land where it landed then. Very likely, not
+    /// certainly, because every effective leaf depends on the whole tree. See
+    /// [`DEFAULT_REVISIT_RADIUS`].
+    pub revisit_radius: usize,
+}
+
+impl SprApprox {
+    /// Build the knobs explicitly.
+    ///
+    /// ### Params
+    ///
+    /// * `revisit_radius` - See [`SprApprox::revisit_radius`]; `0` is off
+    ///
+    /// ### Returns
+    ///
+    /// The knobs.
+    pub fn new(revisit_radius: usize) -> Self {
+        Self { revisit_radius }
+    }
+}
+
+impl Default for SprApprox {
+    /// Every approximation at its measured default.
+    ///
+    /// ### Returns
+    ///
+    /// The default knobs.
+    fn default() -> Self {
+        Self {
+            revisit_radius: DEFAULT_REVISIT_RADIUS,
+        }
+    }
+}
+
+/// The specified search, or this crate's approximation of it.
+///
+/// Same shape as [`crate::bonsai::StartTree`]: one arm reproduces the paper and
+/// the other is what we recommend. Both return a tree whose loglikelihood never
+/// falls below the input's; they differ in which moves they get to look at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprSearch {
+    /// Every subtree every sweep, as SPEC.md section 9.3 specifies. Choose it
+    /// to reproduce the published method, or to check on your own data what
+    /// the approximation costs.
+    Exact,
+    /// The approximations in [`SprApprox`]. The default: within a few nats of
+    /// [`SprSearch::Exact`] on every dataset measured, and up to twice as fast
+    /// over steps 5 to 8.
+    Approximate(SprApprox),
+}
+
+impl Default for SprSearch {
+    /// [`SprSearch::Approximate`] at its measured defaults.
+    ///
+    /// ### Returns
+    ///
+    /// The default search.
+    fn default() -> Self {
+        Self::Approximate(SprApprox::default())
+    }
+}
+
+impl SprSearch {
+    /// The revisit radius in force, `0` when every subtree is proposed.
+    ///
+    /// ### Returns
+    ///
+    /// The radius.
+    fn revisit_radius(&self) -> usize {
+        match self {
+            Self::Exact => 0,
+            Self::Approximate(a) => a.revisit_radius,
+        }
+    }
 }
 
 /// Tuning knobs for search step 5.
@@ -243,16 +330,8 @@ pub struct SprParams {
     /// [`DEFAULT_MIN_RELATIVE_GAIN`] for why an absolute floor alone is not
     /// enough.
     pub min_relative_gain: f64,
-    /// After the first sweep, propose only subtrees within this many edges of
-    /// a clade the previous sweep's accepted moves created. `0` proposes every
-    /// subtree every sweep, which is what SPEC.md section 9.3 specifies.
-    ///
-    /// The don't-look bits of TSP local search: a subtree whose neighbourhood
-    /// nothing touched last sweep is very likely to land where it landed then.
-    /// Very likely, not certainly, because every effective leaf depends on the
-    /// whole tree, so this is an approximation and changes the answer. See
-    /// [`DEFAULT_REVISIT_RADIUS`].
-    pub revisit_radius: usize,
+    /// Whether to run the specified search or this crate's approximation of it.
+    pub search: SprSearch,
 }
 
 impl Default for SprParams {
@@ -270,7 +349,7 @@ impl Default for SprParams {
             placement: PlacementParams::default(),
             star: StarParams::default(),
             min_relative_gain: DEFAULT_MIN_RELATIVE_GAIN,
-            revisit_radius: DEFAULT_REVISIT_RADIUS,
+            search: SprSearch::default(),
         }
     }
 }
@@ -1588,7 +1667,7 @@ fn mark_revisits(
 /// ### Returns
 ///
 /// The round's result and the words [`mark_revisits`] collected from its
-/// accepted moves, empty when [`SprParams::revisit_radius`] is zero, or the
+/// accepted moves, empty when the search revisits everything, or the
 /// error the placement, the primitive or the arena failed with.
 fn sweep<T: BonsaiFloat>(
     tree: &Tree,
@@ -1645,12 +1724,12 @@ fn sweep<T: BonsaiFloat>(
             word = leaf_words(&tree);
             here = split_fingerprint_with(&tree, &word);
             by_word = word_index(&word);
-            if params.revisit_radius > 0 {
+            if params.search.revisit_radius() > 0 {
                 mark_revisits(
                     &tree,
                     &proposal.to_old,
                     &word,
-                    params.revisit_radius,
+                    params.search.revisit_radius(),
                     &mut revisit,
                 );
             }
@@ -1722,7 +1801,7 @@ pub fn spr<T: BonsaiFloat>(
             },
             look.as_ref(),
         )?;
-        if params.revisit_radius > 0 {
+        if params.search.revisit_radius() > 0 {
             look = Some(revisit);
         }
         out.rounds += 1;
@@ -2837,23 +2916,35 @@ mod tests {
             n_features: p,
         };
         let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
-        let all = spr(&start, leaves, None).expect("spr");
-        let wide = spr(
-            &start,
-            leaves,
-            Some(SprParams {
-                revisit_radius: 4 * n,
-                ..SprParams::default()
-            }),
-        )
-        .expect("spr");
+        let with = |search: SprSearch| {
+            spr(
+                &start,
+                leaves,
+                Some(SprParams {
+                    search,
+                    ..SprParams::default()
+                }),
+            )
+            .expect("spr")
+        };
+        let all = with(SprSearch::Exact);
         assert!(all.rounds >= 2, "only {} rounds", all.rounds);
-        assert_eq!(wide.rounds, all.rounds);
-        assert_eq!(wide.loglik.to_bits(), all.loglik.to_bits());
-        assert_eq!(
-            crate::search::split_fingerprint(&wide.tree),
-            crate::search::split_fingerprint(&all.tree)
-        );
+        // A radius of zero switches the restriction off, which is the exact
+        // search whatever else the approximate arm carries.
+        for radius in [0, 4 * n] {
+            let got = with(SprSearch::Approximate(SprApprox::new(radius)));
+            assert_eq!(got.rounds, all.rounds, "radius {radius}");
+            assert_eq!(
+                got.loglik.to_bits(),
+                all.loglik.to_bits(),
+                "radius {radius}"
+            );
+            assert_eq!(
+                crate::search::split_fingerprint(&got.tree),
+                crate::search::split_fingerprint(&all.tree),
+                "radius {radius}"
+            );
+        }
     }
 
     #[test]
@@ -2872,7 +2963,7 @@ mod tests {
                 &start,
                 leaves,
                 Some(SprParams {
-                    revisit_radius: radius,
+                    search: SprSearch::Approximate(SprApprox::new(radius)),
                     ..SprParams::default()
                 }),
             )

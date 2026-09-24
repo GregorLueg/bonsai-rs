@@ -105,48 +105,6 @@ impl<T: BonsaiFloat> NodeState<T> {
         })
     }
 
-    /// Assemble a state from rows that are already settled.
-    ///
-    /// No validation beyond the lengths, because the one caller is
-    /// [`crate::search::spr`], which forms the rows through the same kernels
-    /// [`NodeState::prune`] dispatches to and is tested bit for bit against it.
-    ///
-    /// ### Params
-    ///
-    /// * `p` - Number of features
-    /// * `n_leaf_rows` - Number of leaf rows, which `prune` checks against the
-    ///   tree it is handed
-    /// * `m` - Effective means, `[node][feature]`, row-major, every row settled
-    /// * `w` - Effective precisions, same layout
-    /// * `contrib` - Per-node loglikelihood contributions, one per node
-    ///
-    /// ### Returns
-    ///
-    /// The state.
-    ///
-    /// ### Panics
-    ///
-    /// If the three lengths do not describe the same node count.
-    pub(crate) fn from_rows(
-        p: usize,
-        n_leaf_rows: usize,
-        m: Vec<T>,
-        w: Vec<T>,
-        contrib: Vec<f64>,
-    ) -> Self {
-        assert_eq!(m.len(), w.len());
-        assert_eq!(m.len(), contrib.len() * p);
-        Self {
-            n_nodes: contrib.len(),
-            m,
-            w,
-            p,
-            n_leaf_rows,
-            contrib,
-            scratch: Vec::new(),
-        }
-    }
-
     /// One node's loglikelihood contribution from the last `prune`.
     ///
     /// ### Params

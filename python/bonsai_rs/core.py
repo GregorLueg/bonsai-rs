@@ -14,6 +14,7 @@ from ._validate import cell_totals_of, check_pair, check_vector, gene_major
 ###########
 
 Start = Literal["linkage", "greedy"]
+Search = Literal["approximate", "exact"]
 VarianceRule = Literal["marginalise", "posterior_mean", "max_posterior", "fixed"]
 
 
@@ -166,6 +167,7 @@ def bonsai(
     *,
     variances: np.ndarray | None = None,
     start: Start = "linkage",
+    search: Search = "approximate",
     min_signal_to_noise: float | None = None,
     reroot: bool = True,
 ) -> BonsaiResult:
@@ -182,6 +184,11 @@ def bonsai(
         start: ``"linkage"`` (Ward over a neighbour graph, the default) or
             ``"greedy"`` (the paper's greedy merge, for like-for-like
             reproduction).
+        search: ``"approximate"`` (the default) or ``"exact"``. Exact runs
+            SPR and NNI as the paper specifies them; the approximate search
+            revisits only what the last moves touched and landed within a few
+            nats of the exact one on every dataset measured, several times
+            faster. Worth an exact run to check on data of your own.
         min_signal_to_noise: Features below this signal-to-noise are dropped
             before the search. ``None`` for the default of 0.25.
         reroot: Reroot for display once the search is done. Changes the
@@ -196,7 +203,7 @@ def bonsai(
     """
     m, s = check_pair(means, sds)
     v = _variances(variances, m.shape[1])
-    return _result(_core.bonsai(m, s, v, start, min_signal_to_noise, reroot))
+    return _result(_core.bonsai(m, s, v, start, search, min_signal_to_noise, reroot))
 
 
 # `counts` is dense numpy or scipy sparse; scipy is optional, so it is `Any`.
@@ -210,6 +217,7 @@ def bonsai_from_counts(
     dtype: type[np.float32] | type[np.float64] = np.float32,
     gpu: bool = False,
     start: Start = "linkage",
+    search: Search = "approximate",
     min_signal_to_noise: float | None = None,
     max_amplification: float | None = None,
     reroot: bool = True,
@@ -228,6 +236,7 @@ def bonsai_from_counts(
         gpu: As `sanity`. Only Sanity runs on the GPU; the tree search is
             CPU either way.
         start: As `bonsai`.
+        search: As `bonsai`.
         min_signal_to_noise: As `bonsai`.
         max_amplification: As `from_sanity`.
         reroot: As `bonsai`.
@@ -250,6 +259,7 @@ def bonsai_from_counts(
             dtype is np.float64,
             gpu,
             start,
+            search,
             min_signal_to_noise,
             max_amplification,
             reroot,
@@ -266,6 +276,7 @@ def backbone(
     backbone_cells: int | None = None,
     seed: int = 0,
     start: Start = "linkage",
+    search: Search = "approximate",
     min_signal_to_noise: float | None = None,
     reroot: bool = True,
 ) -> BonsaiResult:
@@ -283,6 +294,7 @@ def backbone(
             of 2048.
         seed: Seed for choosing the backbone subset.
         start: As `bonsai`, for the backbone.
+        search: As `bonsai`.
         min_signal_to_noise: As `bonsai`.
         reroot: As `bonsai`.
 
@@ -293,6 +305,6 @@ def backbone(
     v = _variances(variances, m.shape[1])
     return _result(
         _core.backbone(
-            m, s, v, start, min_signal_to_noise, reroot, backbone_cells, seed
+            m, s, v, start, search, min_signal_to_noise, reroot, backbone_cells, seed
         )
     )

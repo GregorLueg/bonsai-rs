@@ -19,6 +19,13 @@ def test_same_input_same_tree(sim, fitted):
     np.testing.assert_array_equal(again.tree.parent, fitted.tree.parent)
 
 
+def test_the_exact_search_is_one_keyword_away(sim, fitted):
+    exact = bs.bonsai(sim.means, sim.sds, search="exact")
+    # On a 128-cell simulation the approximate search reproduces the exact one.
+    assert exact.loglik == pytest.approx(fitted.loglik, rel=1e-9)
+    assert bs.robinson_foulds(exact.tree, sim.tree) <= 10
+
+
 def test_storage_follows_the_input_dtype(sim):
     res = bs.bonsai(sim.means.astype(np.float32), sim.sds.astype(np.float32))
     assert res.node_means.dtype == np.float32

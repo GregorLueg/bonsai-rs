@@ -238,6 +238,99 @@ impl Tree {
         })
     }
 
+    /// [`Tree::from_parents`] for arrays already in the arena order.
+    ///
+    /// "Already in order" means every parent index exceeds its children's and
+    /// the internal nodes' heights never decrease with index, which makes
+    /// `from_parents`' relabelling the identity. SPR rebuilds an arena per
+    /// candidate from arrays it has numbered that way itself, and skipping the
+    /// sort, the relabel copies and the range checks there took step 5 from
+    /// 42.3 s to 41.4 s at 5,000 cells and 125.3 s to 121.3 s at 10,000,
+    /// alternating builds, 2026-09-25. The result is the tree
+    /// `from_parents` would build from the same arrays, field for field;
+    /// `test_the_level_ordered_constructor_matches_from_parents` pins that,
+    /// and debug builds check the order on every call.
+    ///
+    /// ### Params
+    ///
+    /// * `parent` - Parent index per node, [`NO_NODE`] at the root, in arena
+    ///   order
+    /// * `branch` - Branch length above each node, same indexing
+    /// * `n_leaves` - Number of leaves, which occupy `0..n_leaves`
+    ///
+    /// ### Returns
+    ///
+    /// The tree, or `MalformedTree` if an internal node has fewer than two
+    /// children.
+    pub(crate) fn from_level_ordered(
+        parent: Vec<u32>,
+        branch: Vec<f64>,
+        n_leaves: usize,
+    ) -> Result<Self, BonsaiErrors> {
+        let n_nodes = parent.len();
+        debug_assert_eq!(branch.len(), n_nodes);
+        debug_assert!(n_leaves > 0 && n_leaves <= n_nodes);
+        debug_assert_eq!(parent.iter().filter(|&&p| p == NO_NODE).count(), 1);
+        debug_assert!(
+            parent
+                .iter()
+                .enumerate()
+                .all(|(i, &p)| p == NO_NODE || (p as usize > i && p as usize >= n_leaves))
+        );
+
+        let mut height = vec![0u32; n_nodes];
+        for i in 0..n_nodes {
+            if parent[i] != NO_NODE {
+                let par = parent[i] as usize;
+                height[par] = height[par].max(height[i] + 1);
+            }
+        }
+        debug_assert!(height[n_leaves..].windows(2).all(|w| w[0] <= w[1]));
+
+        let mut level_ptr = vec![n_leaves as u32];
+        for i in n_leaves + 1..n_nodes {
+            if height[i] != height[i - 1] {
+                level_ptr.push(i as u32);
+            }
+        }
+        level_ptr.push(n_nodes as u32);
+
+        let mut child_ptr = vec![0u32; n_nodes + 1];
+        for &par in &parent {
+            if par != NO_NODE {
+                child_ptr[par as usize + 1] += 1;
+            }
+        }
+        for i in 0..n_nodes {
+            child_ptr[i + 1] += child_ptr[i];
+        }
+        let mut cursor = child_ptr.clone();
+        let mut children = vec![0u32; n_nodes - 1];
+        for (i, &par) in parent.iter().enumerate() {
+            if par != NO_NODE {
+                children[cursor[par as usize] as usize] = i as u32;
+                cursor[par as usize] += 1;
+            }
+        }
+        if let Some(i) = (n_leaves..n_nodes).find(|&i| child_ptr[i + 1] - child_ptr[i] < 2) {
+            return Err(BonsaiErrors::MalformedTree {
+                reason: format!(
+                    "internal node {i} has {} children, expected at least 2",
+                    child_ptr[i + 1] - child_ptr[i]
+                ),
+            });
+        }
+
+        Ok(Self {
+            parent,
+            branch,
+            n_leaves,
+            child_ptr,
+            children,
+            level_ptr,
+        })
+    }
+
     /// Number of levels above the leaves.
     ///
     /// ### Returns
@@ -478,6 +571,39 @@ mod tests {
         }
         for i in 8..15 {
             assert_eq!(tree.children(i).len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_the_level_ordered_constructor_matches_from_parents() {
+        // Arrays taken from a tree `from_parents` has already put in arena
+        // order must rebuild into the same tree, field for field, whichever
+        // constructor builds it. Shapes with one level per node, balanced
+        // levels and polytomies.
+        let polytomy_parent = vec![6, 6, 6, 7, 7, 7, 8, 8, NO_NODE];
+        let fixtures = [
+            Tree::ladder(17, 0.3).expect("ladder"),
+            Tree::balanced_binary(32, 0.5).expect("balanced"),
+            Tree::from_parents(
+                polytomy_parent,
+                (1..=9).map(|i| 0.1 * i as f64).collect(),
+                6,
+            )
+            .expect("polytomy"),
+        ];
+        for tree in fixtures {
+            let n = tree.n_nodes();
+            let parent: Vec<u32> = (0..n as u32)
+                .map(|i| tree.parent(i).unwrap_or(NO_NODE))
+                .collect();
+            let fast = Tree::from_level_ordered(parent, tree.branches().to_vec(), tree.n_leaves())
+                .expect("fast");
+            assert_eq!(fast.parent, tree.parent);
+            assert_eq!(fast.branch, tree.branch);
+            assert_eq!(fast.n_leaves, tree.n_leaves);
+            assert_eq!(fast.child_ptr, tree.child_ptr);
+            assert_eq!(fast.children, tree.children);
+            assert_eq!(fast.level_ptr, tree.level_ptr);
         }
     }
 

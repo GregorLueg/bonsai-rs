@@ -436,10 +436,10 @@ impl SprResult {
 /// detached subtree and a suppressed degree-two node leave the arena. Kept
 /// leaves are compacted into `0..k` in ascending original order, and kept
 /// internal nodes are numbered by height and then by original index, which is
-/// exactly the order [`Tree::from_parents`] relabels into. Its relabelling is
-/// therefore the identity, which is what makes the map returned here a map of
-/// the tree that comes back rather than of the array that went in;
-/// `test_the_node_map_survives_the_arena` pins that.
+/// exactly the order [`Tree::from_parents`] relabels into. So the arena is
+/// built by [`Tree::from_level_ordered`], which skips the relabelling, and
+/// the map returned here is a map of the tree that comes back rather than of
+/// the array that went in; `test_the_node_map_survives_the_arena` pins that.
 ///
 /// ### Params
 ///
@@ -547,7 +547,7 @@ fn assemble(
         };
         new_branch[here as usize] = branch[old];
     }
-    let tree = Tree::from_parents(new_parent, new_branch, n_kept_leaves)?;
+    let tree = Tree::from_level_ordered(new_parent, new_branch, n_kept_leaves)?;
     Ok((tree, new_id))
 }
 

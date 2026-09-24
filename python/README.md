@@ -24,9 +24,9 @@ import bonsai_rs as bs
 
 res = bs.bonsai_from_counts(counts, cell_totals=totals)  # cells x genes
 
-res.tree                     # parent array, branch lengths, leaf count
-res.node_means               # posterior position of every node, ancestors too
-xy = bs.layout(res.tree)     # (n_nodes, 2), edges run node -> parent
+res.tree  # parent array, branch lengths, leaf count
+res.node_means  # posterior position of every node, ancestors too
+xy = bs.layout(res.tree)  # (n_nodes, 2), edges run node -> parent
 newick = bs.to_newick(res.tree, labels=cell_names)
 ```
 

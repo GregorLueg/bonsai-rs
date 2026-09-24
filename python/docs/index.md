@@ -47,7 +47,7 @@ sim = bs.datasets.simulate_counts(256, 500, seed=0)
 res = bs.bonsai_from_counts(sim.counts, cell_totals=sim.cell_totals)
 
 bs.robinson_foulds(res.tree, sim.tree)  # 0: the generating topology, exactly
-xy = bs.layout(res.tree)                # (n_nodes, 2), ready to draw
+xy = bs.layout(res.tree)  # (n_nodes, 2), ready to draw
 newick = bs.to_newick(res.tree)
 ```
 

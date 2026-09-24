@@ -1,0 +1,28 @@
+[package]
+name = "bonsai-rs-py"
+version = "0.1.0"
+edition = "2024"
+authors = ["Gregor Lueg <gregorlueg@me.com>"]
+license = "MIT"
+description = "Python bindings for bonsai-rs"
+publish = false
+
+[workspace]
+
+[lib]
+name = "_bonsai_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+bonsai-rs = { path = "..", features = ["sanity"] }
+numpy = "0.29"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+sanity-sc-rs = "0.0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+[profile.dev]
+opt-level = 2

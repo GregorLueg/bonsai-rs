@@ -1,0 +1,63 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "bonsai-rs"
+description = "Tree representations of single-cell data under Brownian motion, in Rust."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Gregor Lueg", email = "gregorlueg@me.com" }]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23", "beartype>=0.19"]
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[project.urls]
+Documentation = "https://gregorlueg.github.io/bonsai-rs/"
+Repository = "https://github.com/GregorLueg/bonsai-rs"
+Changelog = "https://github.com/GregorLueg/bonsai-rs/blob/main/python/CHANGELOG.md"
+
+[project.optional-dependencies]
+# Sparse counts for `sanity` / `bonsai_from_counts`. Dense counts need numpy only.
+sparse = ["scipy>=1.9"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.15,<2.0",
+    "pytest>=8",
+    "ruff>=0.9",
+    "ty>=0.0.1",
+    "scipy>=1.9",
+]
+# mkdocstrings reads the installed package, so a docs build needs the compiled
+# extension present: `maturin develop --release` before `mkdocs build`.
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
+]
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "bonsai_rs._bonsai_rs"
+python-source = "."
+strip = true
+include = ["bonsai_rs/py.typed", "bonsai_rs/*.pyi"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bonsai_rs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

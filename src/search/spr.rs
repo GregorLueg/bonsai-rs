@@ -98,8 +98,9 @@ use crate::utils::rng::SplitMix64;
 use crate::utils::simd::prune_binary;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::OnceCell;
+use std::collections::VecDeque;
 
 ////////////////
 // Parameters //
@@ -175,6 +176,28 @@ const PROPOSAL_CHUNK_MIN: usize = 8;
 /// candidate is a whole arena, so a chunk holds this many trees at once.
 const PROPOSAL_CHUNK_MAX: usize = 256;
 
+/// Default for [`SprParams::revisit_radius`]: off, every subtree every sweep.
+///
+/// Measured 2026-09-24, steps 5 to 8 from the same step-4 tree, scored against
+/// the generating tree. Synthetic: balanced, random-branch and unbalanced
+/// shapes at noise 0.4, 1.0 and 1.6, 4,096 cells by 1,000 features. At radius
+/// five the loglikelihood stayed within 1 nat of the full search on all nine and
+/// Robinson-Foulds within 8 splits of 2,000 to 2,400 at noise 1.6, and step 5
+/// ran 1.4 to 2.7 times faster. Sanity-preprocessed, 512 to 10,000 cells:
+///
+/// | cells | radius | steps 5-8 | loglik | Robinson-Foulds |
+/// |---|---|---|---|---|
+/// | 5,000 | 0 | 132.7 s | -5,557,974.99 | 1,293 |
+/// | 5,000 | 5 | 84.8 s | -5,557,978.08 | 1,288 |
+/// | 10,000 | 0 | 461.0 s | -11,253,188.26 | 2,632 |
+/// | 10,000 | 3 | 406.2 s | -11,253,459.03 | 2,644 |
+/// | 10,000 | 5 | 257.8 s | -11,252,720.99 | 2,624 |
+///
+/// Both 512-cell panels come back identical at radius three and five. Three
+/// is too tight at 10,000: step 5 stops early and step 6 inherits the work,
+/// 106 s to 273 s. Timings were taken at a load average of 7 to 16.
+const DEFAULT_REVISIT_RADIUS: usize = 0;
+
 /// Which subtree the sweep considers next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PruneOrder {
@@ -220,6 +243,16 @@ pub struct SprParams {
     /// [`DEFAULT_MIN_RELATIVE_GAIN`] for why an absolute floor alone is not
     /// enough.
     pub min_relative_gain: f64,
+    /// After the first sweep, propose only subtrees within this many edges of
+    /// a clade the previous sweep's accepted moves created. `0` proposes every
+    /// subtree every sweep, which is what SPEC.md section 9.3 specifies.
+    ///
+    /// The don't-look bits of TSP local search: a subtree whose neighbourhood
+    /// nothing touched last sweep is very likely to land where it landed then.
+    /// Very likely, not certainly, because every effective leaf depends on the
+    /// whole tree, so this is an approximation and changes the answer. See
+    /// [`DEFAULT_REVISIT_RADIUS`].
+    pub revisit_radius: usize,
 }
 
 impl Default for SprParams {
@@ -237,6 +270,7 @@ impl Default for SprParams {
             placement: PlacementParams::default(),
             star: StarParams::default(),
             min_relative_gain: DEFAULT_MIN_RELATIVE_GAIN,
+            revisit_radius: DEFAULT_REVISIT_RADIUS,
         }
     }
 }
@@ -1494,7 +1528,74 @@ pub fn spr_round<T: BonsaiFloat>(
     leaves: Leaves<'_, T>,
     params: Option<SprParams>,
 ) -> Result<SprResult, BonsaiErrors> {
-    let params = params.unwrap_or_default();
+    Ok(sweep(tree, leaves, params.unwrap_or_default(), None)?.0)
+}
+
+/// Words of every node within `radius` edges of a clade a move created.
+///
+/// A created clade is a node of the new tree with no counterpart in the old
+/// one, which is exactly the path the move rewired. The walk is unrooted, so it
+/// reaches the pruned subtree and its new siblings as well as the ancestors.
+///
+/// ### Params
+///
+/// * `tree` - The tree the move produced
+/// * `to_old` - Per node of `tree`, its node in the tree before, or [`NO_NODE`]
+/// * `word` - [`leaf_words`] of `tree`
+/// * `radius` - How many edges out to mark
+/// * `out` - Set the words are added to
+fn mark_revisits(
+    tree: &Tree,
+    to_old: &[u32],
+    word: &[u64],
+    radius: usize,
+    out: &mut FxHashSet<u64>,
+) {
+    let n = tree.n_nodes();
+    let mut dist = vec![usize::MAX; n];
+    let mut queue = VecDeque::new();
+    for v in tree.n_leaves()..n {
+        if to_old[v] == NO_NODE {
+            dist[v] = 0;
+            queue.push_back(v as u32);
+        }
+    }
+    while let Some(v) = queue.pop_front() {
+        out.insert(word[v as usize]);
+        let d = dist[v as usize];
+        if d == radius {
+            continue;
+        }
+        for nb in tree.children(v).iter().copied().chain(tree.parent(v)) {
+            if dist[nb as usize] == usize::MAX {
+                dist[nb as usize] = d + 1;
+                queue.push_back(nb);
+            }
+        }
+    }
+}
+
+/// One sweep, optionally restricted to the subtrees a previous sweep touched.
+///
+/// ### Params
+///
+/// * `tree` - Tree to improve; not modified
+/// * `leaves` - The leaf data
+/// * `params` - Knobs
+/// * `look` - [`leaf_words`] of the subtrees to propose, or `None` for all of
+///   them
+///
+/// ### Returns
+///
+/// The round's result and the words [`mark_revisits`] collected from its
+/// accepted moves, empty when [`SprParams::revisit_radius`] is zero, or the
+/// error the placement, the primitive or the arena failed with.
+fn sweep<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+    params: SprParams,
+    look: Option<&FxHashSet<u64>>,
+) -> Result<(SprResult, FxHashSet<u64>), BonsaiErrors> {
     let mut rng = SplitMix64::new(params.seed);
     let mut tree = tree.clone();
     let mut gains = Vec::new();
@@ -1509,7 +1610,11 @@ pub fn spr_round<T: BonsaiFloat>(
     let mut here = split_fingerprint_with(&tree, &word);
     let mut by_word = word_index(&word);
 
-    let order = candidate_order(&tree, &params, &mut rng);
+    let mut order = candidate_order(&tree, &params, &mut rng);
+    if let Some(look) = look {
+        order.retain(|w| look.contains(w));
+    }
+    let mut revisit = FxHashSet::default();
     let mut next = 0usize;
     let mut chunk = PROPOSAL_CHUNK_MIN;
     while next < order.len() {
@@ -1540,6 +1645,15 @@ pub fn spr_round<T: BonsaiFloat>(
             word = leaf_words(&tree);
             here = split_fingerprint_with(&tree, &word);
             by_word = word_index(&word);
+            if params.revisit_radius > 0 {
+                mark_revisits(
+                    &tree,
+                    &proposal.to_old,
+                    &word,
+                    params.revisit_radius,
+                    &mut revisit,
+                );
+            }
             accepted = Some(k);
             break;
         }
@@ -1559,12 +1673,15 @@ pub fn spr_round<T: BonsaiFloat>(
     }
 
     let loglik = tree_loglik(&tree, leaves)?;
-    Ok(SprResult {
-        tree,
-        loglik,
-        gains,
-        rounds: 1,
-    })
+    Ok((
+        SprResult {
+            tree,
+            loglik,
+            gains,
+            rounds: 1,
+        },
+        revisit,
+    ))
 }
 
 /// Search step 5: sweep until a sweep finds nothing.
@@ -1592,17 +1709,22 @@ pub fn spr<T: BonsaiFloat>(
         rounds: 0,
     };
 
+    let mut look: Option<FxHashSet<u64>> = None;
     while out.rounds < params.max_rounds {
         // The random order has to differ between rounds, or the second round
         // retries the first round's order on a tree that has moved under it.
-        let round = spr_round(
+        let (round, revisit) = sweep(
             &out.tree,
             leaves,
-            Some(SprParams {
+            SprParams {
                 seed: params.seed.wrapping_add(out.rounds as u64),
                 ..params
-            }),
+            },
+            look.as_ref(),
         )?;
+        if params.revisit_radius > 0 {
+            look = Some(revisit);
+        }
         out.rounds += 1;
         if round.gains.is_empty() {
             break;
@@ -2697,6 +2819,69 @@ mod tests {
                 store.contribution(v).to_bits(),
                 fresh.contribution(v).to_bits(),
                 "term at node {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_revisit_radius_wider_than_the_tree_changes_nothing() {
+        // With the radius past the tree's diameter every accepted move marks
+        // every node, and a node made later in the sweep is marked by the move
+        // that made it, so the next sweep proposes exactly what an unrestricted
+        // one would. Any difference is a word the marking lost.
+        let (p, n) = (96usize, 32usize);
+        let (data, w) = dataset(n, p, 7);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let all = spr(&start, leaves, None).expect("spr");
+        let wide = spr(
+            &start,
+            leaves,
+            Some(SprParams {
+                revisit_radius: 4 * n,
+                ..SprParams::default()
+            }),
+        )
+        .expect("spr");
+        assert!(all.rounds >= 2, "only {} rounds", all.rounds);
+        assert_eq!(wide.rounds, all.rounds);
+        assert_eq!(wide.loglik.to_bits(), all.loglik.to_bits());
+        assert_eq!(
+            crate::search::split_fingerprint(&wide.tree),
+            crate::search::split_fingerprint(&all.tree)
+        );
+    }
+
+    #[test]
+    fn test_a_revisit_radius_never_lowers_the_loglikelihood() {
+        let (p, n) = (96usize, 32usize);
+        let (data, w) = dataset(n, p, 7);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let before = tree_loglik(&start, leaves).expect("loglik");
+        for radius in 1..=3 {
+            let out = spr(
+                &start,
+                leaves,
+                Some(SprParams {
+                    revisit_radius: radius,
+                    ..SprParams::default()
+                }),
+            )
+            .expect("spr");
+            assert!(out.loglik > before, "radius {radius}");
+            assert_relative_eq!(
+                out.loglik,
+                tree_loglik(&out.tree, leaves).expect("loglik"),
+                max_relative = 1e-12
             );
         }
     }

@@ -261,7 +261,8 @@ def backbone(
     """Backbone mode for datasets too large to search directly.
 
     Reconstructs on a random subset, places every other cell onto it one at a
-    time, then refines the whole tree (SI section 15).
+    time, then refines the whole tree. This is the paper's route to large
+    datasets.
 
     Args:
         means: As `bonsai`.

@@ -11,6 +11,9 @@ the licence position.
 - Ingest: the scale transform of SPEC 3.1, feature selection by
   signal-to-noise, and conversion from Sanity posteriors to likelihood
   parameters.
+- Optional `sanity` feature: `ingest::from_sanity_output` takes a
+  `sanity-sc-rs` run straight to Bonsai's input, so raw UMI counts to tree
+  needs nothing outside Rust.
 - Pruning recursion and tree loglikelihood, row-major `[node][feature]`,
   parallel over features rather than tree levels, so the cost is indifferent to
   tree shape.

@@ -65,6 +65,49 @@ parameter settings.
 For datasets too large to search directly, `backbone::backbone` reconstructs on a
 random subset and places the rest against it (SPEC 15).
 
+### From raw counts
+
+The `sanity` feature pulls in [`sanity-sc-rs`](https://github.com/GregorLueg/sanity-sc-rs)
+and adds `ingest::from_sanity_output`, which turns a Sanity run into Bonsai's
+input: transposed to `[cell][gene]`, the prior shrinkage undone (S5), and
+ill-conditioned genes dropped and reported.
+
+```toml
+bonsai-rs = { version = "0.1", features = ["sanity"] }
+```
+
+```rust
+use bonsai_rs::bonsai::bonsai;
+use bonsai_rs::ingest::from_sanity_output;
+use sanity_sc_rs::sanity;
+
+let post = sanity::<f32>(&counts, &cell_totals, None)?;
+let lik = from_sanity_output(&post, None)?;
+let out = bonsai(&lik.means, &lik.sds, lik.n_cells, lik.features.len(), Some(&lik.variances), None)?;
+```
+
+It reads Sanity's log fold changes, not the log transcription quotients. S5
+inverts a zero-mean prior, so the gene mean has to stay out. Measured on 64
+simulated cells by 300 genes: log fold changes give back the generating tree
+exactly (Robinson-Foulds 0, distance recovery 0.950), quotients land at 100 of
+a possible 122 and 0.016.
+
+## Python
+
+```bash
+uv pip install bonsai-rs
+```
+
+```python
+import bonsai_rs as bs
+
+res = bs.bonsai_from_counts(counts)  # cells x genes, dense or scipy sparse
+xy = bs.layout(res.tree)
+```
+
+Docs at [gregorlueg.github.io/bonsai-rs](https://gregorlueg.github.io/bonsai-rs/).
+The bindings live in `python/` and version separately from the crate.
+
 ## How it performs
 
 Against the published implementation on Sanity-preprocessed Baron pancreas data,

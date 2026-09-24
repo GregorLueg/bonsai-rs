@@ -14,6 +14,7 @@ __core_version__: str
 class BonsaiError(Exception):
     """The data was well formed but the method could not use it."""
 
+def gpu_available() -> bool: ...
 def sanity(
     indices: np.ndarray,
     values: np.ndarray,
@@ -23,6 +24,7 @@ def sanity(
     rule: str,
     fixed_variance: float | None,
     double: bool,
+    gpu: bool,
     /,
 ) -> dict[str, Any]: ...
 def from_sanity(
@@ -50,6 +52,7 @@ def bonsai_from_counts(
     rule: str,
     fixed_variance: float | None,
     double: bool,
+    gpu: bool,
     start: str,
     min_snr: float | None,
     max_amp: float | None,

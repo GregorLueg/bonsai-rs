@@ -19,10 +19,10 @@ use pyo3::types::PyDict;
 use sanity_sc_rs::config::{SanityParams, VarianceRule};
 use sanity_sc_rs::float::SanityFloat;
 use sanity_sc_rs::input::CountMatrix;
-use sanity_sc_rs::sanity as sanity_run;
 
 use crate::convert::{flat, result_out, slice, tree_out};
 use crate::error::BErr;
+use crate::gpu::{check, run_sanity};
 
 /// What a float has to be to go through every path in this file.
 trait Float: BonsaiFloat + SanityFloat + Element {}
@@ -168,6 +168,7 @@ fn counts_in(
 /// * `cell_totals` - Total UMIs per cell over all genes
 /// * `rule`, `fixed_variance` - As [`sanity_params`]
 /// * `double` - `float64` storage instead of `float32`
+/// * `gpu` - Run Sanity on the GPU, see [`crate::gpu`]
 ///
 /// ### Returns
 ///
@@ -184,14 +185,16 @@ pub fn sanity<'py>(
     rule: &str,
     fixed_variance: Option<f64>,
     double: bool,
+    gpu: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
+    check(gpu)?;
     let counts = counts_in(&indices, &values, &indptr, n_cells)?;
     let totals = slice(&cell_totals)?;
     let sp = sanity_params(rule, fixed_variance)?;
     if double {
-        sanity_out::<f64>(py, &counts, totals, sp)
+        sanity_out::<f64>(py, &counts, totals, sp, gpu)
     } else {
-        sanity_out::<f32>(py, &counts, totals, sp)
+        sanity_out::<f32>(py, &counts, totals, sp, gpu)
     }
 }
 
@@ -203,6 +206,7 @@ pub fn sanity<'py>(
 /// * `counts` - The counts
 /// * `totals` - Total UMIs per cell
 /// * `sp` - Sanity parameters
+/// * `gpu` - Run Sanity on the GPU
 ///
 /// ### Returns
 ///
@@ -212,10 +216,9 @@ fn sanity_out<'py, T: Float>(
     counts: &CountMatrix,
     totals: &[f64],
     sp: SanityParams,
+    gpu: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let out = py
-        .detach(|| sanity_run::<T>(counts, totals, Some(sp)))
-        .map_err(BErr::from)?;
+    let out = py.detach(|| run_sanity::<T>(counts, totals, sp, gpu))?;
     let (g, c) = (out.n_genes, out.n_cells);
     let d = PyDict::new(py);
     d.set_item(
@@ -374,6 +377,7 @@ fn bonsai_out<'py, T: Float>(
 /// * `cell_totals` - Total UMIs per cell over all genes
 /// * `rule`, `fixed_variance` - As [`sanity_params`]
 /// * `double` - `float64` storage instead of `float32`
+/// * `gpu` - Run Sanity on the GPU, see [`crate::gpu`]
 /// * `start`, `min_snr`, `max_amp`, `reroot` - As [`params`]
 ///
 /// ### Returns
@@ -392,19 +396,21 @@ pub fn bonsai_from_counts<'py>(
     rule: &str,
     fixed_variance: Option<f64>,
     double: bool,
+    gpu: bool,
     start: &str,
     min_snr: Option<f64>,
     max_amp: Option<f64>,
     reroot: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
+    check(gpu)?;
     let counts = counts_in(&indices, &values, &indptr, n_cells)?;
     let totals = slice(&cell_totals)?;
     let sp = sanity_params(rule, fixed_variance)?;
     let bp = params(start, min_snr, max_amp, reroot)?;
     if double {
-        chain::<f64>(py, &counts, totals, sp, bp)
+        chain::<f64>(py, &counts, totals, sp, bp, gpu)
     } else {
-        chain::<f32>(py, &counts, totals, sp, bp)
+        chain::<f32>(py, &counts, totals, sp, bp, gpu)
     }
 }
 
@@ -416,6 +422,7 @@ pub fn bonsai_from_counts<'py>(
 /// * `counts` - The counts
 /// * `totals` - Total UMIs per cell
 /// * `sp`, `bp` - Sanity and Bonsai parameters
+/// * `gpu` - Run Sanity on the GPU
 ///
 /// ### Returns
 ///
@@ -426,9 +433,10 @@ fn chain<'py, T: Float>(
     totals: &[f64],
     sp: SanityParams,
     bp: BonsaiParams,
+    gpu: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (res, genes, dropped) = py.detach(|| -> Result<_, BErr> {
-        let out = sanity_run::<T>(counts, totals, Some(sp))?;
+        let out = run_sanity::<T>(counts, totals, sp, gpu)?;
         let lik = from_sanity_output(&out, Some(bp.ingest))?;
         let k = lik.features.len();
         let res = bonsai_run(

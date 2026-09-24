@@ -53,6 +53,7 @@ def sanity(
     variance_rule: VarianceRule = "marginalise",
     fixed_variance: float | None = None,
     dtype: type[np.float32] | type[np.float64] = np.float32,
+    gpu: bool = False,
 ) -> SanityResult:
     """Posterior log expression and error bars from raw UMI counts.
 
@@ -71,12 +72,17 @@ def sanity(
             ``variance_rule="fixed"``.
         dtype: Storage type of the output. Reductions are ``float64`` either
             way.
+        gpu: Run Sanity on the GPU through wgpu. The device path is
+            ``float32`` whatever ``dtype`` says, since wgpu has no ``float64``.
+            Check `gpu_available` first; asking for it where that is ``False``
+            raises rather than falling back to the CPU.
 
     Returns:
         The posteriors, cells x genes.
 
     Raises:
         ValueError: On malformed or non-integer counts.
+        BonsaiError: If ``gpu=True`` and no GPU can be reached.
     """
     indices, values, indptr, n_cells, _ = gene_major(counts)
     totals = cell_totals_of(counts, cell_totals, n_cells)
@@ -89,6 +95,7 @@ def sanity(
         variance_rule,
         fixed_variance,
         dtype is np.float64,
+        gpu,
     )
     return SanityResult(
         log_fold_changes=d["log_fold_changes"].T,
@@ -201,6 +208,7 @@ def bonsai_from_counts(
     variance_rule: VarianceRule = "marginalise",
     fixed_variance: float | None = None,
     dtype: type[np.float32] | type[np.float64] = np.float32,
+    gpu: bool = False,
     start: Start = "linkage",
     min_signal_to_noise: float | None = None,
     max_amplification: float | None = None,
@@ -217,6 +225,8 @@ def bonsai_from_counts(
         variance_rule: As `sanity`.
         fixed_variance: As `sanity`.
         dtype: As `sanity`.
+        gpu: As `sanity`. Only Sanity runs on the GPU; the tree search is
+            CPU either way.
         start: As `bonsai`.
         min_signal_to_noise: As `bonsai`.
         max_amplification: As `from_sanity`.
@@ -238,6 +248,7 @@ def bonsai_from_counts(
             variance_rule,
             fixed_variance,
             dtype is np.float64,
+            gpu,
             start,
             min_signal_to_noise,
             max_amplification,

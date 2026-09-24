@@ -26,6 +26,20 @@ it out and the row sums of `counts` are used, which is right only when `counts`
 holds every gene. Subset to highly variable genes first and you must pass the
 totals from the full matrix.
 
+Sanity can run on the GPU instead, through wgpu (Metal on macOS, Vulkan or DX12
+elsewhere). The wheel ships the GPU code; whether this machine has an adapter
+is answered at runtime:
+
+```python
+bs.gpu_available()  # True
+res = bs.bonsai_from_counts(sim.counts, cell_totals=sim.cell_totals, gpu=True)
+bs.robinson_foulds(res.tree, sim.tree)  # 0
+```
+
+Only Sanity moves to the device, in `float32` whatever `dtype` says; the tree
+search runs on the CPU either way. `gpu=True` where `gpu_available()` is
+`False` raises `BonsaiError` rather than quietly using the CPU.
+
 `res.dropped` is the genes the Sanity conversion refused, and `res.features`
 the ones the search used, both as column indices into `counts`. The
 [guide](guide.md#the-sanity-handover) says why genes get dropped.

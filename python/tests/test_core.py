@@ -46,6 +46,28 @@ def test_the_chain_equals_its_steps(counts):
     assert steps.loglik == chain.loglik
 
 
+def test_gpu_available_is_a_plain_bool():
+    assert bs.gpu_available() in (True, False)
+
+
+gpu = pytest.mark.skipif(not bs.gpu_available(), reason="no GPU adapter here")
+
+
+@gpu
+def test_gpu_sanity_agrees_with_the_cpu(counts):
+    cpu = bs.sanity(counts.counts, cell_totals=counts.cell_totals)
+    dev = bs.sanity(counts.counts, cell_totals=counts.cell_totals, gpu=True)
+    # The device is float32 throughout; judge it in error bars, not ulps.
+    gap = np.abs(dev.log_fold_changes - cpu.log_fold_changes) / cpu.error_bars
+    assert gap.max() < 1e-2
+
+
+@gpu
+def test_gpu_counts_recover_the_simulated_tree(counts):
+    res = bs.bonsai_from_counts(counts.counts, cell_totals=counts.cell_totals, gpu=True)
+    assert bs.robinson_foulds(res.tree, counts.tree) == 0
+
+
 def test_sanity_shapes(counts):
     post = bs.sanity(counts.counts, cell_totals=counts.cell_totals)
     assert post.log_fold_changes.shape == counts.counts.shape

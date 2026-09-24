@@ -14,7 +14,7 @@ With your own means and error bars, call `bonsai` directly.
 """
 
 from . import datasets
-from ._bonsai_rs import BonsaiError, __core_version__, __version__
+from ._bonsai_rs import BonsaiError, __core_version__, __version__, gpu_available
 from ._types import (
     BonsaiResult,
     Clustering,
@@ -53,6 +53,7 @@ __all__ = [
     "cluster",
     "datasets",
     "from_sanity",
+    "gpu_available",
     "layout",
     "read_newick",
     "robinson_foulds",

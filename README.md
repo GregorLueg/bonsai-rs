@@ -92,6 +92,19 @@ let lik = from_sanity_output(&post, None)?;
 let out = bonsai(&lik.means, &lik.sds, lik.n_cells, lik.features.len(), Some(&lik.variances), None)?;
 ```
 
+The `gpu` feature adds Sanity on the GPU through CubeCL/wgpu. Its output goes
+into `from_sanity_output` exactly as the CPU run's does:
+
+```rust
+use cubecl::Runtime;
+use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use sanity_sc_rs::gpu::sanity_gpu;
+
+let client = WgpuRuntime::client(&WgpuDevice::default());
+let post = sanity_gpu::<f32, WgpuRuntime>(&counts, &cell_totals, None, &client)?;
+let lik = from_sanity_output(&post, None)?;
+```
+
 It reads Sanity's log fold changes, not the log transcription quotients. S5
 inverts a zero-mean prior, so the gene mean has to stay out. Measured on 64
 simulated cells by 300 genes: log fold changes give back the generating tree

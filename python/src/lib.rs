@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 
 mod convert;
 mod error;
+mod gpu;
 mod run;
 mod tree;
 
@@ -33,6 +34,7 @@ fn _bonsai_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__core_version__", bonsai_rs::VERSION)?;
     m.add("BonsaiError", m.py().get_type::<error::BonsaiError>())?;
 
+    m.add_function(wrap_pyfunction!(gpu::gpu_available, m)?)?;
     m.add_function(wrap_pyfunction!(run::sanity, m)?)?;
     m.add_function(wrap_pyfunction!(run::from_sanity, m)?)?;
     m.add_function(wrap_pyfunction!(run::bonsai, m)?)?;

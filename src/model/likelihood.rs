@@ -162,10 +162,11 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// Run the pruning recursion over the whole tree and return its
     /// loglikelihood.
     ///
-    /// Sequential, and measurement says it should stay that way: the whole
-    /// prune is 2.4 per cent of a pipeline run, so parallelising it cannot
-    /// matter. Walks levels from the leaves up and, within a level, ascending
-    /// node index, which the arena invariant makes a valid post-order.
+    /// Sequential, and measurement says it should stay that way: the prune
+    /// kernels and the up-sweep together are 2.8 per cent of busy thread time
+    /// over a whole run at 5,000 cells, sampled 2026-09-24, so parallelising
+    /// this cannot matter. Walks levels from the leaves up and, within a level,
+    /// ascending node index, which the arena invariant makes a valid post-order.
     ///
     /// Per-node contributions are summed within a level and only then added to
     /// the running total, which keeps the association fixed to the tree so that

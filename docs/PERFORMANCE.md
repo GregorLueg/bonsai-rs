@@ -10,33 +10,33 @@ dated then was measured on or before it.
 ## Now
 
 `BonsaiParams::default()` on Sanity-preprocessed Baron data, every step timed,
-2026-09-24, load average 4 at the start of the 5,000 run:
+2026-09-25, load average 6 to 7 at the start of each run:
 
 | step | 512 | 5,000 | 10,000 | share at 10,000 |
 |---|---|---|---|---|
-| 1-2 linkage | 0.04 s | 1.93 s | 6.64 s | 2% |
-| 3 polytomy | 0.01 s | 0.16 s | 0.33 s | 0% |
-| 4 branch | 0.68 s | 9.30 s | 27.01 s | 8% |
-| 5 SPR | 2.31 s | 45.75 s | 153.45 s | 47% |
-| 6 NNI | 0.13 s | 31.86 s | 105.45 s | 32% |
-| 7 branch | 0.81 s | 7.61 s | 20.48 s | 6% |
-| 8 collapse | 0.05 s | 4.70 s | 12.45 s | 4% |
-| total | 4.03 s | 101.31 s | 325.82 s | |
+| 1-2 linkage | 0.04 s | 1.7 s | 5.9 s | 3% |
+| 3 polytomy | 0.01 s | 0.1 s | 0.3 s | 0% |
+| 4 branch | 0.7 s | 8.9 s | 26.1 s | 12% |
+| 5 SPR | 1.9 s | 42.1 s | 128.0 s | 61% |
+| 6 NNI | 0.1 s | 5.9 s | 17.0 s | 8% |
+| 7 branch | 0.7 s | 7.2 s | 20.3 s | 10% |
+| 8 collapse | 0.05 s | 4.5 s | 12.6 s | 6% |
+| total | 3.5 s | 70.4 s | 210.2 s | |
 
-From 5,000 to 10,000 the total goes as `n^1.69`, SPR `n^1.75` and NNI `n^1.73`.
-Those are two-point exponents over two different gene panels, 2,701 and 2,767,
-so read them as a slope rather than a law.
+On 2026-09-13 the same configurations took 4.7 s, 166 s and 611 s. From 5,000
+to 10,000 cells the total goes as `n^1.58`, SPR `n^1.60` and NNI `n^1.53`,
+two-point exponents over two different gene panels, so a slope rather than a law.
 
 What that says:
 
-- SPR and NNI are four fifths of the run. NNI was 13 per cent at 5,000 and 17
-  at 10,000 on 2026-09-13; with the revisit radius it went from 22.6 s to
-  31.9 s at 5,000 and did not move at 10,000.
+- SPR is three fifths of the run and branch optimisation, steps 4, 7 and 8,
+  over a quarter. Neither has an approximation left that measured safe; see the
+  log for the ones that did not.
 - The full-tree sweeps are still small. Sampled at 5,000 cells, the prune
   kernels and the up-sweep are 2.8 per cent of busy thread time.
-- A third of thread time is idle: at 5,000 cells 248,024 of 716,943 thread
-  samples sit in a wait. Which step the waiting happens in has not been split
-  out.
+- A third of SPR's thread time is idle. Round one accepts a move every few
+  candidates, so its chunks run at the floor of eight proposals on ten threads,
+  and a larger floor measured slower because it discards more proposals.
 - The hottest code is the branch solve inside merges and placements:
   `edge_newton_simd`, `split_derivative` and `log` are the top three by self
   time.
@@ -86,6 +86,11 @@ What that says:
     2026-09-24 the load average wandered from 2 to 27 while other work ran, and
     the same build's step 6 at 10,000 cells measured 98 s and 156 s. Quality
     numbers are deterministic and survive load; timings do not.
+13. **A single real-data run is one draw.** Equally valid searches spread
+    over 460 nats at 5,000 cells and 1,700 at 10,000; see
+    [How much one real-data run says](#how-much-one-real-data-run-says). Trust
+    an approximation that reproduces the exact tree; treat a few hundred nats
+    either way as noise unless it repeats across sizes.
 
 ## Log
 
@@ -109,6 +114,7 @@ What that says:
 | 2026-09-13 | Scale-relative SPR acceptance floor | 2383.75 s to 616.26 s at 10,000 by 2,767, and a better tree |
 | 2026-09-24 | SPR acceptance into a slot store instead of an `O(n p)` state copy | step 5 134.1 s to 101.4 s at 5,000 by 2,701, byte-identical tree |
 | 2026-09-24 | SPR revisit radius 5, the default `SprSearch::Approximate` | steps 5 to 8 132.7 s to 84.8 s at 5,000 and 461.0 s to 257.8 s at 10,000, within a few nats everywhere; see [Revisit radius](#revisit-radius) |
+| 2026-09-25 | Lazy NNI greedy phase, radius 5, the default `NniSearch::Approximate` | step 6 29.6 s to 5.9 s at 5,000 and 99.4 s to 16.5 s at 10,000, finished tree identical to the exact phase on all thirteen datasets; see [Lazy NNI](#lazy-nni) |
 
 What the big ones have in common is not materialising things. The lazy rows
 form what a proposal reads and no more; the NNI filter tests the star result
@@ -143,6 +149,10 @@ pins it at 1, 3 and 8 threads.
 | 2026-09-24 | Starting the SPR beam at the pruned subtree's origin only | 64 and 449 nats and 6 and 15 splits lost at 512; the 3 per cent of accepted moves that travel far carry real gain |
 | 2026-09-24 | SPR revisit radius 3 | fine to 5,000 cells; at 10,000 step 6 inherits the work, 106 s to 273 s |
 | 2026-09-24 | Scoring only the three splice pairs through the regrafted subtree | 437 and 737 nats and distance recovery 0.67 to 0.54 on real data, and slower; see [Splice pairs](#splice-pairs-through-the-regrafted-subtree) |
+| 2026-09-25 | Expanding a beam start point's neighbours only when the start is within tolerance of the best | SPR 3 to 9 per cent faster, quality within 2 nats either way; too small to carry a knob |
+| 2026-09-25 | SPR proposal chunk floor other than 8 | 2 to 6 flat, 10 to 32 slower (46.8 s to 70.4 s against 42.1 s at 5,000); the tree is identical at every floor, so the existing 8 stands |
+| 2026-09-25 | Branch tolerance 1e-8 or 1e-7 on steps 4 and 7 instead of 1e-10 | saves 5 to 25 s; at 1e-8 landed in the worse basin at both 5,000 and 10,000, recovery 0.67 to 0.54 and 0.48 to 0.38; one draw each, see [How much one real-data run says](#how-much-one-real-data-run-says) |
+| 2026-09-25 | Repeating a discarded SPR proposal from its previous target alone | step 5 43.3 s to 37.1 s at 5,000, 490 nats worse after step 5; one draw, inside the spread, so not proven harmful but not worth 14 per cent |
 
 ## Notes
 
@@ -178,6 +188,59 @@ the exact search. At `r = 3` all of them are too, except 10,000 cells, where
 step 6 inherits what step 5 skipped. `SprSearch::Exact` keeps the specified
 search one line away, and `DEFAULT_REVISIT_RADIUS` in `src/search/spr.rs` has
 the table.
+
+### Lazy NNI
+
+The greedy phase performs one interchange per round and, as specified, rescores
+every edge every round, so it costs a full scan per move: 1.1 s a round at
+5,000 cells and 2.2 s at 10,000, for 27 and 44 moves. `NniSearch::Approximate`
+caches each edge's gain under the leaf set below it, rescores after a move only
+the edges within five edges of the clades the move created, and rescores the
+leading cached gain on the current tree before taking it, the lazy greedy
+evaluation of Minoux (1978). When nothing cached improves, a full scan runs, so
+the phase stops on exactly the condition the exact phase stops on.
+
+Measured 2026-09-25 on the thirteen-dataset grid of the revisit radius, steps 5
+to 8 with the default SPR: the finished tree matched the exact phase on all
+thirteen, loglikelihood, Robinson-Foulds and recovery to the last printed digit.
+On step 6 alone radius two and three drifted by 0.01 and 7.5 nats at 5,000
+cells; five was identical at both sizes. What is left per round is the settle,
+about 0.28 s at 10,000 cells, which a lazy row provider like SPR's could take
+away.
+
+### How much one real-data run says
+
+The finished tree on real data is sensitive to small upstream changes. Runs that
+differ only in the order SPR visits subtrees are equally valid searches, and
+they spread widely, measured 2026-09-25:
+
+| cells | SPR order | loglikelihood | Robinson-Foulds | recovery |
+|---|---|---|---|---|
+| 5,000 | longest branch, the default | -5,557,978 | 1,288 | 0.666 |
+| 5,000 | random, seed 1 | -5,558,223 | 1,274 | 0.581 |
+| 5,000 | random, seed 2 | -5,557,825 | 1,258 | 0.668 |
+| 5,000 | random, seed 3 | -5,557,834 | 1,275 | 0.665 |
+| 5,000 | random, seed 4 | -5,557,764 | 1,267 | 0.666 |
+| 10,000 | longest branch, the default | -11,252,721 | 2,624 | 0.476 |
+| 10,000 | random, seed 1 | -11,254,387 | 2,668 | 0.403 |
+| 10,000 | random, seed 2 | -11,253,896 | 2,563 | 0.479 |
+| 10,000 | random, seed 3 | -11,254,362 | 2,571 | 0.404 |
+
+About 460 nats and 0.58 to 0.67 in recovery at 5,000 cells, 1,700 nats and 0.40
+to 0.48 at 10,000. So a single-run difference of a few hundred nats is inside
+the noise at these sizes, and an approximation is only safe to call harmless
+when it reproduces the exact result outright, as lazy NNI does on all thirteen
+datasets. The revisit radius reproduces it on the 512-cell and low-noise sets;
+at 5,000 and 10,000 cells it lands 3 nats below and 467 above the exact search,
+both inside this spread. The same caution runs the other way: the 1,281-nat,
+0.38-recovery loss of a loose branch tolerance at 10,000 cells looks like one
+of the bad basins above rather than a measured cost of the tolerance.
+
+Two things about the search itself. The runs fall into two basins, one with
+visibly worse recovery, and the loglikelihood separates them every time, so a
+best-of-several run chosen by loglikelihood is a cheap way to avoid the bad one
+now that a run is a minute or three. And the specified longest-branch order is
+not dominated: random order did better at 5,000 cells and worse at 10,000.
 
 ### Splice pairs through the regrafted subtree
 

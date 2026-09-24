@@ -156,12 +156,14 @@ from: an SI equation, or ours by measurement. No constant is carried over from
 the published implementation, whose source is off limits under the licence
 position in `PROVENANCE.md`. Explicitly ours to determine: the neighbour count
 `k`, the kNN rebuild cadence, the placement-search tolerance, the ellipsoid
-`nsteps` schedule, the default backbone size and the SPR revisit radius.
+`nsteps` schedule, the default backbone size, the SPR revisit radius and the
+NNI rescore radius.
 
-SPR has an exact and an approximate mode, `SprSearch`, in the same spirit as
-`StartTree`: `Exact` is the search SPEC section 9.3 specifies, `Approximate` is
-the default and carries this crate's shortcuts, each measured across tree shapes
-and sizes before it was switched on.
+SPR and NNI each have an exact and an approximate mode, `SprSearch` and
+`NniSearch`, in the same spirit as `StartTree`: `Exact` is the search SPEC
+sections 9.3 and 9.4 specify, `Approximate` is the default and carries this
+crate's shortcuts, each measured across tree shapes and sizes before it was
+switched on.
 
 ## Errors
 

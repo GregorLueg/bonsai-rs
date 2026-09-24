@@ -106,6 +106,8 @@ numbers said so; it took a run at `RAYON_NUM_THREADS=1` to see it.
 | Parallel edge scan in `nni_greedy` | 2.0x on top of the 3.8x it borrowed, bit-identical |
 | Adaptive ellipsoid sizing on redraw-versus-walk cost | 0.109 s against 0.170 and 0.175 for fixed schedules either side |
 | `f64x4` tier on `edge_newton` | 0.95 to 0.71 ns per feature; 8 per cent of a whole run |
+| SPR acceptance into a slot store instead of an `O(n p)` state copy | 134.1 s to 101.4 s at 5,000 by 2,701, byte-identical tree |
+| SPR revisit radius 5, `SprSearch::Approximate` | steps 5 to 8 132.7 s to 84.8 s at 5,000 and 461.0 s to 257.8 s at 10,000, within a few nats everywhere |
 
 Three notes.
 
@@ -143,8 +145,11 @@ implicitly, since the arena invariant makes ascending index order a post-order.
 | Redrawing the linkage graph more often to stop it chaining | the chain was the cause, not the cadence |
 | Collapsing zero-length internal edges before step 5 | 589 s against 451 in SPR, on an eighth fewer nodes |
 | Merging every mutually-best pair a round instead of the single best | step 2 seven to eight times faster and scoring better, and the tree no better; the chaining is in the criterion |
+| Starting the SPR beam at the pruned subtree's origin only | 64 and 449 nats and 6 and 15 splits lost at 512; the 3 per cent of accepted moves that travel far carry real gain |
+| SPR revisit radius 3 | identical at 512, fine at 5,000, and at 10,000 step 6 inherits the work, 106 s to 273 s |
+| Scoring only the three splice pairs through the regrafted subtree | a few nats on synthetic data, 437 and 737 nats and distance recovery 0.67 to 0.54 on real; slower overall |
 
-Two deserve a paragraph.
+Four deserve a paragraph.
 
 **Feature subsampling.** The merge gain is a sum over `p` features, so estimating
 it on `p'` of them and rescaling looks like a free 30x. Measured over five
@@ -171,6 +176,39 @@ pair had. Measured at 64 and 128 members: 10 to 32 inversions over 61 to 125
 rounds, worst excess 3.6 to 13.2 nats, up to 60 per cent relative. Ward has no
 global remainder term and is reducible by construction, which is a second reason
 to prefer it for the starting tree.
+
+**Splice pairs through the regrafted subtree.** A regraft onto an internal node
+leaves a four-member star, which the star primitive resolves by scoring all six
+pairs. A pair and its complement build the same unrooted tree, so the three
+pairs containing the regrafted subtree already offer every topology, and only
+the three branch lengths the merge optimises differ. That looked like half the
+splice for free. Measured 2026-09-24 against the radius-5 default, it saved
+nothing in step 5 and cost everywhere else:
+
+| data | steps 5 to 8 | loglikelihood | Robinson-Foulds | recovery |
+|---|---|---|---|---|
+| 5,000 real, all six pairs | 84.8 s | -5,557,978 | 1,288 | 0.666 |
+| 5,000 real, three pairs | 131.3 s | -5,558,415 | 1,310 | 0.545 |
+| 10,000 real, all six pairs | 257.8 s | -11,252,721 | 2,624 | 0.476 |
+| 10,000 real, three pairs | 566.0 s | -11,253,458 | 2,567 | 0.384 |
+
+With the worse branch lengths SPR accepts 5 to 20 per cent more moves, each
+worth less, and NNI then runs two to four times longer cleaning up. Step 7's
+global branch optimisation does not repair the recovery loss, so the damage is
+in the topology the search walked into. On the synthetic grid the same change
+cost only 5 to 11 nats: the generator once more understated what real data
+showed.
+
+**The revisit radius.** After the first SPR sweep, only subtrees within `r`
+edges of a clade the previous sweep created are proposed again, the don't-look
+bits of TSP local search. Rounds after the first used to cost two thirds of
+step 5 for a quarter of its moves. Measured 2026-09-24 over thirteen datasets:
+balanced, random-branch and unbalanced trees at noise 0.4, 1.0 and 1.6 at 4,096
+by 1,000, plus the four Sanity-preprocessed configurations. At `r = 5` every one
+is within a few nats of the exact search. At `r = 3` all of them are too, except
+10,000 cells, where step 6 inherits what step 5 skipped. The approximation held
+at 5,000 and failed at 10,000, which is the argument for sweeping sizes and not
+only shapes. `SprSearch::Exact` keeps the specified search one line away.
 
 ## Which starting tree
 

@@ -4,7 +4,7 @@
 //! to find a cubic term in the merge, which turned out to be the candidate
 //! restrictions not being wired into the pipeline at all.
 //!
-//! Measured 2026-09-06 on a quiet machine, 200 features, seconds at 2048 leaves
+//! Reference figures, 200 features, seconds at 2048 leaves
 //! and the exponent over the last doubling:
 //!
 //! | step | seconds | `n^` |

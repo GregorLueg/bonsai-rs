@@ -1,9 +1,9 @@
 //! Branch-length optimisation.
 //!
-//! Implements SPEC.md section 6. Collapsing everything but one edge into an
-//! effective leaf on each side reduces the branch-length problem to a
-//! one-dimensional root find whose derivative is available in closed form, so
-//! there is no call to a general-purpose optimiser anywhere in this crate.
+//! Collapsing everything but one edge into an effective leaf on each side
+//! reduces the branch-length problem to a one-dimensional root find whose
+//! derivative is available in closed form, so there is no call to a
+//! general-purpose optimiser anywhere in this crate.
 
 use crate::errors::BonsaiErrors;
 use crate::utils::kernels::edge_loglik;
@@ -47,15 +47,15 @@ const BRANCH_TOL: f64 = 1e-12;
 /// bracket rather than from a change of variable.
 ///
 /// Two details decide the iteration count, which is the cost of every merge,
-/// placement and branch solve in the crate. Both measured 2026-09-12 on the SPR
-/// beam at 1024 leaves by 2000 features, 76752 solves:
+/// placement and branch solve in the crate, and both are measured over the
+/// solves the SPR beam makes on a real search:
 ///
 /// - **Where it starts.** `upper` is a maximum over features and sits an order
 ///   of magnitude above the root, so from `upper / 2` the first three or four
 ///   steps are bisections. The mean of `d - s` over features is the exact
 ///   optimum when the features agree and lands inside Newton's basin when they
 ///   do not. The neighbour's optimum, which the beam could hand down, was
-///   tried and is worse: 8.3 iterations per solve against 5.8 from the mean.
+///   tried and is worse, by around half again as many iterations per solve.
 /// - **When it stops.** Convergence is tested on the Newton correction before
 ///   the safeguard sees it. Near the root the correction points exactly at a
 ///   bracket end, the safeguard refuses it as not strictly inside, and the loop
@@ -271,8 +271,8 @@ mod tests {
 
     #[test]
     fn test_a_non_finite_edge_is_an_error_and_not_a_branch_length() {
-        // Adversarial review 2026-08-27, N11. Every comparison against a `NaN`
-        // is false, so a `NaN` used to skip the early return, then send `hi = t`
+        // Every comparison against a `NaN` is false, so a `NaN` used to skip
+        // the early return, then send `hi = t`
         // on every iteration, and come back as `Ok(6.2e-25)`: a garbage branch
         // length reported as a success.
         for (s, d, upper) in [

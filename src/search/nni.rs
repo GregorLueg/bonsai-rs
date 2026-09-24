@@ -44,9 +44,9 @@
 //! the rounding floor of an interchange gain is `O(p eps)` and not
 //! `O(n p eps)`, and [`StarParams::min_gain`] is the right floor for it at any
 //! `n`. [`crate::search::spr`] scores its candidates the other way, on the
-//! whole-tree figure, and needs a floor that scales with `n p`; measured
-//! 2026-09-13 at 10,000 cells by 2,767 genes, every one of the 89 accepted
-//! interchanges gained between 0.08 and 26 nats and none was rounding.
+//! whole-tree figure, and needs a floor that scales with `n p`. Measured on
+//! realistic data at ten thousand cells, every accepted interchange here gained
+//! well clear of a nat and none was rounding.
 //!
 //! ### This is a topology search and only a topology search
 //!
@@ -54,10 +54,9 @@
 //! were is not an interchange at all: it is a reoptimisation of the three
 //! branches the star primitive creates at `l`, and it nearly always gains a
 //! little. Accepting those turns the greedy phase into an extremely expensive
-//! branch-length descent. Measured 2026-08-31, starting from the generating
-//! tree itself at 32 to 64 leaves and 256 features, that ran for 104 to 239
-//! rounds with the Robinson-Foulds distance to the truth pinned at zero
-//! throughout. So a proposal is discarded unless it changes the tree's splits;
+//! branch-length descent: started from the generating tree itself it runs for
+//! hundreds of rounds with the Robinson-Foulds distance to the truth pinned at
+//! zero throughout. So a proposal is discarded unless it changes the splits;
 //! branch lengths are search steps 4 and 7, which do the same job globally and
 //! for a fraction of the cost.
 
@@ -94,13 +93,11 @@ const MIN_INTERCHANGE_MEMBERS: usize = 4;
 ///
 /// One round performs one move, so the requirement is the number of
 /// interchanges between the starting topology and the local optimum, and that
-/// grows with the leaf count. Measured 2026-08-31 on simulated data at 256
-/// features, starting from a ladder with its branch lengths already at the step
-/// 4 optimum and running to a Robinson-Foulds distance of zero from the
-/// generating tree: 23 rounds at 32 leaves and 53 at 64, which is a shade under
-/// one round per leaf. The default therefore covers roughly ten thousand
-/// leaves; beyond that a caller should raise it rather than accept a truncated
-/// search.
+/// grows with the leaf count. Measured from a ladder at the step 4 optimum,
+/// running to a Robinson-Foulds distance of zero from the generating tree, it
+/// comes out a shade under one round per leaf. The default therefore covers
+/// roughly ten thousand leaves; beyond that a caller should raise it rather
+/// than accept a truncated search.
 const DEFAULT_MAX_ROUNDS: usize = 10_000;
 
 /// Default for [`NniParams::n_random`].
@@ -112,24 +109,24 @@ const DEFAULT_MAX_ROUNDS: usize = 10_000;
 /// It is also weaker than it looks at the feature counts this crate expects.
 /// The sampling weight is a softmax over tree loglikelihoods, whose gaps are
 /// `O(p)` nats, so it concentrates on the greedy pick as `p` grows. Measured
-/// 2026-08-31 at 32 leaves, eight moves and eight seeds: at 8 features all
-/// eight seeds moved the tree off its starting topology, at 32 features four,
-/// and at 128 and 512 features two and three. So a budget buys real
-/// diversification on small feature sets and mostly buys branch-length
-/// reoptimisation on large ones.
+/// over seeds at a fixed leaf count, the fraction that move the tree off its
+/// starting topology at all falls away by a couple of hundred features. So a
+/// budget buys real diversification on small feature sets and mostly buys
+/// branch-length reoptimisation on large ones.
 const DEFAULT_RANDOM_MOVES: usize = 0;
 
 /// Default for [`NniParams::n_restarts`].
 ///
 /// Zero: one random phase, if any, then one greedy phase, which is the
 /// composition SPEC.md section 9.4 describes. Measured against iterated local
-/// search on 2026-09-13; see [`nni`].
+/// search; see [`nni`].
 const DEFAULT_RESTARTS: usize = 0;
 
 /// Default for [`NniParams::temperature`].
 ///
 /// One is the specification's distribution: weights proportional to the
-/// likelihood of the resulting tree. Measured 2026-09-13; see [`nni_random`].
+/// likelihood of the resulting tree. Ours only in the sense of being the
+/// neutral setting; see [`nni_random`].
 pub const DEFAULT_RANDOM_TEMPERATURE: f64 = 1.0;
 
 /// Tuning knobs for search step 6.
@@ -658,25 +655,18 @@ pub fn nni_random<T: BonsaiFloat>(
 /// round. What is left per round is the one settling sweep every candidate
 /// reads its rows from, and the star primitive itself once per edge.
 ///
-/// Measured 2026-09-06 at 200 features on the tree search step 5 leaves
-/// behind, on the two sizes where the phase happened to run exactly one round
-/// so that the move count cannot confound the timing: **0.238 s at 1024 leaves
-/// and 1.979 s at 4096 before, `n^1.53`, against 0.125 s and 0.512 s after,
-/// `n^1.02`.** The whole phase was `n^3.05` in `benches/steps.rs` because the
-/// round count grows on top of that.
+/// A round is linear in the leaf count on this arrangement, against
+/// superlinear when the filter spliced a tree per candidate.
 ///
 /// **What was expensive was not what it looked like.** The `O(n p)` re-prune
 /// per candidate is nearly free at this point in the search, because the
-/// topology filter discards almost everything before it: counted over the same
-/// runs, every one of the 1021 to 4093 eligible edges produced merges and
-/// between zero and one of them per round changed a split. The quadratic was
-/// the filter itself, which spliced a whole tree and fingerprinted it to answer
-/// a question about one star's ancestors. Scoring on the exact gain rather than
-/// on a re-prune is what makes the *other* end of the search cheap, where the
-/// tree is far from converged and a large fraction of proposals do change a
-/// split: over the forty fixtures of 32 to 256 leaves and 16 to 256 features
-/// used for the identical-tree check, the longest of which takes 240 moves from
-/// a ladder, the two phases together are 1.44 times faster.
+/// topology filter discards almost everything before it: near convergence at
+/// most one eligible edge per round changes a split at all. The cost was the
+/// filter itself, which spliced a whole tree and fingerprinted it to answer a
+/// question about one star's ancestors. Scoring on the exact gain rather than
+/// on a re-prune is also what makes the *other* end of the search cheap, where
+/// the tree is far from converged and a large fraction of proposals do change
+/// a split.
 ///
 /// ### Params
 ///
@@ -748,11 +738,10 @@ pub fn nni_greedy<T: BonsaiFloat>(
                     // the star primitive creates at `l`. Those nearly always gain a
                     // little, and taking them turns the phase into branch-length
                     // descent that steps 4 and 7 do properly and far more cheaply.
-                    // Measured 2026-08-31: from the generating tree itself, at 32 to 64
-                    // leaves and 256 features, accepting them ran 104 to 239 rounds
-                    // with the Robinson-Foulds distance pinned at zero throughout, so
-                    // every one of those rounds was branch lengths and none was
-                    // topology.
+                    // Started from the generating tree itself, accepting them
+                    // runs hundreds of rounds with the Robinson-Foulds distance
+                    // pinned at zero throughout: every one of those rounds is
+                    // branch lengths and none is topology.
                     let k_lo = tree.children(l).len() - 1;
                     let k_hi = k_lo + tree.children(k).len();
                     let last = star.member_nodes.len() - 1;
@@ -1148,10 +1137,10 @@ mod tests {
         }
         println!("{checked} edges, worst absolute disagreement {worst:e} nats");
         assert!(checked > 100, "only {checked} edges exercised");
-        // Measured 2026-09-06 at 3.0e-13 nats over these 174 edges, against
-        // tree loglikelihoods of `O(1e3)`. The bound is set three orders above
-        // that and one below the `min_gain` a move has to clear, which is what
-        // it has to stay under for the search's answer not to turn on it.
+        // The worst disagreement measured here is `O(1e-13)` nats against tree
+        // loglikelihoods of `O(1e3)`. The bound sits three orders above that and
+        // one below the `min_gain` a move has to clear, which is what it has to
+        // stay under for the search's answer not to turn on it.
         assert!(worst < 1e-10, "worst disagreement {worst:e} nats");
     }
 

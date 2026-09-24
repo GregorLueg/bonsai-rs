@@ -36,7 +36,7 @@ use crate::utils::traits::{BonsaiFloat, narrow, wide};
 /// contrib = 1/2 * sum_g [ log reduced - reduced * (m_l - m_k)^2 ]
 /// ```
 ///
-/// Two rewrites of the SI form are load-bearing and are explained at their use
+/// Two rewrites of the SI form matter and are explained at their use
 /// sites: the three logarithms collapse into one, and the effective mean is a
 /// convex combination rather than a ratio of sums.
 ///

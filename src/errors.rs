@@ -99,6 +99,11 @@ pub enum BonsaiErrors {
         cap: f64,
     },
 
+    /// Sanity itself refused the counts, before any conversion was attempted.
+    #[cfg(feature = "sanity")]
+    #[error("Sanity failed: {0}")]
+    Sanity(#[from] sanity_sc_rs::errors::SanityErrors),
+
     /// A caller-supplied parameter was outside its valid range.
     ///
     /// Distinct from `MalformedTree`: the tree is fine, the knob is not.

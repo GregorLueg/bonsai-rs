@@ -31,7 +31,7 @@
 //!
 //! At roughly three cycles per feature it sat close to both the two-chain FMA
 //! latency bound and the `f64` division throughput bound, which want opposite
-//! fixes. The variants below settle it. Measured 2026-09-12 on an M1 Max,
+//! fixes. The variants below settle it. Reference figures,
 //! `P = 2000`, load average 3.5 rather than a quiet machine, so read the small
 //! differences as noise:
 //!

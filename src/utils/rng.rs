@@ -100,7 +100,7 @@ impl SplitMix64 {
     /// which is what keeps both ends open. `(bits + 1) / 2^53` is exactly `1.0`
     /// on the largest of the `2^53` mantissas, whose logarithm is zero, and an
     /// exponential of exactly zero is a variance of zero that the simulator
-    /// divides by (adversarial review N14). Half a bit does not fix that at 53:
+    /// divides by. Half a bit does not fix that at 53:
     /// the spacing just below `2^53` is `1`, so `2^53 - 0.5` rounds straight
     /// back up to `2^53`. At 52 it is `0.5`, the offset survives, and the
     /// extreme draws are `2^-53` and `1 - 2^-53`. One draw in `2^53` either way,
@@ -282,8 +282,8 @@ mod tests {
 
     #[test]
     fn test_the_open_uniform_never_reaches_either_end() {
-        // Adversarial review 2026-08-27, N14. `(bits + 1) / 2^53` is exactly
-        // `1.0` on the largest of the `2^53` mantissas, and `ln(1) == 0` makes
+        // `(bits + 1) / 2^53` is exactly `1.0` on the largest of the `2^53`
+        // mantissas, and `ln(1) == 0` makes
         // `exponential` return zero from a routine documented as strictly
         // positive. The simulator then divides by the square root of it.
         for out in [u64::MAX, 0, 2048, u64::MAX - 2047] {

@@ -24,8 +24,13 @@ ann-search-rs = "0.8.4"
 num-traits = "0.2.19"
 rayon = "1.11.0"
 rustc-hash = "2.1.1"
+sanity-sc-rs = { version = "0.0.1", optional = true }
 thiserror = "2.0.18"
 wide = "1.4.0"
+
+[features]
+## Raw UMI counts in, via Sanity posteriors: `ingest::from_sanity_output`.
+sanity = ["dep:sanity-sc-rs"]
 
 [dev-dependencies]
 approx = "0.5.1"

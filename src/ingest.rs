@@ -803,6 +803,52 @@ pub fn from_sanity<T: BonsaiFloat>(
     })
 }
 
+/// [`from_sanity`] straight from a `sanity-sc-rs` run.
+///
+/// Takes `log_fold_changes` as `xstar`, **not** the log transcription quotients
+/// `m + d_c`. S5 inverts a zero-mean `N(0, v)` prior, so the posterior it
+/// undoes is the one on the fold change; handing it `m + d_c` multiplies the
+/// gene mean by a per-cell amplification and invents structure.
+///
+/// Sanity writes gene-major (`g * n_cells + c`); both matrices are transposed
+/// to `[cell][gene]` here.
+///
+/// ### Params
+///
+/// * `out` - A finished Sanity run, from `sanity` or `sanity_select`
+/// * `params` - Knobs, or `None` for [`IngestParams::default`]
+///
+/// ### Returns
+///
+/// As [`from_sanity`], except that `features` and `dropped` index the gene axis
+/// of the counts Sanity was given, not Sanity's output rows.
+#[cfg(feature = "sanity")]
+pub fn from_sanity_output<T: BonsaiFloat + sanity_sc_rs::float::SanityFloat>(
+    out: &sanity_sc_rs::SanityOutput<T>,
+    params: Option<IngestParams>,
+) -> Result<SanityLikelihood<T>, BonsaiErrors> {
+    let (n_cells, n_genes) = (out.n_cells, out.n_genes);
+    let mut means = vec![T::zero(); n_cells * n_genes];
+    let mut sds = vec![T::zero(); n_cells * n_genes];
+    means
+        .par_chunks_mut(n_genes.max(1))
+        .zip(sds.par_chunks_mut(n_genes.max(1)))
+        .enumerate()
+        .for_each(|(cell, (m_row, s_row))| {
+            for g in 0..n_genes {
+                m_row[g] = out.log_fold_changes[g * n_cells + cell];
+                s_row[g] = out.error_bars[g * n_cells + cell];
+            }
+        });
+    let variances: Vec<f64> = out.variance.iter().map(|&v| wide(v)).collect();
+
+    let mut lik = from_sanity(&means, &sds, n_cells, n_genes, &variances, params)?;
+    for k in lik.features.iter_mut().chain(lik.dropped.iter_mut()) {
+        *k = out.genes[*k];
+    }
+    Ok(lik)
+}
+
 ///////////
 // Tests //
 ///////////
@@ -1327,5 +1373,63 @@ mod tests {
                 max_relative = 1e-5
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "sanity"))]
+mod sanity_tests {
+    use super::*;
+    use crate::bonsai::bonsai;
+    use crate::tree::distance::{MAX_PAIRS, distance_recovery};
+    use crate::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand_distr::{Distribution, LogNormal, Poisson};
+    use sanity_sc_rs::input::CountMatrix;
+    use sanity_sc_rs::sanity;
+
+    #[test]
+    fn test_counts_through_sanity_recover_the_tree() {
+        let (n, p) = (64, 300);
+        let sim = simulate_binary::<f64>(Some(SimulationParams {
+            n_leaves: n,
+            n_features: p,
+            seed: 11,
+            ..SimulationParams::default()
+        }))
+        .unwrap();
+
+        // Counts of SPEC 13.1: the noise-free leaf positions, back on the raw
+        // scale, as log fold changes about a per-gene mean quotient.
+        let mut rng = StdRng::seed_from_u64(3);
+        let library = LogNormal::new(8.0f64, 0.3).unwrap();
+        let totals: Vec<f64> = (0..n).map(|_| library.sample(&mut rng).round()).collect();
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        let mut indptr = vec![0usize];
+        for g in 0..p {
+            let log_q = -(p as f64).ln() + 2.0 * (g as f64 / p as f64 - 0.5);
+            let scale = sim.variances[g].sqrt();
+            for c in 0..n {
+                let rate = totals[c] * (log_q + sim.truth[c * p + g] * scale).exp();
+                let k = Poisson::new(rate).unwrap().sample(&mut rng) as u32;
+                if k > 0 {
+                    indices.push(c as u32);
+                    values.push(k);
+                }
+            }
+            indptr.push(indices.len());
+        }
+        let counts = CountMatrix::new(indices, values, indptr, n).unwrap();
+        let out = sanity::<f64>(&counts, &totals, None).unwrap();
+
+        let lik = from_sanity_output(&out, None).unwrap();
+        let n_kept = lik.features.len();
+        let res = bonsai(&lik.means, &lik.sds, n, n_kept, Some(&lik.variances), None).unwrap();
+
+        // Measured 2026-09-24: RF 0 and recovery 0.950. The same run fed the
+        // log transcription quotients lands at RF 100 of 122 and 0.016.
+        assert!(robinson_foulds(&res.tree, &sim.tree).unwrap() <= 6);
+        assert!(distance_recovery(&res.tree, &sim.truth, p, MAX_PAIRS, 0) > 0.8);
     }
 }

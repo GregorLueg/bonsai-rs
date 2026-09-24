@@ -1,0 +1,20 @@
+name: Test the package
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: GregorLueg/personal-actions/.github/workflows/rust-test.yml@v1
+    with:
+      # `sanity` carries the counts-to-tree test; it is not a default feature.
+      cpu-args: '--release --features sanity'
+      # No GPU lane: bonsai-rs is CPU only.
+    secrets: inherit

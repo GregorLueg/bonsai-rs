@@ -1,0 +1,101 @@
+[package]
+name = "bonsai-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["Gregor Lueg <gregorlueg@me.com>"]
+license = "MIT"
+description = "Tree representations of high-dimensional data under Brownian motion. A clean-room Rust implementation of the Bonsai algorithm for single cell and computational biology applications."
+repository = "https://github.com/GregorLueg/bonsai-rs"
+keywords = ["bioinformatics", "single-cell", "phylogenetics", "tree", "visualisation"]
+categories = [
+    "algorithms",
+    "science::bioinformatics",
+    "science::computational-biology",
+]
+# The comparison figures are for the repository, not for the published tarball.
+exclude = ["docs/figures/*"]
+
+[lib]
+name = "bonsai_rs"
+path = "src/lib.rs"
+
+[dependencies]
+ann-search-rs = "0.8.4"
+num-traits = "0.2.19"
+rayon = "1.11.0"
+rustc-hash = "2.1.1"
+sanity-sc-rs = { version = "0.0.1", optional = true }
+thiserror = "2.0.18"
+wide = "1.4.0"
+
+[features]
+## Raw UMI counts in, via Sanity posteriors: `ingest::from_sanity_output`.
+sanity = ["dep:sanity-sc-rs"]
+
+[dev-dependencies]
+approx = "0.5.1"
+rand = "0.9.2"
+rand_distr = "0.5.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+[profile.test]
+opt-level = 2
+
+###########
+# Benches #
+###########
+
+## Pruning sweep timings and the numerical cross-check against the numpy
+## reference.
+[[bench]]
+name = "prune_sweep"
+harness = false
+
+## One full round of candidate-pair scoring, which is what decides whether the
+## tree search is viable.
+[[bench]]
+name = "merge_scan"
+harness = false
+
+## Single-threaded throughput per kernel, for identifying which wall each one
+## hits.
+[[bench]]
+name = "kernels"
+harness = false
+
+## End-to-end scaling of the whole search.
+[[bench]]
+name = "pipeline"
+harness = false
+
+## Per-step attribution within the search.
+[[bench]]
+name = "steps"
+harness = false
+
+## Distance recovery, the paper's Fig. S8 metric.
+[[bench]]
+name = "recovery"
+harness = false
+
+## Does step 2 earn its keep? Four starting trees through the identical
+## refinement.
+[[bench]]
+name = "start_tree"
+harness = false
+
+## Reducibility of the merge score and how far the feature axis can be
+## subsampled.
+[[bench]]
+name = "approx_star"
+harness = false
+
+## Step 6 on the tree step 5 leaves behind, and what the knobs around it buy
+## in loglikelihood and Robinson-Foulds.
+[[bench]]
+name = "nni_real"
+harness = false

@@ -467,6 +467,18 @@ recovery worse (RF 44 to 24 rather than to 0), because the landscape is then
 dominated by wrong branch lengths and the only improvements available are the
 ones the filter rejects.
 
+**Deviation: the default greedy phase rescores lazily, 2026-09-25.** Taken
+literally the greedy phase scores every edge every round and performs one move,
+so it costs a full scan per move. This crate's default (`NniSearch::Approximate`)
+caches each edge's gain, rescores after a move only the edges within five edges
+of the clades the move created, and rescores the leading cached gain on the
+current tree before taking it (lazy greedy evaluation, Minoux 1978). A full scan
+runs whenever nothing cached improves, so the phase still stops only where no
+edge improves. On thirteen datasets across three tree shapes, three noise levels
+and four real-data configurations up to 10,000 cells, the finished tree matched
+`NniSearch::Exact` on every one, with step 6 five to eight times faster where
+it had work to do.
+
 **The random phase is close to inert at realistic feature counts.** This is a
 property of the method as published, not of this implementation. The softmax is
 over loglikelihoods whose gaps scale as `O(p)`, so it concentrates on the greedy

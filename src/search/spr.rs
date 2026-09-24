@@ -91,7 +91,9 @@ use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place};
 use crate::search::polytomy::{CentreStar, splice_star};
 use crate::search::star::StarParams;
-use crate::search::{Leaves, leaf_words, settled_down, split_fingerprint_with, tree_loglik};
+use crate::search::{
+    Leaves, leaf_words, mark_near_new_clades, settled_down, split_fingerprint_with, tree_loglik,
+};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
@@ -100,7 +102,6 @@ use crate::utils::traits::{BonsaiFloat, narrow, wide};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::OnceCell;
-use std::collections::VecDeque;
 
 ////////////////
 // Parameters //
@@ -1610,50 +1611,6 @@ pub fn spr_round<T: BonsaiFloat>(
     Ok(sweep(tree, leaves, params.unwrap_or_default(), None)?.0)
 }
 
-/// Words of every node within `radius` edges of a clade a move created.
-///
-/// A created clade is a node of the new tree with no counterpart in the old
-/// one, which is exactly the path the move rewired. The walk is unrooted, so it
-/// reaches the pruned subtree and its new siblings as well as the ancestors.
-///
-/// ### Params
-///
-/// * `tree` - The tree the move produced
-/// * `to_old` - Per node of `tree`, its node in the tree before, or [`NO_NODE`]
-/// * `word` - [`leaf_words`] of `tree`
-/// * `radius` - How many edges out to mark
-/// * `out` - Set the words are added to
-fn mark_revisits(
-    tree: &Tree,
-    to_old: &[u32],
-    word: &[u64],
-    radius: usize,
-    out: &mut FxHashSet<u64>,
-) {
-    let n = tree.n_nodes();
-    let mut dist = vec![usize::MAX; n];
-    let mut queue = VecDeque::new();
-    for v in tree.n_leaves()..n {
-        if to_old[v] == NO_NODE {
-            dist[v] = 0;
-            queue.push_back(v as u32);
-        }
-    }
-    while let Some(v) = queue.pop_front() {
-        out.insert(word[v as usize]);
-        let d = dist[v as usize];
-        if d == radius {
-            continue;
-        }
-        for nb in tree.children(v).iter().copied().chain(tree.parent(v)) {
-            if dist[nb as usize] == usize::MAX {
-                dist[nb as usize] = d + 1;
-                queue.push_back(nb);
-            }
-        }
-    }
-}
-
 /// One sweep, optionally restricted to the subtrees a previous sweep touched.
 ///
 /// ### Params
@@ -1666,7 +1623,7 @@ fn mark_revisits(
 ///
 /// ### Returns
 ///
-/// The round's result and the words [`mark_revisits`] collected from its
+/// The round's result and the words [`mark_near_new_clades`] collected from its
 /// accepted moves, empty when the search revisits everything, or the
 /// error the placement, the primitive or the arena failed with.
 fn sweep<T: BonsaiFloat>(
@@ -1725,10 +1682,10 @@ fn sweep<T: BonsaiFloat>(
             here = split_fingerprint_with(&tree, &word);
             by_word = word_index(&word);
             if params.search.revisit_radius() > 0 {
-                mark_revisits(
+                mark_near_new_clades(
                     &tree,
-                    &proposal.to_old,
                     &word,
+                    |v| proposal.to_old[v] == NO_NODE,
                     params.search.revisit_radius(),
                     &mut revisit,
                 );

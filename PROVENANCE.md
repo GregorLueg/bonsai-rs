@@ -29,27 +29,32 @@ textbook.
 reads or greps it, its Zenodo drop or any mirror. Not directly, not in a sibling
 worktree, not through a subagent.
 
+One thing no session rule covers: the reference is public, so it may be in a
+model's pretraining data. That can't be ruled out. The answer is the same as for
+a human who once saw the code: the implementation is written from
+`docs/SPEC.md`, and this file records how.
+
 ## Disclosure
 
-A proposal session in August 2026, before this repository existed, read the
-reference source while assessing feasibility. That proposal
-(`bixverse-project/proposals/bonsai-rs.md`) is not an implementation source.
-What it carried across was SI.B maths or criticism of their engineering.
-Every design decision here comes from `docs/SPEC.md`.
+A Claude Code session (Claude Opus 5.0) in August 2026, before this repository
+existed, read the reference source while drafting a feasibility proposal. That
+proposal (`bixverse-project/proposals/bonsai-rs.md`) is not an implementation
+source. What it carried across was SI.B maths or criticism of their
+engineering. Every design decision here comes from `docs/SPEC.md`.
 
 ## Comparison harness, 2026-09-06
 
 A black-box comparison was run as a two-team clean room.
 
-A separate agent got read access to a local clone of the reference **for
-interface only**: how to invoke it, what input it expects, what it emits. It
-could not read the source to learn the method, could not write inside this
-repository, and reported results only. Excluded from its report: algorithm
+A separate Claude Code session (Claude Opus 5.0) got read access to a local
+clone of the reference **for interface only**: how to invoke it, what input it
+expects, what it emits. It could not read the source to learn the method, could
+not write inside this repository, and reported results only. Excluded from its report: algorithm
 descriptions, code structure, numerical methods, and performance explanations
 drawn from the source.
 
-No session that writes this crate's code has read that clone. The harness lives
-at `~/repos/others/bonsai-comparison`, outside the crate.
+No Claude Code session that writes this crate's code has read that clone. The
+harness lives at `~/repos/others/bonsai-comparison`, outside the crate.
 
 The first comparison used this crate's simulated data (SPEC 13.1, the SI.E.2
 recipe). Later runs used Baron pancreas (GSE84133, public GEO),
@@ -81,13 +86,14 @@ have that in front of it.
 ## Harness published, 2026-09-25
 
 `reference/comparison/` is the harness minus everything that touches the
-reference. A Claude Code subagent, with no access to the clone (a sibling
-directory, never entered), audited the harness and staged the copy. It removed:
-the scripts that invoke the reference, a data export in the reference's input
-layout, a compatibility step for the reference's file naming, a parser for the
-reference's log format, a scorer loop over the reference's intermediate outputs,
-and comments naming its CLI flags or defaults. The session writing this crate
-then reviewed the staged copy, which by then contained none of that. The data
+reference. Two Claude Code subagents (Claude Sonnet 5), told to stay out of
+the clone (a sibling directory, never entered), audited the harness and staged
+the copy. They removed: the scripts that invoke the reference, a data export in
+the reference's input layout, a compatibility step for the reference's file
+naming, a parser for the reference's log format, a scorer loop over the
+reference's intermediate outputs, and comments naming its CLI flags or
+defaults. The Claude Code session (Claude Opus 5.5) that dispatched them
+reviewed the staged copy, which by then contained none of that. The data
 generator follows SI section E and Sanity's documented interface; the author
 states the harness contains no reference code, and the audit found no imports,
 paths or copied content from the clone.

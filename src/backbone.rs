@@ -1,22 +1,29 @@
 //! Backbone mode: reconstruct on a subset, then place the rest.
 //!
 //! Four steps: preprocess everything, run the standard algorithm on a random
-//! subset to get a backbone, place the remaining cells on it one at a time,
-//! then refine the whole thing.
+//! subset to get a backbone, place the remaining cells on it in rounds, then
+//! refine the whole thing.
 //!
 //! ### What this does and does not buy
 //!
 //! It replaces the standard search's cost on `n` cells with its cost on the
-//! backbone plus one placement per remaining cell. The merge step is what it
-//! avoids, and the merge is not the expensive step: SPR is, and the final
+//! backbone plus one placement per remaining cell. The start is what it
+//! avoids, and the start is not the expensive step: SPR is, and the final
 //! refinement runs SPR over every cell however the backbone was built. **So on
 //! its own this trades away the cheap step and keeps the expensive one.** It is
 //! worth having because it composes with anything that makes SPR cheaper.
 //!
+//! Measured, 2026-09-25, Baron 10k: 336 s against 211 s for the linkage-start
+//! search, 8k nats below it. The grown tree matches the linkage start on
+//! loglikelihood at a 4096-cell backbone, but the refinement still costs more
+//! from it (253 s against 205 s), NNI above all. What the refinement costs
+//! tracks the quality of its start, 42 s from a converged tree, so this only
+//! pays once a grown tree beats the linkage start outright.
+//!
 //! ### The one place this differs from the standard algorithm's answer
 //!
 //! Placement is a beam search with a tolerance, not an exhaustive scan, and a
-//! cell placed early cannot see cells placed after it. So this is an
+//! cell cannot see cells placed in its own round or after it. So this is an
 //! approximation and its trees are not guaranteed identical to the standard
 //! algorithm's. The paper is explicit that backbone mode trades accuracy for
 //! time. What that costs is measured in the tests rather than assumed.
@@ -29,13 +36,16 @@
 use crate::bonsai::{BonsaiParams, BonsaiResult, bonsai_prepared, refine};
 use crate::errors::BonsaiErrors;
 use crate::ingest::PreparedData;
-use crate::model::global::{collapse_onto_every_node, optimise_branch_lengths};
+use crate::model::global::{GlobalBranchParams, collapse_onto_every_node, optimise_branch_lengths};
 use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
-use crate::model::place::{PlacementParams, place};
+use crate::model::place::{Placement, PlacementParams, place_from};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::{BonsaiFloat, narrow};
+use ann_search_rs::{build_exhaustive_index, query_exhaustive_index};
+use rayon::prelude::*;
+use std::time::Instant;
 
 ////////////
 // Consts //
@@ -45,20 +55,41 @@ use crate::utils::traits::{BonsaiFloat, narrow};
 ///
 /// The backbone has to be large enough to carry the structure the rest of the
 /// cells will be placed against; too small and every placement is deciding
-/// between branches that are not there yet. The paper suggests ten
-/// thousand. This crate's default is smaller because the standard search is
-/// still `n^1.8`, so a ten thousand cell backbone is most of the total cost;
-/// raise it once that changes. Ours, and a starting point rather than a
-/// recovery measurement.
-pub const DEFAULT_BACKBONE_CELLS: usize = 2048;
-
-/// Fraction of growth after which the branch lengths are reoptimised.
+/// between branches that are not there yet. The paper suggests ten thousand.
 ///
-/// The Methods note the backbone changes appreciably as cells are added, so a
-/// tree grown far past its last optimisation is being placed against stale
-/// branch lengths. A quarter means four reoptimisations per doubling.
-/// Ours; see `test_reoptimisation_cadence_changes_the_result`.
-pub const DEFAULT_REGROW_FRACTION: f64 = 0.25;
+/// Ours, measured 2026-09-25 on Baron 10k. Grown-tree loglikelihood after
+/// branch optimisation, against the seed search's cost: 1024 cells -11,460,009
+/// in 15 s, 2048 -11,378,038 in 40 s, 4096 -11,326,618 in 75 s, the last level
+/// with the linkage start's -11,327,995. End to end 4096 took 336 s and 2048
+/// 372 s, one run each.
+pub const DEFAULT_BACKBONE_CELLS: usize = 4096;
+
+/// Growth per placement round, as a fraction of the current leaf count.
+///
+/// Each round places its cells against one collapse of the tree as it stood, so
+/// a cell cannot see its own round. Smaller rounds cost a collapse each and buy
+/// sight of more of the tree. Ours, measured 2026-09-25 on Baron 10k with a
+/// 2048-cell backbone: 0.05 grew a tree 16k nats better than 0.25 for 7 s more
+/// placement, and a single round was 43k worse than 0.25.
+pub const DEFAULT_REGROW_FRACTION: f64 = 0.05;
+
+/// Metric for [`Growing::nearest_leaves`], as `ann_search_rs` spells it.
+const NEAREST_METRIC: &str = "euclidean";
+
+/// Nearest leaves each cell's beam search starts from, on top of its spread
+/// starts.
+///
+/// The beam's own starts are spread over the node index, and on a 10k-cell
+/// tree they leave it in a local optimum: exhaustive placement grew a tree
+/// 650k nats better than the beam at the shipped tolerance. Starting next to
+/// the cell's nearest neighbours puts the search in the right basin.
+///
+/// Ours, measured 2026-09-25 on Baron 10k with a 2048-cell backbone, grown
+/// loglikelihood after branch optimisation: none -12,031,580, 4 leaves
+/// -11,411,956, 16 leaves -11,389,458, exhaustive -11,378,943. Placement stayed
+/// near 5 s throughout; exhaustive took 314 s. Widening the beam instead gets
+/// less: tolerance 100 with the spread starts reached -11,463,839.
+pub const DEFAULT_LEAF_STARTS: usize = 16;
 
 ////////////////////
 // BackboneParams //
@@ -69,13 +100,23 @@ pub const DEFAULT_REGROW_FRACTION: f64 = 0.25;
 pub struct BackboneParams {
     /// Cells in the initial backbone.
     pub backbone_cells: usize,
-    /// Reoptimise the branch lengths once the tree has grown by this fraction
-    /// since the last time.
+    /// Growth per placement round as a fraction of the current leaf count.
     pub regrow_fraction: f64,
     /// Seed for choosing the backbone subset.
     pub seed: u64,
+    /// Nearest current leaves, in Euclidean distance over the means, handed to
+    /// the beam search as extra start points for each cell. Zero for the
+    /// beam's own spread starts only.
+    pub leaf_starts: usize,
     /// Placement search knobs for the growth phase.
     pub placement: PlacementParams,
+    /// Stopping rule for reoptimising the branch lengths between rounds, which
+    /// SPEC.md section 15 does and this skips by default: `max_iter: 0` skips
+    /// it. Measured 2026-09-25 on Baron 10k, 2048-cell backbone, quarter
+    /// rounds: the full reoptimisation cost 87 s and grew a tree 4k nats better
+    /// than none. Resolving the polytomies between rounds as well (SPEC.md
+    /// section 7.3) bought 6.5k nats for 107 s and is not offered.
+    pub growth_branch: GlobalBranchParams,
     /// Everything the standard algorithm takes, used for the backbone and for
     /// the final refinement.
     pub bonsai: BonsaiParams,
@@ -88,7 +129,12 @@ impl Default for BackboneParams {
             backbone_cells: DEFAULT_BACKBONE_CELLS,
             regrow_fraction: DEFAULT_REGROW_FRACTION,
             seed: 0,
+            leaf_starts: DEFAULT_LEAF_STARTS,
             placement: PlacementParams::default(),
+            growth_branch: GlobalBranchParams {
+                max_iter: 0,
+                ..GlobalBranchParams::default()
+            },
             bonsai: BonsaiParams::default(),
         }
     }
@@ -103,16 +149,51 @@ impl Default for BackboneParams {
 pub struct BackboneReport {
     /// Cells in the initial backbone.
     pub backbone_cells: usize,
-    /// Cells added one at a time afterwards.
+    /// Cells placed onto the backbone afterwards.
     pub placed: usize,
     /// Times the branch lengths were reoptimised during growth.
     pub reoptimisations: usize,
     /// Mean nodes scored per placement. The handle on whether the beam search's
     /// tolerance is doing anything; compare against the node count.
     pub mean_scored: f64,
+    /// Wall time of the standard search on the backbone subset.
+    pub seed_seconds: f64,
+    /// Wall time of placing the remaining cells, reoptimisation excluded.
+    pub place_seconds: f64,
+    /// Wall time of the growth-phase branch-length reoptimisations.
+    pub reoptimise_seconds: f64,
+    /// Wall time of the final refinement over every cell. Zero from [`grow`],
+    /// which stops before it.
+    pub refine_seconds: f64,
+}
+
+impl BackboneReport {
+    /// A report for a backbone of `backbone_cells` with nothing done yet.
+    ///
+    /// ### Params
+    ///
+    /// * `backbone_cells` - Cells in the initial backbone
+    ///
+    /// ### Returns
+    ///
+    /// The report, every count and timing zero.
+    fn empty(backbone_cells: usize) -> Self {
+        Self {
+            backbone_cells,
+            placed: 0,
+            reoptimisations: 0,
+            mean_scored: 0.0,
+            seed_seconds: 0.0,
+            place_seconds: 0.0,
+            reoptimise_seconds: 0.0,
+            refine_seconds: 0.0,
+        }
+    }
 }
 
 /// Reconstruct a tree by building a backbone and placing the rest onto it.
+///
+/// [`grow`] followed by [`crate::bonsai::refine`] over every cell.
 ///
 /// ### Params
 ///
@@ -129,6 +210,45 @@ pub fn backbone<T: BonsaiFloat>(
 ) -> Result<(BonsaiResult<T>, BackboneReport), BonsaiErrors> {
     let params = params.unwrap_or_default();
     let n_cells = data.n_cells;
+
+    // A backbone at least as large as the dataset means there is nothing to
+    // place, so this is the standard algorithm with extra steps.
+    if n_cells >= 2 && params.backbone_cells >= n_cells {
+        let t0 = Instant::now();
+        let out = bonsai_prepared(data, Some(params.bonsai))?;
+        let mut report = BackboneReport::empty(n_cells);
+        report.seed_seconds = t0.elapsed().as_secs_f64();
+        return Ok((out, report));
+    }
+
+    let (tree, mut report) = grow(data, Some(params))?;
+    let t0 = Instant::now();
+    let out = refine(&tree, data, Some(params.bonsai))?;
+    report.refine_seconds = t0.elapsed().as_secs_f64();
+    Ok((out, report))
+}
+
+/// Build the backbone and place every remaining cell on it, without the final
+/// refinement.
+///
+/// Steps 2 and 3 of SPEC.md section 15. Public so that a caller can time or
+/// replace the refinement; [`backbone`] is this plus [`crate::bonsai::refine`].
+///
+/// ### Params
+///
+/// * `data` - Transformed means and precisions for every cell
+/// * `params` - Knobs, `None` for the defaults
+///
+/// ### Returns
+///
+/// The grown tree, leaves in cell order and polytomies unresolved, plus what
+/// the growth phase did.
+pub fn grow<T: BonsaiFloat>(
+    data: &PreparedData<T>,
+    params: Option<BackboneParams>,
+) -> Result<(Tree, BackboneReport), BonsaiErrors> {
+    let params = params.unwrap_or_default();
+    let n_cells = data.n_cells;
     let p = data.n_features();
 
     if n_cells < 2 {
@@ -137,48 +257,37 @@ pub fn backbone<T: BonsaiFloat>(
             n_features: p,
         });
     }
-
-    // A backbone at least as large as the dataset means there is nothing to
-    // place, so this is the standard algorithm with extra steps.
     let n_backbone = params.backbone_cells.clamp(2, n_cells);
-    if n_backbone == n_cells {
-        let out = bonsai_prepared(data, Some(params.bonsai))?;
-        return Ok((
-            out,
-            BackboneReport {
-                backbone_cells: n_cells,
-                placed: 0,
-                reoptimisations: 0,
-                mean_scored: 0.0,
-            },
-        ));
-    }
+    let mut report = BackboneReport::empty(n_backbone);
 
     // Step 2: the standard algorithm on a random subset.
+    let t0 = Instant::now();
     let order = shuffled_cells(n_cells, params.seed);
     let mut grown = Growing::seed(data, &order[..n_backbone])?;
     let seed_tree = bonsai_prepared(&grown.subset()?, Some(params.bonsai))?.tree;
     grown.adopt(seed_tree);
+    report.seed_seconds = t0.elapsed().as_secs_f64();
 
-    // Step 3: place the rest, reoptimising as the tree grows.
-    let mut report = BackboneReport {
-        backbone_cells: n_backbone,
-        placed: 0,
-        reoptimisations: 0,
-        mean_scored: 0.0,
-    };
+    // Step 3: place the rest in rounds, each growing the tree by
+    // `regrow_fraction` against one collapse, optionally reoptimising between
+    // rounds. Not after the last: the final refinement's step 4 does that.
     let mut scored_total = 0usize;
-    let mut since_optimised = n_backbone;
+    let mut next = n_backbone;
+    while next < n_cells {
+        let size = ((grown.n_leaves as f64 * params.regrow_fraction).ceil() as usize).max(1);
+        let end = (next + size).min(n_cells);
 
-    for &cell in &order[n_backbone..] {
-        let scored = grown.place_cell(data, cell, &params)?;
-        scored_total += scored;
-        report.placed += 1;
+        let t0 = Instant::now();
+        scored_total += grown.place_round(data, &order[next..end], &params)?;
+        report.place_seconds += t0.elapsed().as_secs_f64();
+        report.placed += end - next;
+        next = end;
 
-        if grown.n_leaves as f64 >= since_optimised as f64 * (1.0 + params.regrow_fraction) {
+        if next < n_cells && params.growth_branch.max_iter > 0 {
+            let t0 = Instant::now();
             grown.reoptimise(&params)?;
+            report.reoptimise_seconds += t0.elapsed().as_secs_f64();
             report.reoptimisations += 1;
-            since_optimised = grown.n_leaves;
         }
     }
     report.mean_scored = if report.placed == 0 {
@@ -187,11 +296,7 @@ pub fn backbone<T: BonsaiFloat>(
         scored_total as f64 / report.placed as f64
     };
 
-    // Step 4: refine with every cell, which is the standard algorithm's steps 3
-    // to 7 over the grown tree.
-    let tree = grown.finish(n_cells)?;
-    let out = refine(&tree, data, Some(params.bonsai))?;
-    Ok((out, report))
+    Ok((grown.finish(n_cells)?, report))
 }
 
 //////////////
@@ -222,7 +327,7 @@ fn shuffled_cells(n_cells: usize, seed: u64) -> Vec<usize> {
     order
 }
 
-/// A tree being grown one leaf at a time.
+/// A tree being grown one round of leaves at a time.
 ///
 /// Leaves are numbered in the order they were added, not by cell index, because
 /// the arena needs its leaves contiguous from zero and a cell arriving later
@@ -315,28 +420,32 @@ impl<T: BonsaiFloat> Growing<T> {
         Tree::from_parents(self.parent.clone(), self.branch.clone(), self.n_leaves)
     }
 
-    /// Place one cell and attach it.
+    /// Place one round of cells against the tree as it stands, then attach
+    /// them all.
     ///
-    /// The cell attaches as another child of the chosen node, which makes a
-    /// polytomy there. SPEC.md section 7.3 says that is how attaching to an
-    /// *edge* is covered as well, and the polytomy is resolved by step 3 of the
-    /// final refinement rather than here: resolving after every placement would
-    /// pay a star primitive per cell for a configuration the next cell may
-    /// change anyway.
+    /// One collapse serves the whole round and every cell is placed against
+    /// it in parallel, so a round costs one `O(n p)` sweep plus one beam search
+    /// per cell, where placing one cell at a time paid the sweep per cell. The
+    /// price is that cells in the same round cannot see each other: two that
+    /// belong together land on the same node as siblings rather than one below
+    /// the other, which is a polytomy the final refinement's step 3 resolves.
+    ///
+    /// Each cell attaches as another child of its chosen node. SPEC.md section
+    /// 7.3 says that is how attaching to an *edge* is covered as well.
     ///
     /// ### Params
     ///
     /// * `data` - The full dataset
-    /// * `cell` - Cell index to place
+    /// * `cells` - Cell indices to place, in growth order
     /// * `params` - Backbone knobs, for the placement tolerance
     ///
     /// ### Returns
     ///
-    /// How many nodes the beam search scored.
-    fn place_cell(
+    /// Total nodes the beam searches scored.
+    fn place_round(
         &mut self,
         data: &PreparedData<T>,
-        cell: usize,
+        cells: &[usize],
         params: &BackboneParams,
     ) -> Result<usize, BonsaiErrors> {
         let p = self.p;
@@ -349,86 +458,165 @@ impl<T: BonsaiFloat> Growing<T> {
         let (eff_m, eff_w) = collapse_onto_every_node(&tree, &self.means, &self.precisions, p)?;
         let eff_w: Vec<T> = eff_w.iter().map(|&x| narrow(x)).collect();
 
-        let lo = cell * p;
-        let q = EffLeaf {
-            m: &data.transformed_means[lo..lo + p],
-            w: &data.transformed_precisions[lo..lo + p],
-        };
-        let placement = place(
-            &tree,
-            q,
-            |node| {
-                let at = node as usize * p;
-                EffLeaf {
-                    m: &eff_m[at..at + p],
-                    w: &eff_w[at..at + p],
-                }
-            },
-            Some(params.placement),
-        )?;
+        let starts = self.nearest_leaves(data, cells, params.leaf_starts)?;
 
-        self.attach(cell, placement.node, placement.branch, q);
-        Ok(placement.scored)
+        // Independent read-only searches, collected in input order, so the
+        // result does not depend on the thread count.
+        let placements: Vec<Placement> = cells
+            .par_iter()
+            .zip(starts.par_iter())
+            .map(|(&cell, extra)| {
+                let lo = cell * p;
+                let q = EffLeaf {
+                    m: &data.transformed_means[lo..lo + p],
+                    w: &data.transformed_precisions[lo..lo + p],
+                };
+                place_from(
+                    &tree,
+                    q,
+                    |node| {
+                        let at = node as usize * p;
+                        EffLeaf {
+                            m: &eff_m[at..at + p],
+                            w: &eff_w[at..at + p],
+                        }
+                    },
+                    extra,
+                    Some(params.placement),
+                )
+            })
+            .collect::<Result<_, _>>()?;
+
+        self.attach(data, cells, &placements);
+        Ok(placements.iter().map(|x| x.scored).sum())
     }
 
-    /// Append a leaf below an existing node.
+    /// The `k` current leaves nearest each cell, as start points for its beam
+    /// search.
     ///
-    /// Two cases. A new leaf below an *internal* node just becomes another
-    /// child, which makes a polytomy there for the final refinement's step 3 to
-    /// resolve. A new leaf below another *leaf* cannot: this arena has no
-    /// data-carrying internal node, so a fresh internal node takes the target's
-    /// place with the target hanging off it on a zero-length branch. That is the
-    /// same unrooted tree and the same point the placement was scored at, and it
-    /// is what `search::spr` does for the identical reason.
-    ///
-    /// Indices are rebuilt rather than patched. Inserting a leaf shifts every
-    /// internal node up by one, and the leaf case adds a node in the middle of
-    /// the ordering, so the parent-above-child invariant is restored by
-    /// [`Growing::renumber`] rather than reasoned about case by case.
+    /// Plain Euclidean over the transformed means in `f32`, the same metric and
+    /// precision [`crate::tree::linkage`] builds its graph in, and for the same
+    /// reason: this only decides where a search starts, and the search scores
+    /// with the model. Exhaustive, one index per round over the leaves placed
+    /// so far.
     ///
     /// ### Params
     ///
-    /// * `cell` - Cell index the new leaf carries
-    /// * `target` - Node to attach below, in the current numbering
-    /// * `branch` - Length of the new edge
-    /// * `q` - The cell's own effective leaf
-    fn attach(&mut self, cell: usize, target: u32, branch: f64, q: EffLeaf<'_, T>) {
+    /// * `data` - The full dataset
+    /// * `cells` - Cell indices about to be placed
+    /// * `k` - Leaves wanted per cell; zero skips the search
+    ///
+    /// ### Returns
+    ///
+    /// One list of leaf node indices per cell, nearest first.
+    fn nearest_leaves(
+        &self,
+        data: &PreparedData<T>,
+        cells: &[usize],
+        k: usize,
+    ) -> Result<Vec<Vec<u32>>, BonsaiErrors> {
+        let k = k.min(self.n_leaves);
+        if k == 0 {
+            return Ok(vec![Vec::new(); cells.len()]);
+        }
+        let p = self.p;
+        let to_f32 = |x: &T| x.to_f32().unwrap_or(0.0);
+        let leaves: Vec<f32> = self.means.iter().map(to_f32).collect();
+        let mut queries: Vec<f32> = Vec::with_capacity(cells.len() * p);
+        for &cell in cells {
+            queries.extend(
+                data.transformed_means[cell * p..(cell + 1) * p]
+                    .iter()
+                    .map(to_f32),
+            );
+        }
+        let index = build_exhaustive_index((leaves.as_slice(), self.n_leaves, p), NEAREST_METRIC);
+        let (rows, _) = query_exhaustive_index(
+            (queries.as_slice(), cells.len(), p),
+            &index,
+            k,
+            false,
+            false,
+        )
+        .map_err(|e| BonsaiErrors::NeighbourGraph {
+            reason: e.to_string(),
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.into_iter().map(|i| i as u32).collect())
+            .collect())
+    }
+
+    /// Append one round of leaves, each below the node its placement chose.
+    ///
+    /// Two cases. A new leaf below an *internal* node just becomes another
+    /// child. A new leaf below another *leaf* cannot: this arena has no
+    /// data-carrying internal node, so a fresh internal node takes the target's
+    /// place with the target hanging off it on a zero-length branch. That is the
+    /// same unrooted tree and the same point the placement was scored at, and it
+    /// is what `search::spr` does for the identical reason. Every cell of the
+    /// round that chose the same leaf shares that one fresh node.
+    ///
+    /// Indices are rebuilt rather than patched. Inserting `k` leaves shifts
+    /// every internal node up by `k` and the fresh nodes land at the end, so
+    /// the parent-above-child invariant is restored by [`Growing::renumber`]
+    /// rather than reasoned about case by case.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - The full dataset
+    /// * `cells` - Cell indices the new leaves carry, in order
+    /// * `placements` - Where each cell goes, in the current numbering
+    fn attach(&mut self, data: &PreparedData<T>, cells: &[usize], placements: &[Placement]) {
+        let p = self.p;
         let old_leaves = self.n_leaves;
-        let new_leaf = old_leaves as u32;
-        // Every internal node moves up one to make room for the new leaf.
+        let k = cells.len();
+        // Every internal node moves up by `k` to make room for the new leaves.
         let shift = |v: u32| -> u32 {
             if v == NO_NODE || (v as usize) < old_leaves {
                 v
             } else {
-                v + 1
+                v + k as u32
             }
         };
 
-        let mut parent = Vec::with_capacity(self.parent.len() + 2);
-        let mut branches = Vec::with_capacity(self.branch.len() + 2);
+        let mut parent = Vec::with_capacity(self.parent.len() + 2 * k);
+        let mut branches = Vec::with_capacity(self.branch.len() + 2 * k);
         parent.extend(self.parent[..old_leaves].iter().map(|&v| shift(v)));
         branches.extend_from_slice(&self.branch[..old_leaves]);
-        parent.push(NO_NODE); // the new leaf, wired below
-        branches.push(branch);
+        parent.extend(std::iter::repeat_n(NO_NODE, k)); // the new leaves, wired below
+        branches.extend(placements.iter().map(|x| x.branch));
         parent.extend(self.parent[old_leaves..].iter().map(|&v| shift(v)));
         branches.extend_from_slice(&self.branch[old_leaves..]);
 
-        if (target as usize) < old_leaves {
-            // Leaf target: a new internal node takes its place.
-            let joint = parent.len() as u32;
-            parent.push(shift(self.parent[target as usize]));
-            branches.push(self.branch[target as usize]);
-            parent[target as usize] = joint;
-            branches[target as usize] = 0.0;
-            parent[new_leaf as usize] = joint;
-        } else {
-            parent[new_leaf as usize] = shift(target);
+        let mut joint_of = vec![NO_NODE; old_leaves];
+        for (i, at) in placements.iter().enumerate() {
+            let target = at.node as usize;
+            parent[old_leaves + i] = if target < old_leaves {
+                // Leaf target: a new internal node takes its place, once.
+                if joint_of[target] == NO_NODE {
+                    let joint = parent.len() as u32;
+                    parent.push(parent[target]);
+                    branches.push(branches[target]);
+                    parent[target] = joint;
+                    branches[target] = 0.0;
+                    joint_of[target] = joint;
+                }
+                joint_of[target]
+            } else {
+                shift(at.node)
+            };
         }
 
-        self.n_leaves += 1;
-        self.cell_of.push(cell);
-        self.means.extend_from_slice(q.m);
-        self.precisions.extend_from_slice(q.w);
+        for &cell in cells {
+            let lo = cell * p;
+            self.means
+                .extend_from_slice(&data.transformed_means[lo..lo + p]);
+            self.precisions
+                .extend_from_slice(&data.transformed_precisions[lo..lo + p]);
+        }
+        self.cell_of.extend_from_slice(cells);
+        self.n_leaves += k;
         let (parent, branches) = Self::renumber(parent, branches, self.n_leaves);
         self.parent = parent;
         self.branch = branches;
@@ -505,7 +693,7 @@ impl<T: BonsaiFloat> Growing<T> {
     fn reoptimise(&mut self, params: &BackboneParams) -> Result<(), BonsaiErrors> {
         let mut tree = self.tree()?;
         let mut state = NodeState::new(tree.n_nodes(), self.p, &self.means, &self.precisions)?;
-        optimise_branch_lengths(&mut tree, &mut state, Some(params.bonsai.branch))?;
+        optimise_branch_lengths(&mut tree, &mut state, Some(params.growth_branch))?;
         self.branch = tree.branches().to_vec();
         Ok(())
     }
@@ -715,6 +903,7 @@ mod tests {
                 Some(BackboneParams {
                     backbone_cells: 12,
                     regrow_fraction: fraction,
+                    growth_branch: GlobalBranchParams::default(),
                     ..Default::default()
                 }),
             )

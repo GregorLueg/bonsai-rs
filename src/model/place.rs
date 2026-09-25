@@ -318,6 +318,38 @@ pub fn place<'a, T: BonsaiFloat, F>(
 where
     F: Fn(u32) -> EffLeaf<'a, T>,
 {
+    place_from(tree, q, eff, &[], params)
+}
+
+/// [`place`] with extra start points supplied by the caller.
+///
+/// The extra starts are searched right after the root and before the evenly
+/// spread ones, so they get the second-least impeded search. Meant for starts
+/// that already sit near the answer, such as the leaves nearest `q`: on a
+/// 10k-cell tree the spread starts alone leave the beam in a local optimum;
+/// `backbone::DEFAULT_LEAF_STARTS` has the measurement.
+///
+/// ### Params
+///
+/// * `tree` - The existing tree, which is not modified
+/// * `q` - Effective leaf summarising the node being attached
+/// * `eff` - Effective leaf of the whole tree seen from each node; see [`place`]
+/// * `extra` - Additional start points, node indices of `tree`
+/// * `params` - Search parameters, or `None` for [`PlacementParams::default`]
+///
+/// ### Returns
+///
+/// As [`place`].
+pub fn place_from<'a, T: BonsaiFloat, F>(
+    tree: &Tree,
+    q: EffLeaf<'_, T>,
+    eff: F,
+    extra: &[u32],
+    params: Option<PlacementParams>,
+) -> Result<Placement, BonsaiErrors>
+where
+    F: Fn(u32) -> EffLeaf<'a, T>,
+{
     let params = params.unwrap_or_default();
     let p = q.m.len();
     let mut s = vec![0.0f64; p];
@@ -334,7 +366,9 @@ where
         scored: 0,
     };
 
-    for start in start_points(tree, params.n_starts) {
+    let spread = start_points(tree, params.n_starts);
+    let starts = spread[..1].iter().chain(extra).chain(&spread[1..]).copied();
+    for start in starts {
         if visited[start as usize] {
             continue;
         }

@@ -353,10 +353,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#input-contract" class="md-nav__link">
+  <a href="#input" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Input contract
+        Input
       
     </span>
   </a>
@@ -364,10 +364,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#where-to-go-next" class="md-nav__link">
+  <a href="#next" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Where to go next
+        Next
       
     </span>
   </a>
@@ -667,10 +667,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#input-contract" class="md-nav__link">
+  <a href="#input" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Input contract
+        Input
       
     </span>
   </a>
@@ -678,10 +678,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#where-to-go-next" class="md-nav__link">
+  <a href="#next" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Where to go next
+        Next
       
     </span>
   </a>
@@ -716,34 +716,31 @@
 <h1 id="bonsai-rs">bonsai-rs<a class="headerlink" href="#bonsai-rs" title="Permanent link">&para;</a></h1>
 <p>Tree representations of single-cell data under Brownian motion. The
 <a href="https://github.com/GregorLueg/bonsai-rs">Rust crate</a> does the work; this is a
-thin functional layer over it.</p>
+thin layer over it.</p>
 <p>A clean-room implementation of Bonsai: de Groot, Morillo Leonardo, Pachkov and
 van Nimwegen, <em>Bonsai reconstructs tree representations for distortion-free
 visualization and exploration of high-dimensional data</em>, Nature Biotechnology
 2026, <a href="https://doi.org/10.1038/s41587-026-03220-2">doi 10.1038/s41587-026-03220-2</a>.
-Raw counts go through a clean-room Sanity first
-(<a href="https://github.com/GregorLueg/sanity-sc-rs">sanity-sc-rs</a>), so UMIs in, tree
-out, no R or C in the loop.</p>
+Counts go through a clean-room Sanity first
+(<a href="https://github.com/GregorLueg/sanity-sc-rs">sanity-sc-rs</a>): UMIs in, tree out,
+no R or C.</p>
 <h2 id="why-a-tree">Why a tree<a class="headerlink" href="#why-a-tree" title="Permanent link">&para;</a></h2>
-<p>Every node carries a latent position in feature space and every edge is a
-Brownian step. The objective is the marginal likelihood with every internal
-position integrated out. Three things follow:</p>
+<p>Every node has a latent position, every edge is a Brownian step, and internal
+positions are integrated out.</p>
 <ul>
-<li><strong>Distances hold at every scale.</strong> Path distances along the tree track the
-  high-dimensional distances globally, not just locally, which is where UMAP
-  and tSNE fall over.</li>
-<li><strong>It consumes uncertainty.</strong> Per-cell per-feature error bars go in and are
-  marginalised over. A method that takes a matrix treats it as exact.</li>
+<li><strong>Distances hold at every scale</strong>, not just locally. That's where UMAP and
+  tSNE fall over.</li>
+<li><strong>It consumes uncertainty.</strong> Per-cell per-feature error bars go in and get
+  marginalised over.</li>
 <li><strong>Nothing to tune.</strong> No perplexity, no neighbours, no minimum distance.</li>
 </ul>
-<p>The honest caveat: it assumes the data is tree-like. Cells that diverged along
-a branching lineage are fine. Cell cycle, dose response, anything that loops
-back or reconverges, still gets a tree, and a confident-looking one.</p>
+<p>The catch: it assumes a tree. Cell cycle, dose response, anything that loops
+back still gets one, and a confident-looking one.</p>
 <h2 id="install">Install<a class="headerlink" href="#install" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>bonsai-rs<span class="w">            </span><span class="c1"># numpy only; dense counts</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">"bonsai-rs[sparse]"</span><span class="w">  </span><span class="c1"># adds scipy, for sparse counts</span>
 </code></pre></div>
-<p>Wheels target Python 3.10 and up, on Linux x86_64 and macOS.</p>
+<p>Wheels for Python 3.10+ on Linux x86_64 and macOS.</p>
 <h2 id="thirty-seconds">Thirty seconds<a class="headerlink" href="#thirty-seconds" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">bonsai_rs</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">bs</span>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
@@ -754,26 +751,22 @@ back or reconverges, still gets a tree, and a confident-looking one.</p>
 <a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="n">xy</span> <span class="o">=</span> <span class="n">bs</span><span class="o">.</span><span class="n">layout</span><span class="p">(</span><span class="n">res</span><span class="o">.</span><span class="n">tree</span><span class="p">)</span>  <span class="c1"># (n_nodes, 2), ready to draw</span>
 <a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="n">newick</span> <span class="o">=</span> <span class="n">bs</span><span class="o">.</span><span class="n">to_newick</span><span class="p">(</span><span class="n">res</span><span class="o">.</span><span class="n">tree</span><span class="p">)</span>
 </code></pre></div>
-<h2 id="input-contract">Input contract<a class="headerlink" href="#input-contract" title="Permanent link">&para;</a></h2>
-<p>Means <strong>and</strong> standard deviations, per cell per feature. Not a matrix. Without
-real error bars it's a different and worse method; the paper's supplement
-shows accuracy dropping hard on conventional preprocessing.</p>
-<p>For scRNA-seq that means raw UMI counts into <code>bonsai_from_counts</code>. Anything
-log-normalised is refused, because Sanity models the Poisson sampling in the
-raw counts.</p>
-<h2 id="where-to-go-next">Where to go next<a class="headerlink" href="#where-to-go-next" title="Permanent link">&para;</a></h2>
+<h2 id="input">Input<a class="headerlink" href="#input" title="Permanent link">&para;</a></h2>
+<p>Means <strong>and</strong> standard deviations per cell per feature. Without real error bars
+it's a worse method; the paper's supplement shows accuracy dropping hard on
+conventional preprocessing. For scRNA-seq: raw UMI counts into
+<code>bonsai_from_counts</code>. Log-normalised input is refused, since Sanity models the
+Poisson sampling in raw counts.</p>
+<h2 id="next">Next<a class="headerlink" href="#next" title="Permanent link">&para;</a></h2>
 <ul>
-<li><a href="quickstart/">Quickstart</a> for counts to tree, means to tree, and drawing
-  the result.</li>
-<li><a href="guide/">Guide</a> for the Sanity handover, units, determinism, large
-  datasets and threads.</li>
-<li><a href="api/core/">API reference</a> for every parameter and what each <code>None</code>
-  resolves to.</li>
-<li><a href="https://github.com/GregorLueg/bonsai-rs/blob/main/python/CHANGELOG.md">Changelog</a>
-  for this package. It versions separately from the Rust crate.</li>
+<li><a href="quickstart/">Quickstart</a>: counts to tree, means to tree, drawing it.</li>
+<li><a href="guide/">Guide</a>: the Sanity handover, units, determinism, threads, big data.</li>
+<li><a href="api/core/">API reference</a>: every parameter and what each <code>None</code> becomes.</li>
+<li><a href="https://github.com/GregorLueg/bonsai-rs/blob/main/python/CHANGELOG.md">Changelog</a>,
+  versioned separately from the crate.</li>
 </ul>
-<p>Cite the paper. This is an independent implementation of their method and
-claims none of the science.</p>
+<p>Cite the paper. This is an independent implementation and claims none of the
+science.</p>
 
 
 

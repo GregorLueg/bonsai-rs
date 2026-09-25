@@ -795,69 +795,58 @@
 
 <h1 id="guide">Guide<a class="headerlink" href="#guide" title="Permanent link">&para;</a></h1>
 <h2 id="the-sanity-handover">The Sanity handover<a class="headerlink" href="#the-sanity-handover" title="Permanent link">&para;</a></h2>
-<p>Sanity reports posteriors: each cell's log fold change is shrunk towards the
-gene mean under a <code>N(0, v)</code> prior. Bonsai wants the measurement before that
-shrinkage, so <code>from_sanity</code> undoes it (SI eq. S5):</p>
+<p>Sanity reports posteriors: each cell's log fold change shrunk towards the gene
+mean under a <code>N(0, v)</code> prior. Bonsai wants the measurement before shrinkage, so
+<code>from_sanity</code> undoes it (SI eq. S5):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>mu    = x   * v / (v - eps^2)
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>sig^2 = eps^2 * v / (v - eps^2)
 </code></pre></div>
-<p>Two things follow.</p>
-<p><strong>Feed it the log fold changes, not the log transcription quotients.</strong> The
-formula inverts a zero-mean prior. Add the gene mean first and the per-cell
-amplification scales it differently in every cell, which invents structure
-out of nothing. On 64 simulated cells by 300 genes, log fold changes recover the
-generating tree exactly (Robinson-Foulds 0, distance recovery 0.950). The
-quotients land at Robinson-Foulds 100 of a possible 122 and a distance
-recovery of 0.016. <code>bonsai_from_counts</code> does the right thing; this only bites
+<p><strong>Feed it log fold changes, not log transcription quotients.</strong> The formula
+inverts a zero-mean prior; add the gene mean and the per-cell amplification
+invents structure. On 64 simulated cells by 300 genes, fold changes recover the
+generating tree exactly (Robinson-Foulds 0, recovery 0.950); quotients give 100
+of a possible 122 and 0.016. <code>bonsai_from_counts</code> gets this right; it only bites
 if you wire it up by hand.</p>
-<p><strong>Some genes get dropped.</strong> The amplification <code>v / (v - eps^2)</code> blows up as a
-cell's error bar approaches the gene's variance, which is what a gene with
-almost no signal looks like. A gene where any cell exceeds <code>max_amplification</code>
-(default 1000) is dropped whole and reported in <code>dropped</code>, rather than clamped
-into a fabricated error bar. A handful in a large panel is normal. Losing most
-of them says the counts are too shallow for those genes to say anything.</p>
-<p>After the conversion, genes below a signal-to-noise floor are dropped too
-(<code>min_signal_to_noise</code>, default 0.25). <code>features</code> lists what survived both.</p>
+<p><strong>Some genes get dropped.</strong> <code>v / (v - eps^2)</code> blows up as a cell's error bar
+nears the gene's variance, i.e. a gene with almost no signal. Any gene where a
+cell exceeds <code>max_amplification</code> (default 1000) is dropped whole and listed in
+<code>dropped</code>, not clamped into a fake error bar. A handful is normal; losing most
+means the counts are too shallow.</p>
+<p>Genes below <code>min_signal_to_noise</code> (default 1, the paper's threshold) go next.
+<code>features</code> lists the survivors.</p>
 <h3 id="cell_totals">cell_totals<a class="headerlink" href="#cell_totals" title="Permanent link">&para;</a></h3>
-<p>Sanity normalises by each cell's total UMI count over the whole transcriptome.
-The default is the row sums of what you passed, which is right only if you
-passed every gene. On a subset, pass the totals from the full matrix.</p>
-<p>It matters more than it looks. The simulator draws 300 high-variance genes, so
-the row sums carry a per-cell shift that the true library sizes do not. With
-the true sizes the tree comes back exact on four seeds out of four; with row
-sums, Robinson-Foulds 2, 38, 28 and 42.</p>
+<p>Sanity normalises by each cell's UMI total over the whole transcriptome. The
+default is the row sums of what you passed, right only if you passed every gene.
+On a subset, pass the full-matrix totals.</p>
+<p>It matters. The simulator draws 300 high-variance genes, so row sums carry a
+per-cell shift the true library sizes don't. True sizes: exact tree on four
+seeds of four. Row sums: Robinson-Foulds 2, 38, 28 and 42.</p>
 <h2 id="units">Units<a class="headerlink" href="#units" title="Permanent link">&para;</a></h2>
-<p>Loglikelihoods drop the <code>2 pi</code> and variance terms, which do not depend on the
-topology. They are meaningful up to an additive constant: compare two trees on
-the same data, never two datasets, and never against the published
-implementation's numbers.</p>
-<p><code>node_means</code> and <code>node_sds</code> are in the input's units, one row per node. Rows
-<code>n_leaves:</code> are the inferred ancestors, which is the part a manifold embedding
-cannot give you.</p>
+<p>Loglikelihoods drop the <code>2 pi</code> and variance terms, which don't depend on
+topology. Compare two trees on the same data; never two datasets, never against
+the published implementation.</p>
+<p><code>node_means</code> and <code>node_sds</code> are in input units, one row per node. Rows
+<code>n_leaves:</code> are the inferred ancestors, which no manifold embedding gives you.</p>
 <h2 id="determinism">Determinism<a class="headerlink" href="#determinism" title="Permanent link">&para;</a></h2>
-<p>Same input, same tree, whatever the thread count. Parallel reductions sum in
-a fixed order rather than rayon's split order. <code>bonsai</code> on the same arrays
-twice gives bitwise the same loglikelihood.</p>
+<p>Same input, same tree, any thread count. <code>bonsai</code> on the same arrays twice gives
+bitwise the same loglikelihood.</p>
 <h2 id="threads">Threads<a class="headerlink" href="#threads" title="Permanent link">&para;</a></h2>
 <p>Rayon's global pool, sized to the machine. Set <code>RAYON_NUM_THREADS</code> before the
-first call to cap it; the pool is built once and fixed after that.</p>
+first call to cap it; after that it's fixed.</p>
 <h2 id="large-datasets">Large datasets<a class="headerlink" href="#large-datasets" title="Permanent link">&para;</a></h2>
 <p>The largest run measured is 10,000 cells by 2,767 genes of Sanity-preprocessed
-Baron pancreas data, which took 611 seconds; the <a href="https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md">comparison</a>
-has the details and the caveats.</p>
-<p>Past that, <code>backbone</code> reconstructs on a random subset (<code>backbone_cells</code>,
-default 2048), places every other cell onto it one at a time, and refines the
-whole tree.</p>
+Baron pancreas in 210 seconds; see the <a href="https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md">comparison</a>.</p>
+<p>Beyond that, <code>backbone</code> reconstructs on a random subset (<code>backbone_cells</code>,
+default 2048), places every other cell onto it and refines the whole tree.</p>
 <h2 id="the-start-tree">The start tree<a class="headerlink" href="#the-start-tree" title="Permanent link">&para;</a></h2>
-<p><code>start="linkage"</code> (the default) builds the initial tree by Ward linkage over a
-neighbour graph. <code>start="greedy"</code> is the greedy merge the paper specifies. On
-real data the greedy merge chains, and the refinement does not recover from it,
-so it is there for like-for-like reproduction of the published method, not for
-building the best tree.</p>
+<p><code>start="linkage"</code> (default) is Ward linkage over a neighbour graph.
+<code>start="greedy"</code> is the paper's greedy merge. On real data it chains and the
+refinement doesn't recover, so use it to reproduce the published method, not to
+build the best tree.</p>
 <h2 id="what-it-does-not-do">What it does not do<a class="headerlink" href="#what-it-does-not-do" title="Permanent link">&para;</a></h2>
-<p>It won't tell you your data isn't a tree. A cycle gets cut somewhere and drawn
-as two branches, with confident branch lengths either side. Look at the data
-before you believe the picture.</p>
+<p>Tell you your data isn't a tree. A cycle gets cut somewhere and drawn as two
+branches with confident lengths. Look at the data before you believe the
+picture.</p>
 
 
 

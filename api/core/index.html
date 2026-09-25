@@ -539,6 +539,45 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#bonsai_rs.gpu_available" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        <code class="doc-symbol doc-symbol-toc doc-symbol-function"></code>&nbsp;gpu_available
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label=" gpu_available">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#bonsai_rs.gpu_available--params" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Params
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bonsai_rs.gpu_available--returns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Returns
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -748,6 +787,45 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#bonsai_rs.gpu_available" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        <code class="doc-symbol doc-symbol-toc doc-symbol-function"></code>&nbsp;gpu_available
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label=" gpu_available">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#bonsai_rs.gpu_available--params" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Params
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bonsai_rs.gpu_available--returns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Returns
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -827,11 +905,13 @@
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">variance_rule</span><span class="p">:</span> <span class="n"><span title="bonsai_rs.core.VarianceRule">VarianceRule</span></span> <span class="o">=</span> <span class="s2">"marginalise"</span><span class="p">,</span>
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">fixed_variance</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">dtype</span><span class="p">:</span> <span class="n"><span title="type">type</span></span><span class="p">[</span><span class="n"><span title="numpy.float32">float32</span></span><span class="p">]</span> <span class="o">|</span> <span class="n"><span title="type">type</span></span><span class="p">[</span><span class="n"><span title="numpy.float64">float64</span></span><span class="p">]</span> <span class="o">=</span> <span class="n"><span title="numpy.float32">float32</span></span><span class="p">,</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">start</span><span class="p">:</span> <span class="n"><span title="bonsai_rs.core.Start">Start</span></span> <span class="o">=</span> <span class="s2">"linkage"</span><span class="p">,</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">min_signal_to_noise</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    <span class="n">max_amplification</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    <span class="n">reroot</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n"><a class="autorefs autorefs-internal" title="            BonsaiResult
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">gpu</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">start</span><span class="p">:</span> <span class="n"><span title="bonsai_rs.core.Start">Start</span></span> <span class="o">=</span> <span class="s2">"linkage"</span><span class="p">,</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    <span class="n">search</span><span class="p">:</span> <span class="n"><span title="bonsai_rs.core.Search">Search</span></span> <span class="o">=</span> <span class="s2">"approximate"</span><span class="p">,</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    <span class="n">min_signal_to_noise</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    <span class="n">max_amplification</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    <span class="n">reroot</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n"><a class="autorefs autorefs-internal" title="            BonsaiResult
 
 
   
@@ -939,6 +1019,23 @@ Python.</p>
           </tr>
           <tr class="doc-section-item">
             <td>
+                <code>gpu</code>
+            </td>
+            <td>
+                  <code><span title="bool">bool</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>As <code>sanity</code>. Only Sanity runs on the GPU; the tree search is
+CPU either way.</p>
+              </div>
+            </td>
+            <td>
+                  <code>False</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
                 <code>start</code>
             </td>
             <td>
@@ -951,6 +1048,22 @@ Python.</p>
             </td>
             <td>
                   <code>&#39;linkage&#39;</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>search</code>
+            </td>
+            <td>
+                  <code><span title="bonsai_rs.core.Search">Search</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>As <code>bonsai</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>&#39;approximate&#39;</code>
             </td>
           </tr>
           <tr class="doc-section-item">
@@ -1067,7 +1180,8 @@ Python.</p>
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">variance_rule</span><span class="p">:</span> <span class="n"><span title="bonsai_rs.core.VarianceRule">VarianceRule</span></span> <span class="o">=</span> <span class="s2">"marginalise"</span><span class="p">,</span>
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">fixed_variance</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">dtype</span><span class="p">:</span> <span class="n"><span title="type">type</span></span><span class="p">[</span><span class="n"><span title="numpy.float32">float32</span></span><span class="p">]</span> <span class="o">|</span> <span class="n"><span title="type">type</span></span><span class="p">[</span><span class="n"><span title="numpy.float64">float64</span></span><span class="p">]</span> <span class="o">=</span> <span class="n"><span title="numpy.float32">float32</span></span><span class="p">,</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n"><a class="autorefs autorefs-internal" title="            SanityResult
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">gpu</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n"><a class="autorefs autorefs-internal" title="            SanityResult
 
 
   
@@ -1179,6 +1293,25 @@ way.</p>
                   <code><span title="numpy.float32">float32</span></code>
             </td>
           </tr>
+          <tr class="doc-section-item">
+            <td>
+                <code>gpu</code>
+            </td>
+            <td>
+                  <code><span title="bool">bool</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>Run Sanity on the GPU through wgpu. The device path is
+<code>float32</code> whatever <code>dtype</code> says, since wgpu has no <code>float64</code>.
+Check <code>gpu_available</code> first; asking for it where that is <code>False</code>
+raises rather than falling back to the CPU.</p>
+              </div>
+            </td>
+            <td>
+                  <code>False</code>
+            </td>
+          </tr>
       </tbody>
     </table>
 
@@ -1227,6 +1360,16 @@ way.</p>
             <td>
               <div class="doc-md-description">
                 <p>On malformed or non-integer counts.</p>
+              </div>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
+                  <code><a class="autorefs autorefs-internal" title="            BonsaiError (bonsai_rs._bonsai_rs.BonsaiError)" href="#bonsai_rs.BonsaiError">BonsaiError</a></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>If <code>gpu=True</code> and no GPU can be reached.</p>
               </div>
             </td>
           </tr>
@@ -1437,9 +1580,10 @@ default of 1000.</p>
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    <span class="o">*</span><span class="p">,</span>
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">variances</span><span class="p">:</span> <span class="n"><span title="numpy.ndarray">ndarray</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">start</span><span class="p">:</span> <span class="n"><span title="bonsai_rs.core.Start">Start</span></span> <span class="o">=</span> <span class="s2">"linkage"</span><span class="p">,</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">min_signal_to_noise</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">reroot</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n"><a class="autorefs autorefs-internal" title="            BonsaiResult
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">search</span><span class="p">:</span> <span class="n"><span title="bonsai_rs.core.Search">Search</span></span> <span class="o">=</span> <span class="s2">"approximate"</span><span class="p">,</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">min_signal_to_noise</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">reroot</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n"><a class="autorefs autorefs-internal" title="            BonsaiResult
 
 
   
@@ -1534,6 +1678,26 @@ reproduction).</p>
           </tr>
           <tr class="doc-section-item">
             <td>
+                <code>search</code>
+            </td>
+            <td>
+                  <code><span title="bonsai_rs.core.Search">Search</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p><code>"approximate"</code> (the default) or <code>"exact"</code>. Exact runs
+SPR and NNI as the paper specifies them; the approximate search
+revisits only what the last moves touched and landed within a few
+nats of the exact one on every dataset measured, several times
+faster. Worth an exact run to check on data of your own.</p>
+              </div>
+            </td>
+            <td>
+                  <code>&#39;approximate&#39;</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
                 <code>min_signal_to_noise</code>
             </td>
             <td>
@@ -1542,7 +1706,7 @@ reproduction).</p>
             <td>
               <div class="doc-md-description">
                 <p>Features below this signal-to-noise are dropped
-before the search. <code>None</code> for the default of 0.25.</p>
+before the search. <code>None</code> for the default of 1, the paper's.</p>
               </div>
             </td>
             <td>
@@ -1651,9 +1815,10 @@ picture, not the likelihood.</p>
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">backbone_cells</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">seed</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
 <a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">start</span><span class="p">:</span> <span class="n"><span title="bonsai_rs.core.Start">Start</span></span> <span class="o">=</span> <span class="s2">"linkage"</span><span class="p">,</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">min_signal_to_noise</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    <span class="n">reroot</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n"><a class="autorefs autorefs-internal" title="            BonsaiResult
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">search</span><span class="p">:</span> <span class="n"><span title="bonsai_rs.core.Search">Search</span></span> <span class="o">=</span> <span class="s2">"approximate"</span><span class="p">,</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    <span class="n">min_signal_to_noise</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    <span class="n">reroot</span><span class="p">:</span> <span class="n"><span title="bool">bool</span></span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n"><a class="autorefs autorefs-internal" title="            BonsaiResult
 
 
   
@@ -1779,6 +1944,22 @@ of 2048.</p>
           </tr>
           <tr class="doc-section-item">
             <td>
+                <code>search</code>
+            </td>
+            <td>
+                  <code><span title="bonsai_rs.core.Search">Search</span></code>
+            </td>
+            <td>
+              <div class="doc-md-description">
+                <p>As <code>bonsai</code>.</p>
+              </div>
+            </td>
+            <td>
+                  <code>&#39;approximate&#39;</code>
+            </td>
+          </tr>
+          <tr class="doc-section-item">
+            <td>
                 <code>min_signal_to_noise</code>
             </td>
             <td>
@@ -1878,6 +2059,37 @@ of 2048.</p>
 
 
 
+
+
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h2 id="bonsai_rs.gpu_available" class="doc doc-heading">
+<code class="doc-symbol doc-symbol-heading doc-symbol-function"></code>            <span class="doc doc-object-name doc-function-name">gpu_available</span>
+
+
+  <span class="doc doc-labels">
+      <small class="doc doc-label doc-label-builtin"><code>builtin</code></small>
+  </span>
+
+<a href="#bonsai_rs.gpu_available" class="headerlink" title="Permanent link">&para;</a></h2>
+<div class="doc-signature highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nf">gpu_available</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n"><span title="bool">bool</span></span>
+</code></pre></div>
+
+    <div class="doc doc-contents first">
+
+        <p>Whether Sanity can run on the GPU here.</p>
+<h5 id="bonsai_rs.gpu_available--params">Params<a class="headerlink" href="#bonsai_rs.gpu_available--params" title="Permanent link">&para;</a></h5>
+<ul>
+<li><code>py</code> - Attached interpreter token</li>
+</ul>
+<h5 id="bonsai_rs.gpu_available--returns">Returns<a class="headerlink" href="#bonsai_rs.gpu_available--returns" title="Permanent link">&para;</a></h5>
+<p><code>True</code> only when this build has the <code>gpu</code> feature <strong>and</strong> wgpu resolves an
+adapter. Safe to call on any machine.</p>
 
 
     </div>

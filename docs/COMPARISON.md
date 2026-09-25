@@ -155,6 +155,22 @@ the two basins, not the GPU making better trees. And the gaps to the published
 trees at 5,000 and 10,000 cells, several hundred to 2,500 splits, are far outside
 that spread.
 
+The same trees drawn, with the layout and colouring of [What the trees look
+like](#what-the-trees-look-like) below: clade fragments against an ideal of ten,
+and distance recovery on that section's scale, the selected genes' true
+positions and the same 20,000 pairs for every tree.
+
+| cells | GPU + approximate | CPU + exact | reference, 1 core | reference, 10 ranks |
+|---|---|---|---|---|
+| 512 | 13, 0.745 | 13, 0.744 | 15, 0.638 | 14, 0.643 |
+| 512 s32 | 17, 0.375 | 17, 0.373 | 19, 0.311 | |
+| 5,000 | 23, 0.674 | 23, 0.592 | 29, 0.500 | 36, 0.402 |
+| 10,000 | 23, 0.472 | 24, 0.472 | 40, 0.258 | 58, 0.323 |
+
+![radial layouts at 10,000 cells, counts to tree](figures/n10000_e2e_tree_layout.png)
+
+![distance recovery at 10,000 cells, counts to tree](figures/n10000_e2e_distance_recovery.png)
+
 ## What the trees look like
 
 

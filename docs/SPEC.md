@@ -2,7 +2,7 @@
 
 Transcribed from the CC-BY-4.0 paper and Supplementary Information of de Groot,
 Morillo Leonardo, Pachkov and van Nimwegen, *Nature Biotechnology* 2026,
-doi 10.1038/s41587-026-03220-2. See `PROVENANCE.md`.
+doi 10.1038/s41587-026-03220-2. See [provenance](,,/PROVENANCE.md).
 
 **This file is the only implementation source.** Code cites the `(Sxx)` numbers
 below. Where this document restructures an SI expression for numerical or

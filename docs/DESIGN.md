@@ -1,7 +1,7 @@
 # Design
 
-How it's built and why. Equations are in `docs/SPEC.md`, tuning history in
-`docs/PERFORMANCE.md`.
+How it's built and why. Equations are in [specs](SPEC.md), tuning history in
+[performance](PERFORMANCE.md).
 
 ## Model
 

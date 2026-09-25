@@ -34,7 +34,7 @@ panels, so a slope, not a law.
 - Hottest code by self time: `edge_newton_simd`, `split_derivative`, `log`,
   all in the branch solve inside merges and placements.
 
-Counts to tree end to end is in `docs/COMPARISON.md`.
+Counts to tree end to end is in [comparison](COMPARISON.md).
 
 ## Rules
 

@@ -123,7 +123,7 @@ same input, same scorer:
 
 69x and 76x faster at the larger sizes and closer to the truth on both metrics.
 At 512 it's a tie on topology and the published one is ahead on recovery.
-Timings aren't like for like; `docs/COMPARISON.md` has the caveats.
+Timings aren't like for like; [comparison](docs/COMPARISON.md) has the caveats.
 
 ### Exact or approximate search
 
@@ -175,8 +175,8 @@ MIT. See `LICENSE`.
 
 The reference implementation is CC-BY-NC-4.0. A port would be Adapted Material
 under section 1(a) and couldn't be MIT. So this crate is built only from the
-paper and its CC-BY-4.0 Supplementary Information, via `docs/SPEC.md`.
-`PROVENANCE.md` has the full position; contributors, read it first.
+paper and its CC-BY-4.0 Supplementary Information, via [specs](docs/SPEC.md).
+[Provenance](PROVENANCE.md) has the full position; contributors, read it first.
 
 ## Citing
 

@@ -4,8 +4,8 @@ Black-box comparison: same Sanity-preprocessed input to both, scored the same
 way against a ground truth neither produced.
 
 Every claim here rests on a measurement of inputs and outputs, or on the paper.
-None rests on the published source, and none ever will; `PROVENANCE.md` says
-why.
+None rests on the published source, and none ever will;
+[provenance](../PROVENANCE.md) says why.
 
 ## Setup
 
@@ -120,10 +120,10 @@ process per rank. MPI also changes its answer: RF 141 against 146 at 512, 2,016
 against 1,937 at 5,000, 5,151 against 5,149 at 10,000.
 
 Two cautions. Differences between the Rust Sanity paths and search modes sit
-inside the run-to-run spread (`docs/PERFORMANCE.md`, "How much one real-data run
-says"): 0.45 against 0.57 at 5,000 is two basins, not the GPU making better
-trees. The gaps to the published trees, hundreds to 2,500 splits, are far
-outside it.
+inside the run-to-run spread ([performance](docs/PERFORMANCE.md), "How much one
+real-data run says"): 0.45 against 0.57 at 5,000 is two basins, not the GPU
+making better trees. The gaps to the published trees, hundreds to 2,500 splits,
+are far outside it.
 
 Same trees drawn as in [What the trees look like](#what-the-trees-look-like):
 clade fragments (ideal ten) and recovery on the selected genes, same 20,000

@@ -9,6 +9,9 @@
 //!   the per-feature scale transform, through the crate's own ingest.
 //! * `ours` runs the eight search steps over the CSV one at a time, timing each,
 //!   and emits a Newick string, a wall time and a per-step table.
+//! * `backbone` runs `backbone::backbone` over the same CSV: search a random
+//!   subset, place the rest, refine the whole tree. One wall time, since the
+//!   crate does not split its phases.
 //! * `score` loads every Newick it can find for a configuration, puts them all
 //!   on the same leaf indexing, and reports distance recovery, Robinson-Foulds
 //!   and loglikelihood, plus one layout CSV per tree. A Newick named
@@ -30,6 +33,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use bonsai_rs::backbone::BackboneParams;
 use bonsai_rs::bonsai::BonsaiParams;
 use bonsai_rs::ingest::{IngestParams, PreparedData, from_sanity, prepare};
 use bonsai_rs::model::global::optimise_branch_lengths;
@@ -101,6 +105,13 @@ fn run() -> Fallible<()> {
             }
             ours(Path::new(&args[2]))
         }
+        Some("backbone") => {
+            if !(3..=4).contains(&args.len()) {
+                return Err("usage: harness backbone <dir> [backbone_cells]".into());
+            }
+            let cells = args.get(3).map(|v| v.parse()).transpose()?;
+            backbone(Path::new(&args[2]), cells)
+        }
         Some("score") => {
             if args.len() != 3 {
                 return Err("usage: harness score <dir>".into());
@@ -113,7 +124,7 @@ fn run() -> Fallible<()> {
             }
             score_tree(Path::new(&args[2]), Path::new(&args[3]))
         }
-        _ => Err("usage: harness <gen|prep|ours|score|score-tree> ...".into()),
+        _ => Err("usage: harness <gen|prep|ours|backbone|score|score-tree> ...".into()),
     }
 }
 
@@ -628,6 +639,77 @@ fn ours(dir: &Path) -> Fallible<()> {
         ),
     )?;
     println!("ours: {n_cells} cells by {p} features in {total:.2} s, loglik {loglik:.1}");
+    Ok(())
+}
+
+/// Run backbone mode over the CSV and write `backbone.nwk`,
+/// `backbone_seconds.txt` and `backbone_steps.tsv`.
+///
+/// Same input as [`ours`], wrapped as a `PreparedData` with every feature kept
+/// and unit variances, the way `backbone`'s own subset step builds one, so
+/// ingest never runs and both searches see identical leaves. The wall time
+/// covers the whole call: backbone search, placement and the final refinement.
+/// `backbone_steps.tsv` holds the refinement's per-step loglikelihoods and the
+/// growth report.
+///
+/// With `BACKBONE_TAG` set, the outputs are suffixed `_<tag>`.
+fn backbone(dir: &Path, backbone_cells: Option<usize>) -> Fallible<()> {
+    let (means, n_cells, p) = read_csv(&dir.join("ours").join("means.csv"))?;
+    let (sds, sd_cells, sd_p) = read_csv(&dir.join("ours").join("sds.csv"))?;
+    if (n_cells, p) != (sd_cells, sd_p) {
+        return Err(format!(
+            "means are {n_cells}x{p} but standard deviations are {sd_cells}x{sd_p}"
+        )
+        .into());
+    }
+    let precisions: Vec<f64> = sds.iter().map(|&s| 1.0 / (s * s)).collect();
+    if precisions.iter().any(|v| !v.is_finite()) {
+        return Err("a standard deviation is zero or not finite".into());
+    }
+    let data = PreparedData {
+        transformed_means: means,
+        transformed_precisions: precisions,
+        features: (0..p).collect(),
+        variances: vec![1.0; p],
+        signal_to_noise: vec![f64::INFINITY; p],
+        n_cells,
+        n_features_in: p,
+    };
+    let mut params = BackboneParams::default();
+    if let Some(c) = backbone_cells {
+        params.backbone_cells = c;
+    }
+    let tag = env::var("BACKBONE_TAG").ok().filter(|t| !t.is_empty());
+    let named = |base: &str, ext: &str| match &tag {
+        Some(t) => format!("{base}_{t}.{ext}"),
+        None => format!("{base}.{ext}"),
+    };
+
+    let t0 = Instant::now();
+    let (out, report) = bonsai_rs::backbone::backbone(&data, Some(params.clone()))?;
+    let secs = t0.elapsed().as_secs_f64();
+
+    let mut table = String::from("step\tloglik\tgain\n");
+    for s in &out.steps {
+        let _ = writeln!(table, "{}\t{:.3}\t{:.3}", s.step, s.loglik, s.gain);
+    }
+    let _ = writeln!(
+        table,
+        "# backbone_cells\t{}\n# placed\t{}\n# reoptimisations\t{}\n# mean_scored\t{:.2}",
+        report.backbone_cells, report.placed, report.reoptimisations, report.mean_scored
+    );
+
+    fs::write(
+        dir.join(named("backbone", "nwk")),
+        write_newick(&out.tree, &cell_labels(n_cells))? + "\n",
+    )?;
+    fs::write(dir.join(named("backbone_seconds", "txt")), format!("{secs}\n"))?;
+    fs::write(dir.join(named("backbone_steps", "tsv")), &table)?;
+    println!(
+        "backbone: {n_cells} cells by {p} features, backbone {} placed {} reopt {} \
+         in {secs:.2} s, loglik {:.1}",
+        report.backbone_cells, report.placed, report.reoptimisations, out.loglik
+    );
     Ok(())
 }
 

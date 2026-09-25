@@ -6,6 +6,8 @@ use crate::model::likelihood::NodeState;
 use crate::tree::Tree;
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::BonsaiFloat;
+use rustc_hash::FxHashSet;
+use std::collections::VecDeque;
 
 pub mod bounds;
 pub mod candidates;
@@ -231,6 +233,52 @@ pub(crate) fn leaf_words(tree: &Tree) -> Vec<u64> {
             .fold(0u64, |acc, &child| acc.wrapping_add(word[child as usize]));
     }
     word
+}
+
+/// Words of every node within `radius` edges of a clade a move created.
+///
+/// A created clade is a node of the new tree with no counterpart in the old
+/// one, which is exactly the path the move rewired. The walk is unrooted, so it
+/// reaches the moved subtree and its new siblings as well as the ancestors.
+/// SPR uses it to choose what the next sweep proposes, NNI to choose which
+/// cached gains to throw away.
+///
+/// ### Params
+///
+/// * `tree` - The tree the move produced
+/// * `word` - [`leaf_words`] of `tree`
+/// * `is_new` - Whether an internal node of `tree` is a clade the move created
+/// * `radius` - How many edges out to mark
+/// * `out` - Set the words are added to
+pub(crate) fn mark_near_new_clades(
+    tree: &Tree,
+    word: &[u64],
+    is_new: impl Fn(usize) -> bool,
+    radius: usize,
+    out: &mut FxHashSet<u64>,
+) {
+    let n = tree.n_nodes();
+    let mut dist = vec![usize::MAX; n];
+    let mut queue = VecDeque::new();
+    for v in tree.n_leaves()..n {
+        if is_new(v) {
+            dist[v] = 0;
+            queue.push_back(v as u32);
+        }
+    }
+    while let Some(v) = queue.pop_front() {
+        out.insert(word[v as usize]);
+        let d = dist[v as usize];
+        if d == radius {
+            continue;
+        }
+        for nb in tree.children(v).iter().copied().chain(tree.parent(v)) {
+            if dist[nb as usize] == usize::MAX {
+                dist[nb as usize] = d + 1;
+                queue.push_back(nb);
+            }
+        }
+    }
 }
 
 ///////////

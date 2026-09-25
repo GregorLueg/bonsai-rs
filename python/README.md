@@ -1,3 +1,7 @@
+[![PyPI](https://img.shields.io/pypi/v/bonsai-rs.svg)](https://pypi.org/project/bonsai-rs/)
+[![Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://gregorlueg.github.io/bonsai-rs/)
+[![CI](https://github.com/GregorLueg/bonsai-rs/actions/workflows/python-test.yml/badge.svg)](https://github.com/GregorLueg/bonsai-rs/actions/workflows/python-test.yml)
+
 # bonsai-rs
 
 Tree representations of single-cell data under Brownian motion. Python
@@ -52,4 +56,4 @@ uv run --group docs mkdocs serve
 ## Licence
 
 MIT. Built from the paper and its CC-BY-4.0 Supplementary Information only;
-see `PROVENANCE.md` in the repository. Cite the paper.
+see [provenance](https://github.com/GregorLueg/bonsai-rs/blob/main/PROVENANCE.md) in the repository. Cite the paper.

@@ -65,12 +65,13 @@ use crate::model::global::UpState;
 use crate::model::likelihood::NodeState;
 use crate::search::polytomy::{CentreStar, Splice, splice_star};
 use crate::search::star::{StarParams, StarResult, StarSelection, resolve_star};
-use crate::search::{Leaves, leaves_below, settle, tree_loglik};
+use crate::search::{Leaves, leaf_words, leaves_below, mark_near_new_clades, settle, tree_loglik};
 use crate::tree::Tree;
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::BonsaiFloat;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 ////////////////
 // Parameters //
@@ -129,6 +130,89 @@ const DEFAULT_RESTARTS: usize = 0;
 /// neutral setting; see [`nni_random`].
 pub const DEFAULT_RANDOM_TEMPERATURE: f64 = 1.0;
 
+/// Default for [`NniApprox::rescore_radius`].
+///
+/// Measured 2026-09-25, steps 5 to 8 from the same step-4 tree with the
+/// default SPR, scored against the generating tree, on balanced,
+/// random-branch and unbalanced trees at noise 0.4, 1.0 and 1.6 at 4,096 by
+/// 1,000 and on the four Sanity-preprocessed configurations. At radius five
+/// the finished tree matched the exact phase on all thirteen: loglikelihood,
+/// Robinson-Foulds and distance recovery to the last printed digit. Step 6
+/// went 7.6 s to 1.5 s, 12.0 s to 2.1 s and 13.2 s to 2.3 s on the three noisy
+/// synthetic trees, 29.6 s to 5.9 s at 5,000 cells and 99.4 s to 16.5 s at
+/// 10,000. On step 6 alone, radius three lost 7.5 nats at 5,000 cells and
+/// radius two 0.01; five was identical at both sizes.
+const DEFAULT_RESCORE_RADIUS: usize = 5;
+
+/// Knobs of the approximate greedy phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NniApprox {
+    /// After a move, rescore only the edges within this many edges of a clade
+    /// the move created, and keep every other edge's gain from the round it
+    /// was last scored in.
+    ///
+    /// Lazy greedy evaluation (Minoux, *Optimization Techniques*, 1978): the
+    /// leading cached gain is rescored on the current tree before it is taken,
+    /// and taken only if it still beats the runner-up, so every accepted move
+    /// is scored exactly. What a stale gain can do is hide an edge that has
+    /// become improving; a full scan runs whenever the cache has nothing left,
+    /// so the phase still stops only on a tree where no edge improves.
+    pub rescore_radius: usize,
+}
+
+impl NniApprox {
+    /// Build the knobs explicitly.
+    ///
+    /// ### Params
+    ///
+    /// * `rescore_radius` - See [`NniApprox::rescore_radius`]
+    ///
+    /// ### Returns
+    ///
+    /// The knobs.
+    pub fn new(rescore_radius: usize) -> Self {
+        Self { rescore_radius }
+    }
+}
+
+impl Default for NniApprox {
+    /// Every approximation at its default.
+    ///
+    /// ### Returns
+    ///
+    /// The default knobs.
+    fn default() -> Self {
+        Self {
+            rescore_radius: DEFAULT_RESCORE_RADIUS,
+        }
+    }
+}
+
+/// The specified greedy phase, or this crate's approximation of it.
+///
+/// Same shape as [`crate::search::spr::SprSearch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NniSearch {
+    /// Score every eligible edge every round and take the best, as SPEC.md
+    /// section 9.4 specifies.
+    Exact,
+    /// Lazy rescoring, see [`NniApprox`]. The default: the same finished
+    /// tree as [`NniSearch::Exact`] on every dataset measured, and five to
+    /// eight times faster on the noisy ones.
+    Approximate(NniApprox),
+}
+
+impl Default for NniSearch {
+    /// [`NniSearch::Approximate`] at its measured defaults.
+    ///
+    /// ### Returns
+    ///
+    /// The default search.
+    fn default() -> Self {
+        Self::Approximate(NniApprox::default())
+    }
+}
+
 /// Tuning knobs for search step 6.
 #[derive(Clone, Copy, Debug)]
 pub struct NniParams {
@@ -149,6 +233,8 @@ pub struct NniParams {
     pub n_restarts: usize,
     /// Softmax temperature of the random phase's pair draw.
     pub temperature: f64,
+    /// Whether the greedy phase rescores every edge every round.
+    pub search: NniSearch,
 }
 
 impl Default for NniParams {
@@ -165,6 +251,7 @@ impl Default for NniParams {
             max_rounds: DEFAULT_MAX_ROUNDS,
             n_restarts: DEFAULT_RESTARTS,
             temperature: DEFAULT_RANDOM_TEMPERATURE,
+            search: NniSearch::default(),
         }
     }
 }
@@ -560,6 +647,88 @@ fn rebuilds_the_same_splits<T>(
     splits == was_a_split && all_match
 }
 
+/// Score the interchange at one edge against the current tree's rows.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `down` - Down rows, settled against this tree
+/// * `up` - Up rows, settled against the same
+/// * `below` - [`leaves_below`] of the tree
+/// * `k` - Lower end of the edge
+/// * `star_params` - Star primitive knobs
+/// * `scratch` - Peel scratch, reused across edges
+///
+/// ### Returns
+///
+/// The edge's tallies, whose `best_gain` is its exact gain when it changes a
+/// split, and the proposal when that gain clears the floor; or the error the
+/// primitive failed with.
+fn scan_edge<T: BonsaiFloat>(
+    tree: &Tree,
+    down: &NodeState<T>,
+    up: &UpState<T>,
+    below: &[usize],
+    k: u32,
+    star_params: StarParams,
+    scratch: &mut PeelScratch<T>,
+) -> Result<ScannedEdge<T>, BonsaiErrors> {
+    let mut seen = NniRound {
+        best_gain: f64::NEG_INFINITY,
+        ..NniRound::default()
+    };
+    let Some(l) = tree.parent(k) else {
+        return Ok((seen, None));
+    };
+    let Some(star) = collapsed_star(tree, down, up, k) else {
+        return Ok((seen, None));
+    };
+    seen.eligible = 1;
+    let n_leaves = tree.n_leaves();
+    let result = resolve_star(star.view(), Some(star_params))?;
+    if result.merges.is_empty() {
+        return Ok((seen, None));
+    }
+    seen.proposed = 1;
+    // A proposal that puts the same subtrees back where they were is not an
+    // interchange: it is a reoptimisation of the three branches the star
+    // primitive creates at `l`. Those nearly always gain a little, and taking
+    // them turns the phase into branch-length descent that steps 4 and 7 do
+    // properly and far more cheaply. Started from the generating tree itself,
+    // accepting them runs hundreds of rounds with the Robinson-Foulds distance
+    // pinned at zero throughout: every one of those rounds is branch lengths
+    // and none is topology.
+    let k_lo = tree.children(l).len() - 1;
+    let k_hi = k_lo + tree.children(k).len();
+    let last = star.member_nodes.len() - 1;
+    let member_leaves: Vec<usize> = star
+        .member_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &node)| {
+            if star.has_upstream && i == last {
+                n_leaves - below[l as usize]
+            } else {
+                below[node as usize]
+            }
+        })
+        .collect();
+    if rebuilds_the_same_splits(&result, k_lo, k_hi, &member_leaves, n_leaves) {
+        return Ok((seen, None));
+    }
+    seen.changed = 1;
+
+    let gain: f64 = result.merges.iter().map(|x| x.gain).sum::<f64>()
+        + collapse_delta(tree, down, up, k, l, &star, scratch);
+    seen.best_gain = gain;
+    if gain > star_params.min_gain {
+        seen.improving = 1;
+        Ok((seen, Some((gain, k, star))))
+    } else {
+        Ok((seen, None))
+    }
+}
+
 /////////////
 // Phases //
 /////////////
@@ -684,6 +853,9 @@ pub fn nni_greedy<T: BonsaiFloat>(
     params: Option<NniParams>,
 ) -> Result<NniResult, BonsaiErrors> {
     let params = params.unwrap_or_default();
+    if let NniSearch::Approximate(approx) = params.search {
+        return nni_lazy(tree, leaves, params, approx.rescore_radius);
+    }
     let mut tree = tree.clone();
     let mut best: Option<f64> = None;
     let mut n_moves = 0usize;
@@ -695,7 +867,6 @@ pub fn nni_greedy<T: BonsaiFloat>(
         let (down, up, loglik) = settle(&tree, leaves)?;
         best = Some(loglik);
         let below = leaves_below(&tree);
-        let n_leaves = tree.n_leaves();
 
         // Every edge is scored against the same settled rows and nothing in the
         // scan writes to the tree, so the candidates are independent and the
@@ -716,62 +887,7 @@ pub fn nni_greedy<T: BonsaiFloat>(
             .par_iter()
             .map_init(
                 || PeelScratch::<T>::new(leaves.n_features),
-                |scratch, &k| -> Result<ScannedEdge<T>, BonsaiErrors> {
-                    let mut seen = NniRound {
-                        best_gain: f64::NEG_INFINITY,
-                        ..NniRound::default()
-                    };
-                    let Some(l) = tree.parent(k) else {
-                        return Ok((seen, None));
-                    };
-                    let Some(star) = collapsed_star(&tree, &down, &up, k) else {
-                        return Ok((seen, None));
-                    };
-                    seen.eligible = 1;
-                    let result = resolve_star(star.view(), Some(params.star))?;
-                    if result.merges.is_empty() {
-                        return Ok((seen, None));
-                    }
-                    seen.proposed = 1;
-                    // A proposal that puts the same subtrees back where they were is
-                    // not an interchange: it is a reoptimisation of the three branches
-                    // the star primitive creates at `l`. Those nearly always gain a
-                    // little, and taking them turns the phase into branch-length
-                    // descent that steps 4 and 7 do properly and far more cheaply.
-                    // Started from the generating tree itself, accepting them
-                    // runs hundreds of rounds with the Robinson-Foulds distance
-                    // pinned at zero throughout: every one of those rounds is
-                    // branch lengths and none is topology.
-                    let k_lo = tree.children(l).len() - 1;
-                    let k_hi = k_lo + tree.children(k).len();
-                    let last = star.member_nodes.len() - 1;
-                    let member_leaves: Vec<usize> = star
-                        .member_nodes
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &node)| {
-                            if star.has_upstream && i == last {
-                                n_leaves - below[l as usize]
-                            } else {
-                                below[node as usize]
-                            }
-                        })
-                        .collect();
-                    if rebuilds_the_same_splits(&result, k_lo, k_hi, &member_leaves, n_leaves) {
-                        return Ok((seen, None));
-                    }
-                    seen.changed = 1;
-
-                    let gain: f64 = result.merges.iter().map(|x| x.gain).sum::<f64>()
-                        + collapse_delta(&tree, &down, &up, k, l, &star, scratch);
-                    seen.best_gain = gain;
-                    if gain > params.star.min_gain {
-                        seen.improving = 1;
-                        Ok((seen, Some((gain, k, star))))
-                    } else {
-                        Ok((seen, None))
-                    }
-                },
+                |scratch, &k| scan_edge(&tree, &down, &up, &below, k, params.star, scratch),
             )
             .try_reduce(
                 || {
@@ -819,6 +935,157 @@ pub fn nni_greedy<T: BonsaiFloat>(
     let loglik = match best {
         Some(loglik) => loglik,
         // Only reachable at `max_rounds` zero, where the loop never ran.
+        None => tree_loglik(&tree, leaves)?,
+    };
+    Ok(NniResult {
+        tree,
+        loglik,
+        n_moves,
+        rounds,
+        trace,
+    })
+}
+
+/// The greedy phase with cached gains, [`NniSearch::Approximate`].
+///
+/// Round one scores every edge. After a move, only the edges within `radius`
+/// of the clades the move created lose their cached gain and are rescored; the
+/// rest keep the gain from the round they were last scored in. The move itself
+/// is chosen lazily: the leading cached gain is rescored on the current tree
+/// and taken only if it still beats the runner-up, otherwise its fresh gain goes
+/// back in the cache and the next leader is tried. When the cache holds nothing
+/// improving, the next round is a full scan, and a full scan that finds
+/// nothing ends the phase, which is the same stopping rule as the exact phase.
+///
+/// Edges are keyed by [`leaf_words`] of their lower end, so a gain survives the
+/// renumbering a splice performs. Everything that decides a move is sequential
+/// and the parallel scans collect in edge order, so the result does not depend
+/// on the thread count.
+///
+/// ### Params
+///
+/// * `tree` - Tree to improve; not modified
+/// * `leaves` - The leaf data
+/// * `params` - Knobs
+/// * `radius` - See [`NniApprox::rescore_radius`]
+///
+/// ### Returns
+///
+/// As [`nni_greedy`]. `trace` has one entry per round, counting only the edges
+/// that round actually scored.
+fn nni_lazy<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+    params: NniParams,
+    radius: usize,
+) -> Result<NniResult, BonsaiErrors> {
+    let min_gain = params.star.min_gain;
+    let mut tree = tree.clone();
+    let mut best: Option<f64> = None;
+    let mut n_moves = 0usize;
+    let mut rounds = 0usize;
+    let mut trace: Vec<NniRound> = Vec::new();
+    let mut cache: FxHashMap<u64, f64> = FxHashMap::default();
+    let mut full = true;
+
+    while rounds < params.max_rounds {
+        rounds += 1;
+        let (down, up, loglik) = settle(&tree, leaves)?;
+        best = Some(loglik);
+        let below = leaves_below(&tree);
+        let word = leaf_words(&tree);
+        if full {
+            cache.clear();
+        }
+        let edges: Vec<u32> = tree
+            .internal_postorder()
+            .filter(|&k| !cache.contains_key(&word[k as usize]))
+            .collect();
+
+        let scanned: Vec<(u32, NniRound)> = edges
+            .par_iter()
+            .map_init(
+                || PeelScratch::<T>::new(leaves.n_features),
+                |scratch, &k| {
+                    scan_edge(&tree, &down, &up, &below, k, params.star, scratch)
+                        .map(|(seen, _)| (k, seen))
+                },
+            )
+            .collect::<Result<_, _>>()?;
+        let mut round = NniRound {
+            best_gain: f64::NEG_INFINITY,
+            ..NniRound::default()
+        };
+        for &(k, seen) in &scanned {
+            round.eligible += seen.eligible;
+            round.proposed += seen.proposed;
+            round.changed += seen.changed;
+            round.improving += seen.improving;
+            round.best_gain = round.best_gain.max(seen.best_gain);
+            cache.insert(word[k as usize], seen.best_gain);
+        }
+        trace.push(round);
+
+        let mut scratch = PeelScratch::<T>::new(leaves.n_features);
+        let winner = loop {
+            // Leader and runner-up over the edges the tree has now, ties to
+            // the lower node as in the exact phase.
+            let mut lead: Option<(f64, u32)> = None;
+            let mut second = f64::NEG_INFINITY;
+            for k in tree.internal_postorder() {
+                let g = cache
+                    .get(&word[k as usize])
+                    .copied()
+                    .unwrap_or(f64::NEG_INFINITY);
+                match lead {
+                    Some((top, _)) if g <= top => second = second.max(g),
+                    _ => {
+                        if let Some((top, _)) = lead {
+                            second = second.max(top);
+                        }
+                        lead = Some((g, k));
+                    }
+                }
+            }
+            let Some((top, k)) = lead.filter(|&(g, _)| g > min_gain) else {
+                break None;
+            };
+            let _ = top;
+            let (seen, proposal) =
+                scan_edge(&tree, &down, &up, &below, k, params.star, &mut scratch)?;
+            cache.insert(word[k as usize], seen.best_gain);
+            if let Some(found) = proposal.filter(|p| p.0 >= second) {
+                break Some(found);
+            }
+        };
+
+        match winner {
+            None if full => break,
+            None => full = true,
+            Some((gain, _, star)) => {
+                let before: FxHashSet<u64> = word.iter().copied().collect();
+                tree = splice_star(&tree, &star, Some(params.star))?.tree;
+                best = Some(loglik + gain);
+                n_moves += 1;
+                let after = leaf_words(&tree);
+                let mut stale = FxHashSet::default();
+                mark_near_new_clades(
+                    &tree,
+                    &after,
+                    |v| !before.contains(&after[v]),
+                    radius,
+                    &mut stale,
+                );
+                for w in &stale {
+                    cache.remove(w);
+                }
+                full = false;
+            }
+        }
+    }
+
+    let loglik = match best {
+        Some(loglik) => loglik,
         None => tree_loglik(&tree, leaves)?,
     };
     Ok(NniResult {
@@ -1437,6 +1704,82 @@ mod tests {
             assert_eq!(got.loglik.to_bits(), reference.loglik.to_bits());
             assert_eq!(got.n_moves, reference.n_moves);
             assert_eq!(got.rounds, reference.rounds);
+        }
+    }
+
+    /// Greedy knobs with the given search.
+    ///
+    /// ### Params
+    ///
+    /// * `search` - Exact or approximate
+    ///
+    /// ### Returns
+    ///
+    /// The default knobs with that search.
+    fn with(search: NniSearch) -> Option<NniParams> {
+        Some(NniParams {
+            search,
+            ..NniParams::default()
+        })
+    }
+
+    #[test]
+    fn test_a_rescore_radius_wider_than_the_tree_makes_the_exact_moves() {
+        // With every cached gain thrown away after every move, each round
+        // rescores every edge on the current rows, so the leader is the exact
+        // phase's winner and its fresh rescore reproduces it. The only
+        // difference is one extra full scan at the end to confirm.
+        let (p, n) = (128usize, 32usize);
+        let (data, w) = dataset(n, p, 3);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let exact = nni_greedy(&start, leaves, with(NniSearch::Exact)).expect("exact");
+        let wide = nni_greedy(
+            &start,
+            leaves,
+            with(NniSearch::Approximate(NniApprox::new(4 * n))),
+        )
+        .expect("lazy");
+        assert!(exact.n_moves > 0);
+        assert_eq!(wide.n_moves, exact.n_moves);
+        assert_eq!(splits(&wide.tree), splits(&exact.tree));
+        assert_eq!(wide.loglik.to_bits(), exact.loglik.to_bits());
+    }
+
+    #[test]
+    fn test_the_lazy_phase_stops_only_where_the_exact_phase_would() {
+        // Stale gains may hide an improving edge for a while, never for good:
+        // the phase ends only on a full scan that finds nothing. So the exact
+        // phase, handed the lazy phase's tree, must find no move, and the
+        // loglikelihood must be the tree's own.
+        let (p, n) = (128usize, 32usize);
+        let (data, w) = dataset(n, p, 3);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let before = tree_loglik(&start, leaves).expect("loglik");
+        for radius in [1usize, 2, 3] {
+            let lazy = nni_greedy(
+                &start,
+                leaves,
+                with(NniSearch::Approximate(NniApprox::new(radius))),
+            )
+            .expect("lazy");
+            assert!(lazy.loglik > before, "radius {radius}");
+            approx::assert_relative_eq!(
+                lazy.loglik,
+                tree_loglik(&lazy.tree, leaves).expect("loglik"),
+                max_relative = 1e-12
+            );
+            let again = nni_greedy(&lazy.tree, leaves, with(NniSearch::Exact)).expect("exact");
+            assert_eq!(again.n_moves, 0, "radius {radius} stopped early");
         }
     }
 

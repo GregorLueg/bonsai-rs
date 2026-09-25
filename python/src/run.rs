@@ -8,6 +8,8 @@
 use bonsai_rs::backbone::{BackboneParams, backbone as backbone_run};
 use bonsai_rs::bonsai::{BonsaiParams, StartTree, bonsai as bonsai_run};
 use bonsai_rs::ingest::{IngestParams, from_sanity as s5, from_sanity_output, prepare};
+use bonsai_rs::search::nni::{NniParams, NniSearch};
+use bonsai_rs::search::spr::{SprParams, SprSearch};
 use bonsai_rs::tree::simulate::{
     SimulationParams, simulate_binary, simulate_binary_random_branches, simulate_unbalanced,
 };
@@ -19,10 +21,10 @@ use pyo3::types::PyDict;
 use sanity_sc_rs::config::{SanityParams, VarianceRule};
 use sanity_sc_rs::float::SanityFloat;
 use sanity_sc_rs::input::CountMatrix;
-use sanity_sc_rs::sanity as sanity_run;
 
 use crate::convert::{flat, result_out, slice, tree_out};
 use crate::error::BErr;
+use crate::gpu::{check, run_sanity};
 
 /// What a float has to be to go through every path in this file.
 trait Float: BonsaiFloat + SanityFloat + Element {}
@@ -67,31 +69,52 @@ fn pair<'py>(a: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Pair<'py>
 /// ### Params
 ///
 /// * `start` - `"linkage"` or `"greedy"`
+/// * `search` - `"approximate"` or `"exact"`, for SPR and NNI together
 /// * `min_snr` - Signal-to-noise floor, `None` for the default
 /// * `max_amp` - S5 amplification cap, `None` for the default
 /// * `reroot` - Reroot for display once the search is done
 ///
 /// ### Returns
 ///
-/// The parameters, or a `ValueError` on an unknown start.
+/// The parameters, or a `ValueError` on an unknown start or search.
 fn params(
     start: &str,
+    search: &str,
     min_snr: Option<f64>,
     max_amp: Option<f64>,
     reroot: bool,
 ) -> PyResult<BonsaiParams> {
-    let mut p = BonsaiParams::default();
-    p.start = match start {
+    let d = BonsaiParams::default();
+    let start = match start {
         "linkage" => StartTree::Linkage,
         "greedy" => StartTree::GreedyMerge,
         s => return Err(PyValueError::new_err(format!("unknown start '{s}'"))),
     };
-    p.ingest = IngestParams {
-        min_signal_to_noise: min_snr.unwrap_or(p.ingest.min_signal_to_noise),
-        max_sanity_amplification: max_amp.unwrap_or(p.ingest.max_sanity_amplification),
+    let (spr, nni) = match search {
+        "approximate" => (d.spr, d.nni),
+        "exact" => (
+            SprParams {
+                search: SprSearch::Exact,
+                ..d.spr
+            },
+            NniParams {
+                search: NniSearch::Exact,
+                ..d.nni
+            },
+        ),
+        s => return Err(PyValueError::new_err(format!("unknown search '{s}'"))),
     };
-    p.reroot = reroot;
-    Ok(p)
+    Ok(BonsaiParams {
+        start,
+        spr,
+        nni,
+        ingest: IngestParams {
+            min_signal_to_noise: min_snr.unwrap_or(d.ingest.min_signal_to_noise),
+            max_sanity_amplification: max_amp.unwrap_or(d.ingest.max_sanity_amplification),
+        },
+        reroot,
+        ..d
+    })
 }
 
 /// Build a Sanity parameter set from the rule name.
@@ -168,6 +191,7 @@ fn counts_in(
 /// * `cell_totals` - Total UMIs per cell over all genes
 /// * `rule`, `fixed_variance` - As [`sanity_params`]
 /// * `double` - `float64` storage instead of `float32`
+/// * `gpu` - Run Sanity on the GPU, see [`crate::gpu`]
 ///
 /// ### Returns
 ///
@@ -184,14 +208,16 @@ pub fn sanity<'py>(
     rule: &str,
     fixed_variance: Option<f64>,
     double: bool,
+    gpu: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
+    check(gpu)?;
     let counts = counts_in(&indices, &values, &indptr, n_cells)?;
     let totals = slice(&cell_totals)?;
     let sp = sanity_params(rule, fixed_variance)?;
     if double {
-        sanity_out::<f64>(py, &counts, totals, sp)
+        sanity_out::<f64>(py, &counts, totals, sp, gpu)
     } else {
-        sanity_out::<f32>(py, &counts, totals, sp)
+        sanity_out::<f32>(py, &counts, totals, sp, gpu)
     }
 }
 
@@ -203,6 +229,7 @@ pub fn sanity<'py>(
 /// * `counts` - The counts
 /// * `totals` - Total UMIs per cell
 /// * `sp` - Sanity parameters
+/// * `gpu` - Run Sanity on the GPU
 ///
 /// ### Returns
 ///
@@ -212,10 +239,9 @@ fn sanity_out<'py, T: Float>(
     counts: &CountMatrix,
     totals: &[f64],
     sp: SanityParams,
+    gpu: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let out = py
-        .detach(|| sanity_run::<T>(counts, totals, Some(sp)))
-        .map_err(BErr::from)?;
+    let out = py.detach(|| run_sanity::<T>(counts, totals, sp, gpu))?;
     let (g, c) = (out.n_genes, out.n_cells);
     let d = PyDict::new(py);
     d.set_item(
@@ -280,7 +306,7 @@ fn s5_out<'py, T: Float>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let (mean, n, p) = flat(m)?;
     let (sd, _, _) = flat(s)?;
-    let ip = params("linkage", None, max_amp, true)?.ingest;
+    let ip = params("linkage", "approximate", None, max_amp, true)?.ingest;
     let lik = py
         .detach(|| s5(mean, sd, n, p, v, Some(ip)))
         .map_err(BErr)?;
@@ -318,23 +344,25 @@ fn s5_out<'py, T: Float>(
 ///
 /// * `means`, `sds` - `(n_cells, n_features)`, both `float32` or both `float64`
 /// * `variances` - Per-feature variance, `None` to estimate
-/// * `start`, `min_snr`, `reroot` - As [`params`]
+/// * `start`, `search`, `min_snr`, `reroot` - As [`params`]
 ///
 /// ### Returns
 ///
 /// The dict `convert::result_out` builds.
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 pub fn bonsai<'py>(
     py: Python<'py>,
     means: &Bound<'py, PyAny>,
     sds: &Bound<'py, PyAny>,
     variances: Option<PyReadonlyArray1<'py, f64>>,
     start: &str,
+    search: &str,
     min_snr: Option<f64>,
     reroot: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let v = variances.as_ref().map(slice).transpose()?;
-    let bp = params(start, min_snr, None, reroot)?;
+    let bp = params(start, search, min_snr, None, reroot)?;
     match pair(means, sds)? {
         Pair::F32(m, s) => bonsai_out(py, &m, &s, v, bp),
         Pair::F64(m, s) => bonsai_out(py, &m, &s, v, bp),
@@ -374,7 +402,8 @@ fn bonsai_out<'py, T: Float>(
 /// * `cell_totals` - Total UMIs per cell over all genes
 /// * `rule`, `fixed_variance` - As [`sanity_params`]
 /// * `double` - `float64` storage instead of `float32`
-/// * `start`, `min_snr`, `max_amp`, `reroot` - As [`params`]
+/// * `gpu` - Run Sanity on the GPU, see [`crate::gpu`]
+/// * `start`, `search`, `min_snr`, `max_amp`, `reroot` - As [`params`]
 ///
 /// ### Returns
 ///
@@ -392,19 +421,22 @@ pub fn bonsai_from_counts<'py>(
     rule: &str,
     fixed_variance: Option<f64>,
     double: bool,
+    gpu: bool,
     start: &str,
+    search: &str,
     min_snr: Option<f64>,
     max_amp: Option<f64>,
     reroot: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
+    check(gpu)?;
     let counts = counts_in(&indices, &values, &indptr, n_cells)?;
     let totals = slice(&cell_totals)?;
     let sp = sanity_params(rule, fixed_variance)?;
-    let bp = params(start, min_snr, max_amp, reroot)?;
+    let bp = params(start, search, min_snr, max_amp, reroot)?;
     if double {
-        chain::<f64>(py, &counts, totals, sp, bp)
+        chain::<f64>(py, &counts, totals, sp, bp, gpu)
     } else {
-        chain::<f32>(py, &counts, totals, sp, bp)
+        chain::<f32>(py, &counts, totals, sp, bp, gpu)
     }
 }
 
@@ -416,6 +448,7 @@ pub fn bonsai_from_counts<'py>(
 /// * `counts` - The counts
 /// * `totals` - Total UMIs per cell
 /// * `sp`, `bp` - Sanity and Bonsai parameters
+/// * `gpu` - Run Sanity on the GPU
 ///
 /// ### Returns
 ///
@@ -426,9 +459,10 @@ fn chain<'py, T: Float>(
     totals: &[f64],
     sp: SanityParams,
     bp: BonsaiParams,
+    gpu: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (res, genes, dropped) = py.detach(|| -> Result<_, BErr> {
-        let out = sanity_run::<T>(counts, totals, Some(sp))?;
+        let out = run_sanity::<T>(counts, totals, sp, gpu)?;
         let lik = from_sanity_output(&out, Some(bp.ingest))?;
         let k = lik.features.len();
         let res = bonsai_run(
@@ -450,7 +484,8 @@ fn chain<'py, T: Float>(
 ///
 /// ### Params
 ///
-/// * `means`, `sds`, `variances`, `start`, `min_snr`, `reroot` - As [`bonsai`]
+/// * `means`, `sds`, `variances`, `start`, `search`, `min_snr`, `reroot` - As
+///   [`bonsai`]
 /// * `backbone_cells` - Cells in the backbone, `None` for the default
 /// * `seed` - Seed for choosing the backbone
 ///
@@ -465,6 +500,7 @@ pub fn backbone<'py>(
     sds: &Bound<'py, PyAny>,
     variances: Option<PyReadonlyArray1<'py, f64>>,
     start: &str,
+    search: &str,
     min_snr: Option<f64>,
     reroot: bool,
     backbone_cells: Option<usize>,
@@ -472,7 +508,7 @@ pub fn backbone<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let v = variances.as_ref().map(slice).transpose()?;
     let mut bb = BackboneParams {
-        bonsai: params(start, min_snr, None, reroot)?,
+        bonsai: params(start, search, min_snr, None, reroot)?,
         seed,
         ..BackboneParams::default()
     };

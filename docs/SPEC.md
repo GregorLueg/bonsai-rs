@@ -2,7 +2,7 @@
 
 Transcribed from the CC-BY-4.0 paper and Supplementary Information of de Groot,
 Morillo Leonardo, Pachkov and van Nimwegen, *Nature Biotechnology* 2026,
-doi 10.1038/s41587-026-03220-2. See `PROVENANCE.md`.
+doi 10.1038/s41587-026-03220-2. See [provenance](../PROVENANCE.md).
 
 **This file is the only implementation source.** Code cites the `(Sxx)` numbers
 below. Where this document restructures an SI expression for numerical or
@@ -420,6 +420,17 @@ parent, so it is the least confidently placed. Regrafting summarises the pruned
 subtree as an effective leaf and runs the beam search of section 7.2, followed by
 polytomy resolution.
 
+**Deviation: the default revisits only what changed, 2026-09-24.** Sweeps repeat
+until one accepts nothing, and each proposes every subtree. This crate's default
+(`SprSearch::Approximate`) proposes every subtree in the first sweep only; later
+sweeps propose only subtrees within five edges of a clade the previous sweep's
+moves created. `SprSearch::Exact` is the search as specified. Measured over
+three tree shapes at three noise levels and four real-data configurations up to
+10,000 cells, the approximation lands within a few nats of the exact search and
+roughly halves steps 5 to 8 at 5,000 and 10,000 cells; [performance](PERFORMANCE.md) has
+the numbers. `test_a_revisit_radius_wider_than_the_tree_changes_nothing` pins
+the approximate path to the exact one when the radius covers the tree.
+
 ### 9.4 NNI, generalised to polytomies (SI.C.6)
 
 The textbook NNI reconnects four subtrees around an internal edge. Bonsai's trees
@@ -455,6 +466,18 @@ gives anyway. On a ladder with unoptimised branch lengths the filter makes
 recovery worse (RF 44 to 24 rather than to 0), because the landscape is then
 dominated by wrong branch lengths and the only improvements available are the
 ones the filter rejects.
+
+**Deviation: the default greedy phase rescores lazily, 2026-09-25.** Taken
+literally the greedy phase scores every edge every round and performs one move,
+so it costs a full scan per move. This crate's default (`NniSearch::Approximate`)
+caches each edge's gain, rescores after a move only the edges within five edges
+of the clades the move created, and rescores the leading cached gain on the
+current tree before taking it (lazy greedy evaluation, Minoux 1978). A full scan
+runs whenever nothing cached improves, so the phase still stops only where no
+edge improves. On thirteen datasets across three tree shapes, three noise levels
+and four real-data configurations up to 10,000 cells, the finished tree matched
+`NniSearch::Exact` on every one, with step 6 five to eight times faster where
+it had work to do.
 
 **The random phase is close to inert at realistic feature counts.** This is a
 property of the method as published, not of this implementation. The softmax is

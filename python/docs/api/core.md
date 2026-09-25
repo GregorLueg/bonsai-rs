@@ -13,3 +13,5 @@ Counts to posteriors, posteriors to likelihood parameters, and the search.
         - backbone
 
 ::: bonsai_rs.BonsaiError
+
+::: bonsai_rs.gpu_available

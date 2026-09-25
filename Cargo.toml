@@ -1,6 +1,6 @@
 [package]
 name = "bonsai-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -13,7 +13,7 @@ categories = [
     "science::computational-biology",
 ]
 # The comparison figures are for the repository, not for the published tarball.
-exclude = ["docs/figures/*"]
+exclude = ["docs/figures/*", "reference/comparison/*"]
 
 [lib]
 name = "bonsai_rs"
@@ -24,13 +24,19 @@ ann-search-rs = "0.8.4"
 num-traits = "0.2.19"
 rayon = "1.11.0"
 rustc-hash = "2.1.1"
-sanity-sc-rs = { version = "0.0.1", optional = true }
+cubecl = { version = "0.10.0", features = ["wgpu"], optional = true }
+sanity-sc-rs = { version = "0.1.0", optional = true }
 thiserror = "2.0.18"
 wide = "1.4.0"
 
 [features]
 ## Raw UMI counts in, via Sanity posteriors: `ingest::from_sanity_output`.
 sanity = ["dep:sanity-sc-rs"]
+## Sanity on the GPU through CubeCL/wgpu: `sanity_sc_rs::gpu::sanity_gpu`, whose
+## output `ingest::from_sanity_output` takes as it takes the CPU run's.
+gpu = ["sanity", "sanity-sc-rs/gpu", "dep:cubecl"]
+## The tests that need a wgpu adapter on the machine.
+gpu-tests = ["gpu"]
 
 [dev-dependencies]
 approx = "0.5.1"

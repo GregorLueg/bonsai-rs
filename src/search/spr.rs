@@ -57,8 +57,8 @@
 //!
 //! The terms come from [`LazyRows::loglik`], which reads the current tree's
 //! terms wherever the candidate's subtrees are the current tree's and
-//! recomputes the rest; an accepted candidate's rows are assembled from the
-//! same rows by [`LazyRows::into_state`] rather than swept. A fresh
+//! recomputes the rest; an accepted candidate's rows are written into the
+//! current tree's [`RowStore`] by [`RowStore::accept`] rather than swept. A fresh
 //! [`NodeState::prune`] per candidate is correct and is what this replaced, but
 //! it pays an `O(n p)` sweep for every candidate that passes the split filter,
 //! and at the noise levels where the step earns its keep that is a third of the
@@ -91,14 +91,16 @@ use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place};
 use crate::search::polytomy::{CentreStar, splice_star};
 use crate::search::star::StarParams;
-use crate::search::{Leaves, leaf_words, settled_down, split_fingerprint_with, tree_loglik};
+use crate::search::{
+    Leaves, leaf_words, mark_near_new_clades, settled_down, split_fingerprint_with, tree_loglik,
+};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
 use crate::utils::simd::prune_binary;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::OnceCell;
 
 ////////////////
@@ -175,6 +177,29 @@ const PROPOSAL_CHUNK_MIN: usize = 8;
 /// candidate is a whole arena, so a chunk holds this many trees at once.
 const PROPOSAL_CHUNK_MAX: usize = 256;
 
+/// Default for [`SprApprox::revisit_radius`].
+///
+/// Measured 2026-09-24, steps 5 to 8 from the same step-4 tree, scored against
+/// the generating tree. Synthetic: balanced, random-branch and unbalanced
+/// shapes at noise 0.4, 1.0 and 1.6, 4,096 cells by 1,000 features. At radius
+/// five the loglikelihood stayed within 1 nat of the full search on all nine and
+/// Robinson-Foulds within 8 splits of 2,000 to 2,400 at noise 1.6, and step 5
+/// ran 1.4 to 2.7 times faster. Sanity-preprocessed, 512 to 10,000 cells:
+///
+/// | cells | radius | steps 5-8 | loglik | Robinson-Foulds |
+/// |---|---|---|---|---|
+/// | 5,000 | 0 | 132.7 s | -5,557,974.99 | 1,293 |
+/// | 5,000 | 5 | 84.8 s | -5,557,978.08 | 1,288 |
+/// | 10,000 | 0 | 461.0 s | -11,253,188.26 | 2,632 |
+/// | 10,000 | 3 | 406.2 s | -11,253,459.03 | 2,644 |
+/// | 10,000 | 5 | 257.8 s | -11,252,720.99 | 2,624 |
+///
+/// Both 512-cell panels come back identical at radius three and five. Three
+/// is too tight at 10,000: step 5 stops early and step 6 inherits the work,
+/// 106 s to 273 s. Five is the smallest radius that held on every dataset.
+/// Timings were taken at a load average of 7 to 16.
+const DEFAULT_REVISIT_RADIUS: usize = 5;
+
 /// Which subtree the sweep considers next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PruneOrder {
@@ -193,6 +218,92 @@ pub enum PruneOrder {
     LongestBranch,
     /// A uniform shuffle of the eligible subtrees, from [`SprParams::seed`].
     Random,
+}
+
+/// Knobs of the approximate search, each an approximation that changes the
+/// answer and carries its measurement on its default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SprApprox {
+    /// After the first sweep, propose only subtrees within this many edges of
+    /// a clade the previous sweep's accepted moves created. `0` switches this
+    /// approximation off and proposes every subtree every sweep.
+    ///
+    /// The don't-look bits of TSP local search (Bentley, *ORSA Journal on
+    /// Computing*, 1992): a subtree whose neighbourhood nothing touched last
+    /// sweep is very likely to land where it landed then. Very likely, not
+    /// certainly, because every effective leaf depends on the whole tree. See
+    /// [`DEFAULT_REVISIT_RADIUS`].
+    pub revisit_radius: usize,
+}
+
+impl SprApprox {
+    /// Build the knobs explicitly.
+    ///
+    /// ### Params
+    ///
+    /// * `revisit_radius` - See [`SprApprox::revisit_radius`]; `0` is off
+    ///
+    /// ### Returns
+    ///
+    /// The knobs.
+    pub fn new(revisit_radius: usize) -> Self {
+        Self { revisit_radius }
+    }
+}
+
+impl Default for SprApprox {
+    /// Every approximation at its measured default.
+    ///
+    /// ### Returns
+    ///
+    /// The default knobs.
+    fn default() -> Self {
+        Self {
+            revisit_radius: DEFAULT_REVISIT_RADIUS,
+        }
+    }
+}
+
+/// The specified search, or this crate's approximation of it.
+///
+/// Same shape as [`crate::bonsai::StartTree`]: one arm reproduces the paper and
+/// the other is what we recommend. Both return a tree whose loglikelihood never
+/// falls below the input's; they differ in which moves they get to look at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprSearch {
+    /// Every subtree every sweep, as SPEC.md section 9.3 specifies. Choose it
+    /// to reproduce the published method, or to check on your own data what
+    /// the approximation costs.
+    Exact,
+    /// The approximations in [`SprApprox`]. The default: within a few nats of
+    /// [`SprSearch::Exact`] on every dataset measured, and up to twice as fast
+    /// over steps 5 to 8.
+    Approximate(SprApprox),
+}
+
+impl Default for SprSearch {
+    /// [`SprSearch::Approximate`] at its measured defaults.
+    ///
+    /// ### Returns
+    ///
+    /// The default search.
+    fn default() -> Self {
+        Self::Approximate(SprApprox::default())
+    }
+}
+
+impl SprSearch {
+    /// The revisit radius in force, `0` when every subtree is proposed.
+    ///
+    /// ### Returns
+    ///
+    /// The radius.
+    fn revisit_radius(&self) -> usize {
+        match self {
+            Self::Exact => 0,
+            Self::Approximate(a) => a.revisit_radius,
+        }
+    }
 }
 
 /// Tuning knobs for search step 5.
@@ -220,6 +331,8 @@ pub struct SprParams {
     /// [`DEFAULT_MIN_RELATIVE_GAIN`] for why an absolute floor alone is not
     /// enough.
     pub min_relative_gain: f64,
+    /// Whether to run the specified search or this crate's approximation of it.
+    pub search: SprSearch,
 }
 
 impl Default for SprParams {
@@ -237,6 +350,7 @@ impl Default for SprParams {
             placement: PlacementParams::default(),
             star: StarParams::default(),
             min_relative_gain: DEFAULT_MIN_RELATIVE_GAIN,
+            search: SprSearch::default(),
         }
     }
 }
@@ -322,10 +436,10 @@ impl SprResult {
 /// detached subtree and a suppressed degree-two node leave the arena. Kept
 /// leaves are compacted into `0..k` in ascending original order, and kept
 /// internal nodes are numbered by height and then by original index, which is
-/// exactly the order [`Tree::from_parents`] relabels into. Its relabelling is
-/// therefore the identity, which is what makes the map returned here a map of
-/// the tree that comes back rather than of the array that went in;
-/// `test_the_node_map_survives_the_arena` pins that.
+/// exactly the order [`Tree::from_parents`] relabels into. So the arena is
+/// built by [`Tree::from_level_ordered`], which skips the relabelling, and
+/// the map returned here is a map of the tree that comes back rather than of
+/// the array that went in; `test_the_node_map_survives_the_arena` pins that.
 ///
 /// ### Params
 ///
@@ -433,7 +547,7 @@ fn assemble(
         };
         new_branch[here as usize] = branch[old];
     }
-    let tree = Tree::from_parents(new_parent, new_branch, n_kept_leaves)?;
+    let tree = Tree::from_level_ordered(new_parent, new_branch, n_kept_leaves)?;
     Ok((tree, new_id))
 }
 
@@ -561,6 +675,179 @@ fn prune_subtree(tree: &Tree, x: u32) -> Result<Option<Pruned>, BonsaiErrors> {
 // Settled rows //
 //////////////////
 
+/// The current tree's settled down rows, stored by slot rather than by node.
+///
+/// An accepted move renumbers the arena, so a state indexed by node has to be
+/// rebuilt row for row even though all but `O(depth)` of its rows are
+/// unchanged. That rebuild was an `O(n p)` copy per acceptance, on the
+/// sequential path with every other thread waiting: 23 of the 42 seconds of the
+/// first round at 5,000 cells by 2,701 features, measured 2026-09-24. Here a
+/// node points at a slot and [`RowStore::accept`] repoints the nodes whose
+/// subtree the move left alone and writes only the rows it changed, into slots
+/// the move freed.
+#[derive(Clone)]
+struct RowStore<T> {
+    /// Number of features.
+    p: usize,
+    /// Per node of the current tree, its slot.
+    slot: Vec<u32>,
+    /// Down means, `[slot][feature]`, row-major.
+    m: Vec<T>,
+    /// Down precisions, same layout.
+    w: Vec<T>,
+    /// Loglikelihood contribution of each slot's node, zero for a leaf.
+    contrib: Vec<f64>,
+}
+
+impl<T: BonsaiFloat> RowStore<T> {
+    /// Copy a settled state into slots, one per node in node order.
+    ///
+    /// ### Params
+    ///
+    /// * `state` - Down rows settled against the tree
+    /// * `n_nodes` - Node count of that tree
+    ///
+    /// ### Returns
+    ///
+    /// The store.
+    fn from_state(state: &NodeState<T>, n_nodes: usize) -> Self {
+        let p = state.n_features();
+        let mut m = Vec::with_capacity(n_nodes * p);
+        let mut w = Vec::with_capacity(n_nodes * p);
+        for v in 0..n_nodes as u32 {
+            m.extend_from_slice(state.means(v));
+            w.extend_from_slice(state.precisions(v));
+        }
+        Self {
+            p,
+            slot: (0..n_nodes as u32).collect(),
+            m,
+            w,
+            contrib: (0..n_nodes as u32).map(|v| state.contribution(v)).collect(),
+        }
+    }
+
+    /// Number of features.
+    ///
+    /// ### Returns
+    ///
+    /// The feature count.
+    #[inline]
+    fn n_features(&self) -> usize {
+        self.p
+    }
+
+    /// Down means of one node.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node of the current tree
+    ///
+    /// ### Returns
+    ///
+    /// Its row.
+    #[inline]
+    fn means(&self, node: u32) -> &[T] {
+        let lo = self.slot[node as usize] as usize * self.p;
+        &self.m[lo..lo + self.p]
+    }
+
+    /// Down precisions of one node.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node of the current tree
+    ///
+    /// ### Returns
+    ///
+    /// Its row.
+    #[inline]
+    fn precisions(&self, node: u32) -> &[T] {
+        let lo = self.slot[node as usize] as usize * self.p;
+        &self.w[lo..lo + self.p]
+    }
+
+    /// Loglikelihood contribution of one node.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node of the current tree
+    ///
+    /// ### Returns
+    ///
+    /// The term, zero for a leaf.
+    #[inline]
+    fn contribution(&self, node: u32) -> f64 {
+        self.contrib[self.slot[node as usize] as usize]
+    }
+
+    /// Make the store describe the tree an accepted move produced.
+    ///
+    /// Row for row what [`NodeState::prune`] would produce on `tree`, because
+    /// every row either is one of the current rows or was formed by
+    /// [`LazyRows`] through the kernels `prune` dispatches to.
+    /// `test_the_incremental_loglik_matches_a_fresh_prune` pins one acceptance
+    /// to the bit and `test_a_chain_of_accepted_moves_leaves_the_store_a_fresh_prune`
+    /// a chain of them, which is what reuses freed slots.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - The tree the move produced
+    /// * `to_old` - Per node of `tree`, its node in `was`, or [`NO_NODE`]
+    /// * `was` - The tree the store currently describes
+    ///
+    /// ### Returns
+    ///
+    /// `Ok` once the store describes `tree`, or the error [`LazyRows::new`]
+    /// failed with.
+    fn accept(&mut self, tree: &Tree, to_old: &[u32], was: &Tree) -> Result<(), BonsaiErrors> {
+        let LazyRows {
+            inherited,
+            slot: fresh_slot,
+            fresh_m,
+            fresh_w,
+            fresh_contrib,
+            ..
+        } = LazyRows::new(tree, to_old, was, self)?;
+        let p = self.p;
+
+        let mut used = vec![false; self.contrib.len()];
+        let mut slot: Vec<u32> = inherited
+            .iter()
+            .map(|&old| {
+                if old == NO_NODE {
+                    return NO_NODE;
+                }
+                let s = self.slot[old as usize];
+                used[s as usize] = true;
+                s
+            })
+            .collect();
+        let mut free = (0..used.len() as u32).filter(|&s| !used[s as usize]);
+        for (v, &f) in fresh_slot.iter().enumerate() {
+            if f == NO_NODE {
+                continue;
+            }
+            let s = match free.next() {
+                Some(s) => s as usize,
+                None => {
+                    self.m.resize(self.m.len() + p, T::zero());
+                    self.w.resize(self.w.len() + p, T::zero());
+                    self.contrib.push(0.0);
+                    self.contrib.len() - 1
+                }
+            };
+            let f = f as usize;
+            self.m[s * p..(s + 1) * p].copy_from_slice(&fresh_m[f * p..(f + 1) * p]);
+            self.w[s * p..(s + 1) * p].copy_from_slice(&fresh_w[f * p..(f + 1) * p]);
+            self.contrib[s] = fresh_contrib[f];
+            slot[v] = s as u32;
+        }
+        self.slot = slot;
+        Ok(())
+    }
+}
+
 /// One node's settled row, means and precisions.
 ///
 /// Owned and boxed rather than written into a slab, because the beam search's
@@ -618,7 +905,7 @@ struct LazyRows<'a, T> {
     /// Number of features.
     p: usize,
     /// Down rows of the tree the move started from.
-    base: &'a NodeState<T>,
+    base: &'a RowStore<T>,
     /// Per node, the node of that tree whose down row it still has, or
     /// [`NO_NODE`] where the move changed it.
     inherited: Vec<u32>,
@@ -657,7 +944,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
         tree: &'a Tree,
         to_old: &[u32],
         was: &Tree,
-        base: &'a NodeState<T>,
+        base: &'a RowStore<T>,
     ) -> Result<Self, BonsaiErrors> {
         let p = base.n_features();
         let n = tree.n_nodes();
@@ -787,38 +1074,6 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
             };
         }
         total
-    }
-
-    /// The rows as a settled state of the tree they describe.
-    ///
-    /// Row for row what [`NodeState::prune`] would produce, because every row
-    /// either is one of its rows or was formed through the kernels it
-    /// dispatches to; a copy rather than a sweep, which is what makes accepting
-    /// a move cheaper than proposing one.
-    ///
-    /// ### Returns
-    ///
-    /// The state, ready to propose against.
-    fn into_state(self) -> NodeState<T> {
-        let p = self.p;
-        let n = self.tree.n_nodes();
-        let mut m = vec![T::zero(); n * p];
-        let mut w = vec![T::zero(); n * p];
-        let mut contrib = vec![0.0f64; n];
-        for v in 0..n {
-            let (m_v, w_v) = self.down_row(v as u32);
-            m[v * p..(v + 1) * p].copy_from_slice(m_v);
-            w[v * p..(v + 1) * p].copy_from_slice(w_v);
-            if v >= self.tree.n_leaves() {
-                let old = self.inherited[v];
-                contrib[v] = if old != NO_NODE {
-                    self.base.contribution(old)
-                } else {
-                    self.fresh_contrib[self.slot[v] as usize]
-                };
-            }
-        }
-        NodeState::from_rows(p, self.tree.n_leaves(), m, w, contrib)
     }
 
     /// The down row of one node.
@@ -1202,7 +1457,7 @@ fn word_index(word: &[u64]) -> FxHashMap<u64, u32> {
 /// with.
 fn propose<T: BonsaiFloat>(
     tree: &Tree,
-    down: &NodeState<T>,
+    down: &RowStore<T>,
     x: u32,
     params: &SprParams,
     here: u64,
@@ -1353,7 +1608,30 @@ pub fn spr_round<T: BonsaiFloat>(
     leaves: Leaves<'_, T>,
     params: Option<SprParams>,
 ) -> Result<SprResult, BonsaiErrors> {
-    let params = params.unwrap_or_default();
+    Ok(sweep(tree, leaves, params.unwrap_or_default(), None)?.0)
+}
+
+/// One sweep, optionally restricted to the subtrees a previous sweep touched.
+///
+/// ### Params
+///
+/// * `tree` - Tree to improve; not modified
+/// * `leaves` - The leaf data
+/// * `params` - Knobs
+/// * `look` - [`leaf_words`] of the subtrees to propose, or `None` for all of
+///   them
+///
+/// ### Returns
+///
+/// The round's result and the words [`mark_near_new_clades`] collected from its
+/// accepted moves, empty when the search revisits everything, or the
+/// error the placement, the primitive or the arena failed with.
+fn sweep<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+    params: SprParams,
+    look: Option<&FxHashSet<u64>>,
+) -> Result<(SprResult, FxHashSet<u64>), BonsaiErrors> {
     let mut rng = SplitMix64::new(params.seed);
     let mut tree = tree.clone();
     let mut gains = Vec::new();
@@ -1361,12 +1639,18 @@ pub fn spr_round<T: BonsaiFloat>(
     // All of these describe the tree as it stands, and a rejected candidate
     // leaves it exactly as it stands, so they are settled once and again only
     // when a move is accepted.
-    let (mut down, mut best) = settled_down(&tree, leaves)?;
+    let (settled, mut best) = settled_down(&tree, leaves)?;
+    let mut down = RowStore::from_state(&settled, tree.n_nodes());
+    drop(settled);
     let mut word = leaf_words(&tree);
     let mut here = split_fingerprint_with(&tree, &word);
     let mut by_word = word_index(&word);
 
-    let order = candidate_order(&tree, &params, &mut rng);
+    let mut order = candidate_order(&tree, &params, &mut rng);
+    if let Some(look) = look {
+        order.retain(|w| look.contains(w));
+    }
+    let mut revisit = FxHashSet::default();
     let mut next = 0usize;
     let mut chunk = PROPOSAL_CHUNK_MIN;
     while next < order.len() {
@@ -1392,12 +1676,20 @@ pub fn spr_round<T: BonsaiFloat>(
                 gain: proposal.loglik - best,
             });
             best = proposal.loglik;
-            let fresh = LazyRows::new(&proposal.tree, &proposal.to_old, &tree, &down)?.into_state();
-            down = fresh;
+            down.accept(&proposal.tree, &proposal.to_old, &tree)?;
             tree = proposal.tree;
             word = leaf_words(&tree);
             here = split_fingerprint_with(&tree, &word);
             by_word = word_index(&word);
+            if params.search.revisit_radius() > 0 {
+                mark_near_new_clades(
+                    &tree,
+                    &word,
+                    |v| proposal.to_old[v] == NO_NODE,
+                    params.search.revisit_radius(),
+                    &mut revisit,
+                );
+            }
             accepted = Some(k);
             break;
         }
@@ -1417,12 +1709,15 @@ pub fn spr_round<T: BonsaiFloat>(
     }
 
     let loglik = tree_loglik(&tree, leaves)?;
-    Ok(SprResult {
-        tree,
-        loglik,
-        gains,
-        rounds: 1,
-    })
+    Ok((
+        SprResult {
+            tree,
+            loglik,
+            gains,
+            rounds: 1,
+        },
+        revisit,
+    ))
 }
 
 /// Search step 5: sweep until a sweep finds nothing.
@@ -1450,17 +1745,22 @@ pub fn spr<T: BonsaiFloat>(
         rounds: 0,
     };
 
+    let mut look: Option<FxHashSet<u64>> = None;
     while out.rounds < params.max_rounds {
         // The random order has to differ between rounds, or the second round
         // retries the first round's order on a tree that has moved under it.
-        let round = spr_round(
+        let (round, revisit) = sweep(
             &out.tree,
             leaves,
-            Some(SprParams {
+            SprParams {
                 seed: params.seed.wrapping_add(out.rounds as u64),
                 ..params
-            }),
+            },
+            look.as_ref(),
         )?;
+        if params.search.revisit_radius() > 0 {
+            look = Some(revisit);
+        }
         out.rounds += 1;
         if round.gains.is_empty() {
             break;
@@ -1696,6 +1996,7 @@ mod tests {
         leaves: Leaves<'_, f64>,
     ) -> Vec<(Tree, u32, CentreStar<f64>, CentreStar<f64>)> {
         let down = settled_down(tree, leaves).expect("down").0;
+        let down = RowStore::from_state(&down, tree.n_nodes());
         let params = SprParams::default();
         let mut out = Vec::new();
         for x in 0..tree.n_nodes() as u32 {
@@ -1915,6 +2216,7 @@ mod tests {
                 optimised(&data.tree, leaves)
             };
             let down = settled_down(&tree, leaves).expect("down").0;
+            let down = RowStore::from_state(&down, tree.n_nodes());
 
             let mut checked = 0usize;
             let mut dirty_seen = 0usize;
@@ -2002,6 +2304,7 @@ mod tests {
         };
         let tree = optimised(&data.tree, leaves);
         let down = settled_down(&tree, leaves).expect("down").0;
+        let down = RowStore::from_state(&down, tree.n_nodes());
 
         let mut total = 0usize;
         let mut formed = 0usize;
@@ -2458,6 +2761,7 @@ mod tests {
         };
         let tree = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
         let (down, _, _) = settle(&tree, leaves).expect("settle");
+        let down = RowStore::from_state(&down, tree.n_nodes());
 
         let mut checked = 0usize;
         for leaf in 0..tree.n_leaves() as u32 {
@@ -2507,6 +2811,7 @@ mod tests {
         };
         let tree = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
         let (down, _, _) = settle(&tree, leaves).expect("settle");
+        let down = RowStore::from_state(&down, tree.n_nodes());
         let word = leaf_words(&tree);
         let here = split_fingerprint_with(&tree, &word);
         let by_word = word_index(&word);
@@ -2520,20 +2825,158 @@ mod tests {
             };
             let (fresh, loglik) = settled_down(&proposal.tree, leaves).expect("settle");
             assert_relative_eq!(proposal.loglik, loglik, max_relative = 1e-12);
-            let built = LazyRows::new(&proposal.tree, &proposal.to_old, &tree, &down)
-                .expect("rows")
-                .into_state();
-            for v in 0..proposal.tree.n_nodes() as u32 {
-                assert_eq!(
-                    built.means(v),
-                    fresh.means(v),
-                    "means at node {v} of candidate {x}"
-                );
-                assert_eq!(built.precisions(v), fresh.precisions(v));
-            }
+            let mut built = down.clone();
+            built
+                .accept(&proposal.tree, &proposal.to_old, &tree)
+                .expect("accept");
+            assert_store_is_fresh(&built, &fresh, &proposal.tree);
             checked += 1;
         }
         assert!(checked > n, "only {checked} candidates exercised");
+    }
+
+    /// Every row and term of a store against a fresh prune of the same tree, to
+    /// the bit.
+    ///
+    /// ### Params
+    ///
+    /// * `store` - The store under test
+    /// * `fresh` - [`NodeState::prune`] of `tree`
+    /// * `tree` - The tree both describe
+    fn assert_store_is_fresh(store: &RowStore<f64>, fresh: &NodeState<f64>, tree: &Tree) {
+        for v in 0..tree.n_nodes() as u32 {
+            assert_eq!(store.means(v), fresh.means(v), "means at node {v}");
+            assert_eq!(
+                store.precisions(v),
+                fresh.precisions(v),
+                "precisions at node {v}"
+            );
+            assert_eq!(
+                store.contribution(v).to_bits(),
+                fresh.contribution(v).to_bits(),
+                "term at node {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_revisit_radius_wider_than_the_tree_changes_nothing() {
+        // With the radius past the tree's diameter every accepted move marks
+        // every node, and a node made later in the sweep is marked by the move
+        // that made it, so the next sweep proposes exactly what an unrestricted
+        // one would. Any difference is a word the marking lost.
+        let (p, n) = (96usize, 32usize);
+        let (data, w) = dataset(n, p, 7);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let with = |search: SprSearch| {
+            spr(
+                &start,
+                leaves,
+                Some(SprParams {
+                    search,
+                    ..SprParams::default()
+                }),
+            )
+            .expect("spr")
+        };
+        let all = with(SprSearch::Exact);
+        assert!(all.rounds >= 2, "only {} rounds", all.rounds);
+        // A radius of zero switches the restriction off, which is the exact
+        // search whatever else the approximate arm carries.
+        for radius in [0, 4 * n] {
+            let got = with(SprSearch::Approximate(SprApprox::new(radius)));
+            assert_eq!(got.rounds, all.rounds, "radius {radius}");
+            assert_eq!(
+                got.loglik.to_bits(),
+                all.loglik.to_bits(),
+                "radius {radius}"
+            );
+            assert_eq!(
+                crate::search::split_fingerprint(&got.tree),
+                crate::search::split_fingerprint(&all.tree),
+                "radius {radius}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_revisit_radius_never_lowers_the_loglikelihood() {
+        let (p, n) = (96usize, 32usize);
+        let (data, w) = dataset(n, p, 7);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let before = tree_loglik(&start, leaves).expect("loglik");
+        for radius in 1..=3 {
+            let out = spr(
+                &start,
+                leaves,
+                Some(SprParams {
+                    search: SprSearch::Approximate(SprApprox::new(radius)),
+                    ..SprParams::default()
+                }),
+            )
+            .expect("spr");
+            assert!(out.loglik > before, "radius {radius}");
+            assert_relative_eq!(
+                out.loglik,
+                tree_loglik(&out.tree, leaves).expect("loglik"),
+                max_relative = 1e-12
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_chain_of_accepted_moves_leaves_the_store_a_fresh_prune() {
+        // One acceptance from a freshly numbered store never reuses a slot a
+        // previous move freed, nor grows the slab. A chain of them does both,
+        // so every acceptance in a ladder's first round is checked against a
+        // fresh prune of the tree it produced.
+        let (p, n) = (64usize, 32usize);
+        let (data, w) = dataset(n, p, 11);
+        let leaves = Leaves {
+            means: &data.means,
+            precisions: &w,
+            n_features: p,
+        };
+        let mut tree = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
+        let (down, mut best) = settled_down(&tree, leaves).expect("settle");
+        let mut store = RowStore::from_state(&down, tree.n_nodes());
+        let params = SprParams::default();
+
+        let mut accepted = 0usize;
+        let mut x = 0u32;
+        while (x as usize) < tree.n_nodes() {
+            let word = leaf_words(&tree);
+            let here = split_fingerprint_with(&tree, &word);
+            let by_word = word_index(&word);
+            let proposal = propose(&tree, &store, x, &params, here, &by_word).expect("propose");
+            x += 1;
+            let Some(proposal) = proposal else {
+                continue;
+            };
+            if proposal.loglik <= best + acceptance_floor(&params, best) {
+                continue;
+            }
+            store
+                .accept(&proposal.tree, &proposal.to_old, &tree)
+                .expect("accept");
+            let (fresh, loglik) = settled_down(&proposal.tree, leaves).expect("settle");
+            assert_store_is_fresh(&store, &fresh, &proposal.tree);
+            best = loglik;
+            tree = proposal.tree;
+            accepted += 1;
+            x = 0;
+        }
+        assert!(accepted >= 8, "only {accepted} moves accepted");
     }
 
     #[test]
@@ -2672,6 +3115,7 @@ mod tests {
             };
             let tree = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
             let (down, best) = settled_down(&tree, leaves).expect("settle");
+            let down = RowStore::from_state(&down, tree.n_nodes());
             let word = leaf_words(&tree);
             let here = split_fingerprint_with(&tree, &word);
             let by_word = word_index(&word);

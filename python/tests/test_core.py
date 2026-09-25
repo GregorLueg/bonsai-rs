@@ -19,6 +19,13 @@ def test_same_input_same_tree(sim, fitted):
     np.testing.assert_array_equal(again.tree.parent, fitted.tree.parent)
 
 
+def test_the_exact_search_is_one_keyword_away(sim, fitted):
+    exact = bs.bonsai(sim.means, sim.sds, search="exact")
+    # On a 128-cell simulation the approximate search reproduces the exact one.
+    assert exact.loglik == pytest.approx(fitted.loglik, rel=1e-9)
+    assert bs.robinson_foulds(exact.tree, sim.tree) <= 10
+
+
 def test_storage_follows_the_input_dtype(sim):
     res = bs.bonsai(sim.means.astype(np.float32), sim.sds.astype(np.float32))
     assert res.node_means.dtype == np.float32
@@ -44,6 +51,28 @@ def test_the_chain_equals_its_steps(counts):
     lik = bs.from_sanity(post.log_fold_changes, post.error_bars, post.variance)
     steps = bs.bonsai(lik.means, lik.sds, variances=lik.variances)
     assert steps.loglik == chain.loglik
+
+
+def test_gpu_available_is_a_plain_bool():
+    assert bs.gpu_available() in (True, False)
+
+
+gpu = pytest.mark.skipif(not bs.gpu_available(), reason="no GPU adapter here")
+
+
+@gpu
+def test_gpu_sanity_agrees_with_the_cpu(counts):
+    cpu = bs.sanity(counts.counts, cell_totals=counts.cell_totals)
+    dev = bs.sanity(counts.counts, cell_totals=counts.cell_totals, gpu=True)
+    # The device is float32 throughout; judge it in error bars, not ulps.
+    gap = np.abs(dev.log_fold_changes - cpu.log_fold_changes) / cpu.error_bars
+    assert gap.max() < 1e-2
+
+
+@gpu
+def test_gpu_counts_recover_the_simulated_tree(counts):
+    res = bs.bonsai_from_counts(counts.counts, cell_totals=counts.cell_totals, gpu=True)
+    assert bs.robinson_foulds(res.tree, counts.tree) == 0
 
 
 def test_sanity_shapes(counts):

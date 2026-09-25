@@ -62,11 +62,13 @@ const VARIANCE_TOL: f64 = 1e-12;
 
 /// Default signal-to-noise threshold for retaining a feature.
 ///
-/// Ours, chosen by measurement; the paper's threshold is 1 and no constant of
-/// theirs is carried over. `S[g]` of SPEC.md section 3.3 is the mean ratio of
-/// posterior signal variance to measurement error variance, so `S[g] = 1` is
-/// the point at which a feature carries as much signal as noise and this
-/// threshold keeps features whose signal is at least a quarter of their noise.
+/// One, the paper's threshold (SPEC.md section 3.3), adopted 2026-09-25 so that
+/// a default run sees the gene panel the published method would. `S[g]` is the
+/// mean ratio of posterior signal variance to measurement error variance, so
+/// `S[g] = 1` is the point at which a feature carries as much signal as noise.
+/// It was `0.25` before, on the separation measured below; on Sanity-processed
+/// Baron data at 5,000 cells that kept 4,591 genes against 2,701 at `1`, and
+/// search time is linear in the gene count.
 ///
 /// ### What was measured
 ///
@@ -96,11 +98,12 @@ const VARIANCE_TOL: f64 = 1e-12;
 ///
 /// `0.25` sits above the 95th percentile of the pure-noise scores at every cell
 /// count tested and below the 5th percentile of the informative scores at every
-/// cell count and noise level tested. A threshold of `1` does not: in the
-/// hardest row it would discard most of the informative panel, since a feature
-/// carrying exactly as much signal as noise scores `1` only in expectation and
-/// scatters below it at finite `n`. Only at 64 cells do the two distributions
-/// touch `0.25` at all, and there a handful of noise features leak through.
+/// cell count and noise level tested. `1` does not: in the hardest row it
+/// discards most of the informative panel, since a feature carrying exactly as
+/// much signal as noise scores `1` only in expectation and scatters below it at
+/// finite `n`. So on small or noisy datasets a caller should expect `1` to drop
+/// informative features, and can pass `0.25` through
+/// [`IngestParams::min_signal_to_noise`] to keep them.
 ///
 /// ### On tree recovery
 ///
@@ -122,12 +125,10 @@ const VARIANCE_TOL: f64 = 1e-12;
 /// exactly `noise_sd = 1`, i.e. unit signal-to-noise. That is the cliff this
 /// filter exists to keep features away from.
 ///
-/// It is also mildly awkward for the value chosen here. The two are not
-/// directly comparable, `S` being a per-feature aggregate against a noise level
-/// uniform across features, so `0.25` stands on the distribution separation
-/// above. But the recovery cliff sits nearer `1` than to it, and a
-/// recovery-driven sweep of this constant is worth doing.
-pub const DEFAULT_MIN_SIGNAL_TO_NOISE: f64 = 0.25;
+/// The two are not directly comparable, `S` being a per-feature aggregate
+/// against a noise level uniform across features, but the recovery cliff sits
+/// nearer `1` than `0.25`, which is the other argument for the paper's value.
+pub const DEFAULT_MIN_SIGNAL_TO_NOISE: f64 = 1.0;
 
 /// Largest variance amplification `v / (v - eps^2)` [`from_sanity`] converts.
 ///
@@ -1381,15 +1382,23 @@ mod sanity_tests {
     use super::*;
     use crate::bonsai::bonsai;
     use crate::tree::distance::{MAX_PAIRS, distance_recovery};
-    use crate::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
+    use crate::tree::simulate::{
+        SimulatedData, SimulationParams, robinson_foulds, simulate_binary,
+    };
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand_distr::{Distribution, LogNormal, Poisson};
     use sanity_sc_rs::input::CountMatrix;
     use sanity_sc_rs::sanity;
 
-    #[test]
-    fn test_counts_through_sanity_recover_the_tree() {
+    /// Counts of SPEC 13.1 on a 64-leaf balanced tree: the noise-free leaf
+    /// positions, back on the raw scale, as log fold changes about a per-gene
+    /// mean quotient.
+    ///
+    /// ### Returns
+    ///
+    /// The simulation, the counts and the per-cell totals.
+    fn simulated_counts() -> (SimulatedData<f64>, CountMatrix, Vec<f64>) {
         let (n, p) = (64, 300);
         let sim = simulate_binary::<f64>(Some(SimulationParams {
             n_leaves: n,
@@ -1399,8 +1408,6 @@ mod sanity_tests {
         }))
         .unwrap();
 
-        // Counts of SPEC 13.1: the noise-free leaf positions, back on the raw
-        // scale, as log fold changes about a per-gene mean quotient.
         let mut rng = StdRng::seed_from_u64(3);
         let library = LogNormal::new(8.0f64, 0.3).unwrap();
         let totals: Vec<f64> = (0..n).map(|_| library.sample(&mut rng).round()).collect();
@@ -1421,15 +1428,55 @@ mod sanity_tests {
             indptr.push(indices.len());
         }
         let counts = CountMatrix::new(indices, values, indptr, n).unwrap();
-        let out = sanity::<f64>(&counts, &totals, None).unwrap();
+        (sim, counts, totals)
+    }
 
-        let lik = from_sanity_output(&out, None).unwrap();
+    /// Reconstruct from a Sanity run and score it against the generating tree.
+    ///
+    /// ### Params
+    ///
+    /// * `sim` - The simulation the counts came from
+    /// * `out` - A finished Sanity run over those counts
+    ///
+    /// ### Returns
+    ///
+    /// Robinson-Foulds to the generating tree and distance recovery.
+    fn score(sim: &SimulatedData<f64>, out: &sanity_sc_rs::SanityOutput<f64>) -> (usize, f64) {
+        let (n, p) = (sim.n_leaves, sim.n_features);
+        let lik = from_sanity_output(out, None).unwrap();
         let n_kept = lik.features.len();
         let res = bonsai(&lik.means, &lik.sds, n, n_kept, Some(&lik.variances), None).unwrap();
+        (
+            robinson_foulds(&res.tree, &sim.tree).unwrap(),
+            distance_recovery(&res.tree, &sim.truth, p, MAX_PAIRS, 0),
+        )
+    }
 
+    #[test]
+    fn test_counts_through_sanity_recover_the_tree() {
+        let (sim, counts, totals) = simulated_counts();
+        let out = sanity::<f64>(&counts, &totals, None).unwrap();
+        let (rf, recovery) = score(&sim, &out);
         // Measured 2026-09-24: RF 0 and recovery 0.950. The same run fed the
         // log transcription quotients lands at RF 100 of 122 and 0.016.
-        assert!(robinson_foulds(&res.tree, &sim.tree).unwrap() <= 6);
-        assert!(distance_recovery(&res.tree, &sim.truth, p, MAX_PAIRS, 0) > 0.8);
+        assert!(rf <= 6);
+        assert!(recovery > 0.8);
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn test_counts_through_gpu_sanity_recover_the_tree() {
+        use cubecl::Runtime;
+        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        use sanity_sc_rs::gpu::sanity_gpu;
+
+        // The device path is f32 throughout; the tree it hands on has to be as
+        // good as the CPU run's, not bit-equal to it.
+        let (sim, counts, totals) = simulated_counts();
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let out = sanity_gpu::<f64, WgpuRuntime>(&counts, &totals, None, &client).unwrap();
+        let (rf, recovery) = score(&sim, &out);
+        assert!(rf <= 6);
+        assert!(recovery > 0.8);
     }
 }

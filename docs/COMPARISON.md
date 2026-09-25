@@ -73,16 +73,26 @@ then published Bonsai on one core and under MPI with 10 ranks. Rust route:
 defaults (also `S >= 1`). Rust Sanity's default `marginalise` variance rule does
 more work per gene than `MAP`.
 
-Per stage, seconds:
+Sanity, seconds:
 
-| cells | original Sanity | Rust Sanity, CPU | Rust Sanity, GPU | published Bonsai, 1 core | published Bonsai, 10 ranks | Rust search, exact | Rust search, approximate |
-|---|---|---|---|---|---|---|---|
-| 512 | 71.9 | 29.7 | 0.5 | 371.7 | 170.2 | 4.2 | 3.5 |
-| 512 s32 | 72.1 | 29.5 | 0.5 | 371.0 | | 5.4 | 3.8 |
-| 5,000 | 766.9 | 284.8 | 3.4 | 4,868 | 3,208.6 | 117.2 | 60.4 |
-| 10,000 | 1,604.7 | 555.9 | 6.6 | 16,062 | 9,439.3 | 631.0 | 177.1 |
+| cells | original | Rust, CPU | Rust, GPU |
+|---|---|---|---|
+| 512 | 71.9 | 29.7 | 0.5 |
+| 512 s32 | 72.1 | 29.5 | 0.5 |
+| 5,000 | 766.9 | 284.8 | 3.4 |
+| 10,000 | 1,604.7 | 555.9 | 6.6 |
 
-Rust search times are on CPU-Sanity input. On GPU-Sanity input, exact took
+Bonsai, seconds:
+
+| cells | published, 1 core | published, 10 ranks | Rust, exact search | Rust, approximate search |
+|---|---|---|---|---|
+| 512 | 371.7 | 170.2 | 4.2 | 3.5 |
+| 512 s32 | 371.0 | | 5.4 | 3.8 |
+| 5,000 | 4,868 | 3,208.6 | 117.2 | 60.4 |
+| 10,000 | 16,062 | 9,439.3 | 631.0 | 177.1 |
+
+Exact is SPR and NNI as the paper specifies them; approximate is the default
+(see the README). Rust search times are on CPU-Sanity input. On GPU-Sanity input, exact took
 151.8 s and 740.9 s at 5,000 and 10,000, approximate 61.1 s and 172.8 s: the
 search path depends on the posteriors. Published single-core times at 5,000 and
 10,000 are the harness's, reproduced within half a per cent on 2026-09-14; the

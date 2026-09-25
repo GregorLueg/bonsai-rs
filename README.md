@@ -125,15 +125,45 @@ same input, same scorer:
 At 512 it's a tie on topology and the published one is ahead on recovery.
 Timings aren't like for like; `docs/COMPARISON.md` has the caveats.
 
-`BonsaiParams::default()` as of 2026-09-25 departs from the paper in three
-places, each one setting away from the specified version:
+### Exact or approximate search
 
-- Ward linkage start instead of the greedy merge (SPEC 9.1):
-  `StartTree::GreedyMerge`.
-- SPR revisits only the neighbourhood of the last sweep's moves:
-  `SprSearch::Exact`. Within a few nats everywhere measured.
-- NNI caches edge gains and rescores near the last move: `NniSearch::Exact`.
-  Same tree everywhere measured.
+The default search is **approximate**. SPR and NNI (steps 5 and 6) are most of
+the run. As the paper specifies them, every sweep revisits every subtree and
+every edge. The default skips that:
+
+- **SPR** re-proposes only subtrees within five edges of what the last sweep
+  changed. Within a few nats of exact on every dataset measured.
+- **NNI** caches each edge's gain and rescores only near the last move. Same
+  finished tree as exact on all thirteen datasets measured.
+
+Search time on the same input (counts to tree, `docs/COMPARISON.md`):
+
+| cells | exact | approximate | Robinson-Foulds, exact / approximate |
+|---|---|---|---|
+| 512 | 4.2 s | 3.5 s | 136 / 137 |
+| 5,000 | 117.2 s | 60.4 s | 1,285 / 1,277 |
+| 10,000 | 631.0 s | 177.1 s | 2,607 / 2,627 |
+
+The quality differences are inside the run-to-run spread on real data.
+
+Want the search exactly as the paper specifies it? It's one setting away:
+
+```rust
+use bonsai_rs::bonsai::BonsaiParams;
+use bonsai_rs::search::{nni::NniSearch, spr::SprSearch};
+
+let mut params = BonsaiParams::default();
+params.spr.search = SprSearch::Exact;
+params.nni.search = NniSearch::Exact;
+let out = bonsai::<f32>(&means, &sds, n_cells, n_genes, None, Some(params))?;
+```
+
+In Python: `bs.bonsai(..., search="exact")`.
+
+The default also starts from a Ward linkage rather than the paper's greedy merge
+(SPEC 9.1). The greedy merge chains on real data, and the results are worse and
+3 to 5x slower. `StartTree::GreedyMerge` (Python `start="greedy"`) brings it
+back for like-for-like reproduction.
 
 `docs/PERFORMANCE.md` has the numbers and the failures, `docs/DESIGN.md` the
 build.

@@ -1,16 +1,13 @@
 # Performance
 
-Where the time goes now, the rules that came out of getting it there, and a log
-of what worked and what did not. `docs/DESIGN.md` says how the crate is built.
-
-Timings are from one ten-core M1 Max unless stated. Dates in the log are the day
-a result was first committed; 2026-09-12 is when this file was created, so a row
-dated then was measured on or before it.
+Where the time goes, the rules we learnt, and a log of what worked and what
+didn't. Timings on a ten-core M1 Max unless stated. Log dates are first commit;
+this file started 2026-09-12, so rows dated then were measured on or before it.
 
 ## Now
 
-`BonsaiParams::default()` on Sanity-preprocessed Baron data, every step timed,
-2026-09-25, load average 6 to 7 at the start of each run:
+`BonsaiParams::default()` on Sanity-preprocessed Baron, 2026-09-25, load average
+6 to 7:
 
 | step | 512 | 5,000 | 10,000 | share at 10,000 |
 |---|---|---|---|---|
@@ -23,77 +20,59 @@ dated then was measured on or before it.
 | 8 collapse | 0.05 s | 4.5 s | 12.6 s | 6% |
 | total | 3.5 s | 70.4 s | 210.2 s | |
 
-On 2026-09-13 the same configurations took 4.7 s, 166 s and 611 s. From 5,000
-to 10,000 cells the total goes as `n^1.58`, SPR `n^1.60` and NNI `n^1.53`,
-two-point exponents over two different gene panels, so a slope rather than a law.
+On 2026-09-13 the same runs took 4.7 s, 166 s and 611 s. From 5,000 to 10,000
+cells: total `n^1.58`, SPR `n^1.60`, NNI `n^1.53`. Two points over two gene
+panels, so a slope, not a law.
 
-What that says:
-
-- SPR is three fifths of the run and branch optimisation, steps 4, 7 and 8,
-  over a quarter. Neither has an approximation left that measured safe; see the
-  log for the ones that did not.
-- The full-tree sweeps are still small. Sampled at 5,000 cells, the prune
-  kernels and the up-sweep are 2.8 per cent of busy thread time.
+- SPR is three fifths of the run, branch optimisation (4, 7, 8) over a quarter.
+  Neither has a safe approximation left; the log has the ones that failed.
+- Full-tree sweeps are small: prune plus up-sweep is 2.8 per cent of busy thread
+  time at 5,000.
 - A third of SPR's thread time is idle. Round one accepts a move every few
-  candidates, so its chunks run at the floor of eight proposals on ten threads,
-  and a larger floor measured slower because it discards more proposals.
-- The hottest code is the branch solve inside merges and placements:
-  `edge_newton_simd`, `split_derivative` and `log` are the top three by self
-  time.
+  candidates, so chunks sit at the floor of eight proposals on ten threads; a
+  bigger floor was slower.
+- Hottest code by self time: `edge_newton_simd`, `split_derivative`, `log`,
+  all in the branch solve inside merges and placements.
 
-The whole route from raw counts, against the original Sanity and the published
-Bonsai, is in `docs/COMPARISON.md` under "Counts to tree".
+Counts to tree end to end is in `docs/COMPARISON.md`.
 
 ## Rules
 
-1. **Measure a component's share of the whole before optimising it.** A
-   component's share is a hard ceiling on what any change to it returns.
-   `BlockedState` was 6x on a prune that is 2.4 per cent of a run.
-2. **Check that the pipeline calls it at all.** `BlockedState` was only ever
-   built by a benchmark, and the kNN restriction and ellipsoid bounds sat
-   unwired for a week while the search ran cubically.
-3. **Pick the kernel by call count, not by how vectorisable it looks.**
-   `edge_newton` runs 35 to 45 times per candidate pair and earned a SIMD tier;
-   `split_derivative` reads like the hot loop, runs 0.07 times, and measured
-   flat.
-4. **Measure an exponent at the parameter value you ship.** At 200 features
-   polytomy resolution and NNI scaled as `n^2.83` and `n^2.60`; at 2,000 they
-   are `n^1.08` and `n^0.97`. Both were round counts, which collapse as the
-   feature axis cleans up the landscape.
-5. **Diagnose before fixing, and expect the first diagnosis to be wrong.** Four
-   for four on SPR and NNI: the re-prune, the NNI re-prune, the placement beam
-   and the 5k-to-10k slowdown were all blamed and none was the cost. See
+1. **Measure a component's share before optimising it.** The share caps the
+   return. `BlockedState` was 6x on a prune that's 2.4 per cent of a run.
+2. **Check the pipeline calls it.** `BlockedState` was only built by a
+   benchmark; the kNN restriction and ellipsoid bounds sat unwired for a week
+   while the search ran cubic.
+3. **Pick kernels by call count, not looks.** `edge_newton` runs 35 to 45 times
+   per pair and earned SIMD; `split_derivative` looks hot, runs 0.07 times, and
+   measured flat.
+4. **Measure exponents at the shipped parameters.** At 200 features polytomy and
+   NNI went `n^2.83` and `n^2.60`; at 2,000, `n^1.08` and `n^0.97`.
+5. **Expect the first diagnosis to be wrong.** Four for four on SPR and NNI; see
    [Diagnoses that were wrong](#diagnoses-that-were-wrong).
-6. **Ablate the step, and at more than one noise level.** At low noise SPR costs
-   20x the wall clock and changes nothing; at noise 1.6 it wins 27.5 splits of
-   4,090 and is 7.3x *faster* than not having it.
-7. **A justification expires with the measurement behind it.** "X is fine
-   because Y is small" wants re-reading whenever Y's denominator changes. When
-   the linkage replaced step 2, the prune-based steps went from a minority of
-   the run to most of it. The prune kernel itself turned out still to be small,
-   2.8 per cent in 2026-09-24's sample, but that had to be measured again, not
-   assumed.
-8. **A smaller input is not automatically a cheaper one.** Collapsing zero-length
-   edges before step 5 removes an eighth of the nodes and makes SPR 30 per cent
-   slower, because a regraft then lands next to a bigger star.
-9. **A generator is not the data, and a tie on it is not a tie.** The Ward start
-   tied on synthetic data and wins on real data. Subtree splice pairs cost 5 to
-   11 nats on synthetic data and 437 to 737 on real. Confirm on the input you
-   ship against.
-10. **Sweep sizes as well as shapes.** SPR revisit radius 3 held on every shape
-    and at 5,000 cells, then failed at 10,000.
-11. **Look at core utilisation, not only wall time.** Once the linkage replaced
-    step 2 the pipeline got 1.26x out of ten cores, which nothing in the
-    wall-clock numbers showed until a run at `RAYON_NUM_THREADS=1`.
-12. **Time on an idle machine against a kept baseline binary, alternating.** On
-    2026-09-24 the load average wandered from 2 to 27 while other work ran, and
-    the same build's step 6 at 10,000 cells measured 98 s and 156 s. Quality
-    numbers are deterministic and survive load; timings do not.
-13. **A single real-data run is one draw.** Equally valid searches spread
-    over 460 nats at 5,000 cells and 1,700 at 10,000; see
-    [How much one real-data run says](#how-much-one-real-data-run-says). Trust
-    an approximation that reproduces the exact tree; treat a few hundred nats
-    either way as noise unless it repeats across sizes.
+6. **Ablate at more than one noise level.** At low noise SPR costs 20x and
+   changes nothing; at noise 1.6 it wins 27.5 of 4,090 splits and is 7.3x
+   *faster* than skipping it.
+7. **Justifications expire.** "X is fine because Y is small" needs rechecking
+   when Y's denominator moves. The linkage made prune-based steps most of the
+   run; the prune itself was still 2.8 per cent, but that had to be re-measured.
+8. **Smaller isn't cheaper.** Collapsing zero-length edges before step 5 drops
+   an eighth of the nodes and makes SPR 30 per cent slower: regrafts land next
+   to bigger stars.
+9. **A generator isn't the data.** Ward tied on synthetic and wins on real.
+   Splice pairs cost 5 to 11 nats synthetic, 437 to 737 real.
+10. **Sweep sizes, not just shapes.** Revisit radius 3 held on every shape and
+    at 5,000 cells, then broke at 10,000.
+11. **Watch core utilisation.** After the linkage change the pipeline got 1.26x
+    from ten cores, invisible until a `RAYON_NUM_THREADS=1` run.
+12. **Time on an idle machine, alternating against a kept baseline.** On
+    2026-09-24 load wandered 2 to 27 and the same step 6 measured 98 s and
+    156 s. Quality survives load; timings don't.
+13. **One real-data run is one draw.** Equally valid searches spread 460 nats at
+    5,000 and 1,700 at 10,000; see
+    [How much one real-data run says](#how-much-one-real-data-run-says). Trust an
+    approximation that reproduces the exact tree; treat a few hundred nats as
+    noise unless it repeats across sizes.
 
 ## Log
 
@@ -120,16 +99,14 @@ Bonsai, is in `docs/COMPARISON.md` under "Counts to tree".
 | 2026-09-25 | Lazy NNI greedy phase, radius 5, the default `NniSearch::Approximate` | step 6 29.6 s to 5.9 s at 5,000 and 99.4 s to 16.5 s at 10,000, finished tree identical to the exact phase on all thirteen datasets; see [Lazy NNI](#lazy-nni) |
 | 2026-09-25 | SPR arenas built by `Tree::from_level_ordered`, skipping the relabel `from_parents` does | step 5 42.3 s to 41.4 s at 5,000 and 125.3 s to 121.3 s at 10,000, byte-identical tree |
 
-What the big ones have in common is not materialising things. The lazy rows
-form what a proposal reads and no more; the NNI filter tests the star result
-rather than building a tree and walking it; the slot store writes the rows a
-move changed rather than copying the rest. None made a kernel faster.
+The big wins all stop materialising things: lazy rows form only what a proposal
+reads, the NNI filter tests the star result instead of building a tree, the slot
+store writes only changed rows. None made a kernel faster.
 
-The parallel changes are bit-identical on purpose. The branch solve writes one
-slot per node with no reduction; the NNI scan reduces to a running best with
-ties broken on the lower node id, which is what the sequential scan did
-implicitly. `test_the_greedy_phase_is_deterministic_whatever_the_thread_count`
-pins it at 1, 3 and 8 threads.
+The parallel changes are bit-identical on purpose: the branch solve writes one
+slot per node, the NNI scan breaks ties on the lower node id.
+`test_the_greedy_phase_is_deterministic_whatever_the_thread_count` pins it at 1,
+3 and 8 threads.
 
 ### What did not work
 
@@ -162,61 +139,52 @@ pins it at 1, 3 and 8 threads.
 
 ### Diagnoses that were wrong
 
-- SPR was assumed to be paying for its `O(n p)` acceptance re-prune. That
-  re-prune was 0.03 per cent of the step, because the split fingerprint discards
-  99.7 per cent of candidates before it runs. The cost was *proposing*: five
-  `O(n p)` sweeps per candidate for rows of which a few dozen are read.
-- NNI was assumed to be paying for its re-prune too. The cost was the filter
-  itself, which built a whole tree and walked it, `O(n)` each, per candidate.
-- SPR's remaining `n^1.46` was assumed to be the placement beam. The beam is
-  flat: 41 to 49 nodes over a sixteenfold growth in `n`, `n^0.06`.
-- The 5k-to-10k slowdown was assumed to be SPR leaving work for NNI. It was SPR
-  accepting rounding noise and cycling.
+- **SPR's `O(n p)` acceptance re-prune.** 0.03 per cent of the step: the split
+  fingerprint discards 99.7 per cent of candidates first. The cost was
+  *proposing*, five `O(n p)` sweeps per candidate to read a few dozen rows.
+- **NNI's re-prune.** The cost was the filter, which built and walked a whole
+  tree per candidate.
+- **The placement beam behind SPR's `n^1.46`.** The beam is flat: 41 to 49 nodes
+  over a sixteenfold growth in `n`.
+- **SPR leaving work for NNI at 5k to 10k.** SPR was accepting rounding noise and
+  cycling.
 
-The acceptance path came back later on a different axis. Once proposals were
-cheap, the `O(n p)` copy of the state on each accepted move was 23 of the 42
-seconds of the first SPR round at 5,000 cells, measured 2026-09-24, all of it on
-the sequential path with nine threads waiting. The slot store removed it.
+The acceptance path did come back later. Once proposals were cheap, the
+`O(n p)` state copy per accepted move was 23 of 42 s in SPR's first round at
+5,000 cells (2026-09-24), all sequential with nine threads idle. The slot store
+removed it.
 
 ### Revisit radius
 
-After the first SPR sweep, only subtrees within `r` edges of a clade the
-previous sweep created are proposed again: the don't-look bits of TSP local
-search. Before it, rounds after the first cost two thirds of step 5 for a
-quarter of its moves.
+After the first SPR sweep, only subtrees within `r` edges of a clade the last
+sweep created are proposed again: TSP's don't-look bits. Before it, later rounds
+cost two thirds of step 5 for a quarter of the moves.
 
 Measured 2026-09-24 over thirteen datasets: balanced, random-branch and
-unbalanced trees at noise 0.4, 1.0 and 1.6 at 4,096 by 1,000, and the four
-Sanity-preprocessed configurations. At `r = 5` every one is within a few nats of
-the exact search. At `r = 3` all of them are too, except 10,000 cells, where
-step 6 inherits what step 5 skipped. `SprSearch::Exact` keeps the specified
-search one line away, and `DEFAULT_REVISIT_RADIUS` in `src/search/spr.rs` has
-the table.
+unbalanced trees at noise 0.4, 1.0, 1.6 at 4,096 by 1,000, plus the four Sanity
+configurations. `r = 5` is within a few nats of exact on all. `r = 3` too,
+except at 10,000 cells, where step 6 inherits what step 5 skipped. Table in
+`DEFAULT_REVISIT_RADIUS`, `src/search/spr.rs`.
 
 ### Lazy NNI
 
-The greedy phase performs one interchange per round and, as specified, rescores
-every edge every round, so it costs a full scan per move: 1.1 s a round at
-5,000 cells and 2.2 s at 10,000, for 27 and 44 moves. `NniSearch::Approximate`
-caches each edge's gain under the leaf set below it, rescores after a move only
-the edges within five edges of the clades the move created, and rescores the
-leading cached gain on the current tree before taking it, the lazy greedy
-evaluation of Minoux (1978). When nothing cached improves, a full scan runs, so
-the phase stops on exactly the condition the exact phase stops on.
+As specified, the greedy phase rescores every edge for each single interchange:
+1.1 s a round at 5,000 cells and 2.2 s at 10,000, for 27 and 44 moves.
+`NniSearch::Approximate` caches each edge's gain under its leaf set, rescores
+only edges within five of the clades a move created, and rechecks the leading
+cached gain before taking it (Minoux 1978 lazy greedy). When nothing cached
+improves, a full scan runs, so it stops exactly where the exact phase does.
 
-Measured 2026-09-25 on the thirteen-dataset grid of the revisit radius, steps 5
-to 8 with the default SPR: the finished tree matched the exact phase on all
-thirteen, loglikelihood, Robinson-Foulds and recovery to the last printed digit.
-On step 6 alone radius two and three drifted by 0.01 and 7.5 nats at 5,000
-cells; five was identical at both sizes. What is left per round is the settle,
-about 0.28 s at 10,000 cells, which a lazy row provider like SPR's could take
-away.
+2026-09-25, same thirteen datasets, steps 5 to 8: identical finished tree on
+all, to the last printed digit. On step 6 alone, radius 2 and 3 drifted 0.01 and
+7.5 nats at 5,000; radius 5 was identical at both sizes. What's left is the
+per-round settle, about 0.28 s at 10,000, which a lazy row provider like SPR's
+could remove.
 
 ### How much one real-data run says
 
-The finished tree on real data is sensitive to small upstream changes. Runs that
-differ only in the order SPR visits subtrees are equally valid searches, and
-they spread widely, measured 2026-09-25:
+Not much. Runs differing only in SPR's subtree order are equally valid and
+spread widely (2026-09-25):
 
 | cells | SPR order | loglikelihood | Robinson-Foulds | recovery |
 |---|---|---|---|---|
@@ -230,30 +198,25 @@ they spread widely, measured 2026-09-25:
 | 10,000 | random, seed 2 | -11,253,896 | 2,563 | 0.479 |
 | 10,000 | random, seed 3 | -11,254,362 | 2,571 | 0.404 |
 
-About 460 nats and 0.58 to 0.67 in recovery at 5,000 cells, 1,700 nats and 0.40
-to 0.48 at 10,000. So a single-run difference of a few hundred nats is inside
-the noise at these sizes, and an approximation is only safe to call harmless
-when it reproduces the exact result outright, as lazy NNI does on all thirteen
-datasets. The revisit radius reproduces it on the 512-cell and low-noise sets;
-at 5,000 and 10,000 cells it lands 3 nats below and 467 above the exact search,
-both inside this spread. The same caution runs the other way: the 1,281-nat,
-0.38-recovery loss of a loose branch tolerance at 10,000 cells looks like one
-of the bad basins above rather than a measured cost of the tolerance.
+About 460 nats and recovery 0.58 to 0.67 at 5,000; 1,700 nats and 0.40 to 0.48
+at 10,000. A few hundred nats on one run is noise. An approximation is only
+proven harmless when it reproduces the exact result outright, as lazy NNI does.
+The revisit radius does on the 512-cell and low-noise sets; at 5,000 and 10,000
+it lands 3 nats below and 467 above exact, both inside the spread. Same caution
+the other way: the loose branch tolerance's 1,281-nat, 0.38-recovery loss at
+10,000 looks like a bad basin, not a measured cost.
 
-Two things about the search itself. The runs fall into two basins, one with
-visibly worse recovery, and the loglikelihood separates them every time, so a
-best-of-several run chosen by loglikelihood is a cheap way to avoid the bad one
-now that a run is a minute or three. And the specified longest-branch order is
-not dominated: random order did better at 5,000 cells and worse at 10,000.
+Two basins, one with visibly worse recovery, and the loglikelihood separates
+them every time. Best-of-several by loglikelihood is cheap now a run is a few
+minutes. The specified longest-branch order isn't dominated: random did better
+at 5,000 and worse at 10,000.
 
 ### Splice pairs through the regrafted subtree
 
-A regraft onto an internal node leaves a four-member star, which the star
-primitive resolves by scoring all six pairs. A pair and its complement build the
-same unrooted tree, so the three pairs containing the regrafted subtree already
-offer every topology and only the three branch lengths the merge optimises
-differ. It looked like half the splice for free. Measured 2026-09-24 against the
-radius-5 default, it saved nothing in step 5 and cost everywhere else:
+A regraft onto an internal node leaves a four-member star, resolved by scoring
+all six pairs. A pair and its complement give the same unrooted tree, so the
+three pairs containing the regrafted subtree already cover every topology. Half
+the splice for free? No. Against the radius-5 default, 2026-09-24:
 
 | data | steps 5 to 8 | loglikelihood | Robinson-Foulds | recovery |
 |---|---|---|---|---|
@@ -262,17 +225,15 @@ radius-5 default, it saved nothing in step 5 and cost everywhere else:
 | 10,000 real, all six pairs | 257.8 s | -11,252,721 | 2,624 | 0.476 |
 | 10,000 real, three pairs | 566.0 s | -11,253,458 | 2,567 | 0.384 |
 
-With the worse branch lengths SPR accepts 5 to 20 per cent more moves, each
-worth less, and NNI then runs two to four times longer cleaning up. Step 7's
-global branch optimisation does not repair the recovery loss, so the damage is
-in the topology the search walked into.
+Worse branch lengths make SPR accept 5 to 20 per cent more, cheaper moves, and
+NNI then runs two to four times longer. Step 7 doesn't repair the recovery loss:
+the damage is in the topology.
 
 ### Feature subsampling
 
-The merge gain is a sum over `p` features, so estimating it on `p'` of them and
-rescaling looks like a free 30x. Measured over five checkpoints through a
-128-member star at 2000 features, three seeds, with a shared column set per
-checkpoint so the correlated part of the error is already cancelled:
+The merge gain sums over `p` features, so estimating on `p'` and rescaling looks
+like a free 30x. Five checkpoints through a 128-member star at 2000 features,
+three seeds, one shared column set per checkpoint:
 
 | subsample | argmax agreed | mean relative error | mean nats lost |
 |---|---|---|---|
@@ -280,30 +241,26 @@ checkpoint so the correlated part of the error is already cancelled:
 | 128 | 3 / 15 | 3.7e-1 | 26.1 |
 | 512 | 4 / 15 | 1.2e-1 | 12.0 |
 
-The estimator's standard deviation is `p * sigma / sqrt(p')`, about 11 per cent
-of the gain at `p' = 512`, and competing merges in a real round differ by far
-less than that. A random *projection* is a different mechanism and is still
-open, since it summarises every feature rather than discarding all but `p'`. It
-needs the precisions to be approximately rank-1 in gene by cell, which has not
-been checked.
+The estimator's SD is `p * sigma / sqrt(p')`, about 11 per cent of the gain at
+`p' = 512`; competing merges differ by far less. A random *projection* is still
+open, since it summarises every feature, but needs the precisions to be roughly
+rank-1 in gene by cell. Unchecked.
 
 ### Reducibility
 
-Merging changes the peeled remainder that every other pair's score depends on,
-so a merge can lift another pair above the score the merged pair had. Measured
-at 64 and 128 members: 10 to 32 inversions over 61 to 125 rounds, worst excess
-3.6 to 13.2 nats, up to 60 per cent relative. Ward has no global remainder term
-and is reducible by construction, which is a second reason to prefer it for the
-starting tree.
+A merge changes the peeled remainder every other pair's score depends on, so it
+can lift another pair above the merged pair's score. At 64 and 128 members: 10
+to 32 inversions over 61 to 125 rounds, worst excess 3.6 to 13.2 nats, up to 60
+per cent relative. Ward is reducible by construction, another reason to start
+from it.
 
 ### Starting tree
 
-`StartTree::Linkage` is the default. `StartTree::GreedyMerge` is search steps 1
-and 2 as SPEC.md section 9.1 specifies them. Use the linkage for any real work
-and the greedy merge to reproduce the published method.
+`StartTree::Linkage` is the default; `StartTree::GreedyMerge` is SPEC 9.1. Use
+the linkage for real work, the greedy merge to reproduce the paper.
 
-Measured 2026-09-13 on Sanity-preprocessed Baron pancreas data, the same gene
-set to both, scored against the generating tree:
+2026-09-13, Sanity-preprocessed Baron, same genes, scored against the
+generating tree:
 
 | cells | start | Robinson-Foulds | distance recovery | loglikelihood | seconds |
 |---|---|---|---|---|---|
@@ -316,14 +273,11 @@ set to both, scored against the generating tree:
 | 10,000 | greedy | 3,305 | 0.260 | -11,270,741 | 3,680 |
 | 10,000 | linkage | 2,632 | 0.466 | -11,253,188 | 630 |
 
-The linkage wins on the loglikelihood and on Robinson-Foulds at all four sizes,
-on distance recovery at three of four, and is three to five times faster. The
-exception is recovery at 512, where the replicate at the same size goes the
-other way by more than the gap. It is not a size threshold: the linkage wins at
-512 too.
+Linkage wins loglikelihood and Robinson-Foulds at every size, recovery at three
+of four, and is 3 to 5x faster. The exception, recovery at 512, flips on the
+replicate.
 
-The mechanism is chaining, and it is in the criterion. Mean leaf depth straight
-after step 2, against `log2(n)`:
+The greedy criterion chains. Mean leaf depth after step 2:
 
 | cells | greedy | linkage | log2(n) |
 |---|---|---|---|
@@ -331,46 +285,39 @@ after step 2, against `log2(n)`:
 | 5,000 | 114.5 | 12.5 | 12.3 |
 | 10,000 | 151.7 | 13.5 | 13.3 |
 
-The greedy overshoot grows with the cell count, and steps 3 to 7 spend their
-budget repairing it: at 10,000 cells the greedy start leaves SPR 11,330 accepted
-moves over 32 rounds and NNI 457 over 458, against 4,755 and 47 from the
-linkage. A cluster's effective leaf carries `1/size` of the noise, so at a few
-thousand features a large cluster sits closer to every member than that
-member's own relatives do and absorbs them one at a time. Ward has the opposite
-bias, since a Lance-Williams distance to a cluster grows with its size.
+Steps 3 to 7 then spend their budget repairing it: at 10,000 the greedy start
+leaves SPR 11,330 accepted moves over 32 rounds and NNI 457 over 458, against
+4,755 and 47 from the linkage. A cluster's effective leaf carries `1/size` of
+the noise, so at a few thousand features a big cluster sits closer to each
+member than its own relatives do and swallows them one by one. Ward is biased
+the other way: Lance-Williams distance grows with cluster size.
 
-Rescheduling does not reach it. Merging every mutually-best pair a round made
-step 2 seven to eight times faster and reached a *better* merge score, and the
-finished tree got worse: Robinson-Foulds 175 to 186 at 512 and 1,368 to 1,425 at
-5,000, depth only down to 16.1 and 74.1. The mutual test stops a large cluster
-taking more than one partner a round, but not from being every singleton's
-preferred partner; those singletons are then mutual with nothing, the round
-starves, and the chain builds anyway. So on real input the specified criterion
-is a poor proxy for the tree you end up with.
+Rescheduling doesn't fix it. Merging every mutually-best pair per round made
+step 2 7 to 8x faster with a *better* merge score and a worse tree:
+Robinson-Foulds 175 to 186 at 512, 1,368 to 1,425 at 5,000, depth only down to
+16.1 and 74.1. A big cluster still ends up every singleton's preferred partner;
+those singletons are mutual with nothing, the round starves, and the chain
+builds anyway.
 
 ### Earlier snapshots
 
-Where the time went on 2026-09-12, Ward start, 2000 features, 16384 synthetic
-leaves, before the slot store and the revisit radius: linkage 22 per cent, step 4
-4, SPR 73, NNI 2. Exponents then: linkage 2.00, polytomy 0.98, branch 1.03, SPR
-1.45, NNI 0.98, total 1.52.
+2026-09-12, Ward start, 16384 synthetic leaves by 2000, before the slot store
+and revisit radius: linkage 22 per cent, step 4 4, SPR 73, NNI 2. Exponents:
+linkage 2.00, polytomy 0.98, branch 1.03, SPR 1.45, NNI 0.98, total 1.52.
 
-The arc at 512 cells by 2000 features, identical loglikelihoods at every stage:
-the exhaustive candidate scan took 1478.8 s, the kNN restriction and ellipsoid
-bounds took it to 37.4 s, and the lazy SPR proposal and structural NNI filter to
-9.1 s. None of that traded accuracy.
+At 512 by 2000, identical loglikelihoods throughout: exhaustive scan 1478.8 s,
+kNN and ellipsoid bounds 37.4 s, lazy SPR and structural NNI 9.1 s.
 
 ## Reference
 
 ### Memory
 
-**Dense `n x n` anything is dead above about 20k cells.** A Ward distance matrix
-is 2.1 GB at 16384 in `f64` and 4 TB at a million. A `k = 16` neighbour graph at
-a million is 128 MB. That, and not the flop count, is what forces the linkage
-through `ann-search-rs`.
+**Dense `n x n` is dead above about 20k cells.** A Ward distance matrix is
+2.1 GB at 16384 in `f64`, 4 TB at a million. A `k = 16` neighbour graph at a
+million is 128 MB. That's why the linkage goes through `ann-search-rs`.
 
-**`f32` storage costs accuracy as a function of how far the means sit from
-zero**, measured over four leaves by 256 features:
+**`f32` accuracy depends on how far means sit from zero** (four leaves, 256
+features):
 
 | mean over separation | relative error in the difference |
 |---|---|
@@ -379,17 +326,16 @@ zero**, measured over four leaves by 256 features:
 | 1e5 | 3.2e-4 |
 | 1e7 | 7.0e-2 |
 
-Everything downstream consumes squared *differences* of means, so centred data
-is fine and uncentred data at `1e7` is not.
+Centred data is fine; uncentred at `1e7` isn't.
 
-**`MergeScratch` is six `p`-length arrays per candidate pair**, 48 KB at
-`p = 2000` in `f32`. That is over any sensible GPU shared-memory budget, so a
-cubecl merge kernel would have to fuse `prepare` into the solve and recompute
-the separations in registers rather than materialising them.
+**`MergeScratch` is six `p`-length arrays per pair**, 48 KB at `p = 2000` in
+`f32`. Over any sensible GPU shared-memory budget, so a cubecl merge kernel
+would need to fuse `prepare` into the solve and recompute separations in
+registers.
 
 ### The kernel in isolation
 
-The pruning recursion at 8192 cells by 2000 features:
+Pruning at 8192 cells by 2000 features:
 
 | | time |
 |---|---|
@@ -397,11 +343,10 @@ The pruning recursion at 8192 cells by 2000 features:
 | Rust, `f64` storage | 67 ms |
 | Rust, `f32` storage | 40 ms |
 
-Loglikelihoods agree with `reference/bonsai_ref.py` to twelve significant
-figures. That oracle covers the pruning kernel alone, not the merge score or the
-branch solve. The parallel axis is the feature axis, not the tree level, so it
-is indifferent to tree shape: a ladder runs in 9.0 ms where level-parallelism
-takes 67.7 ms. This is not an end-to-end claim; [Now](#now) is.
+Loglikelihoods match `reference/bonsai_ref.py` to twelve significant figures
+(pruning only, not merge or branch solve). Parallel over features, so a ladder
+runs in 9.0 ms where level-parallelism takes 67.7 ms. Kernel only; [Now](#now)
+is the end-to-end number.
 
 ### Reproducing
 
@@ -413,5 +358,4 @@ cargo bench --bench start_tree   # does step 2 earn its keep
 cargo bench --bench merge_scan   # one round of candidate-pair scoring
 ```
 
-Run on an idle machine and check `uptime` first. An implausible speedup is the
-signature of a sweep that did nothing.
+Check `uptime` first. An implausible speedup means a sweep that did nothing.

@@ -19,7 +19,11 @@ both. `512 s32` is the same 512 cells at another seed with a harder gene panel.
 ## Speed and quality
 
 | cells | genes | method | seconds | Robinson-Foulds | distance recovery | loglikelihood |
+<<<<<<< HEAD
 |---|---|---|---|---|---|---|---|
+=======
+|---|---|---|---|---|---|---|
+>>>>>>> caa8a8d (docs: links into markdowns)
 | 512 | 2,382 | bonsai-rs | 4.7 | 147 | 0.591 | -527,499 |
 | 512 | 2,382 | published | 386 | 146 | 0.633 | -527,255 |
 | 512 | 2,382 | truth | | 0 | 0.733 | |

@@ -51,7 +51,7 @@ dud run tells you which step did nothing. Tune via `BonsaiParams`; `None` takes
 the documented defaults. `ingest::prepare` plus `bonsai_prepared` splits ingest
 from search, for your own feature selection or several parameter settings on
 one ingest. Too big to search directly? `backbone::backbone` reconstructs on a
-subset and places the rest (SPEC 15).
+subset and places the rest (see SPEC 15).
 
 ### From raw counts
 
@@ -136,7 +136,8 @@ every edge. The default skips that:
 - **NNI** caches each edge's gain and rescores only near the last move. Same
   finished tree as exact on all thirteen datasets measured.
 
-Search time on the same input (counts to tree, `docs/COMPARISON.md`):
+Search time on the same input (counts to tree, see
+[comparison](docs/COMPARISON.md)):
 
 | cells | exact | approximate | Robinson-Foulds, exact / approximate |
 |---|---|---|---|

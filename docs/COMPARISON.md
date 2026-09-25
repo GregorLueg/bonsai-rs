@@ -33,9 +33,7 @@ both. `512 s32` is the same 512 cells at another seed with a harder gene panel.
 | 10,000 | 2,767 | published | 16,062 | 5,686 MB | 5,149 | 0.281 | -11,280,721 |
 | 10,000 | 2,767 | truth | | | 0 | 0.461 | |
 
-bonsai-rs is `BonsaiParams::default()` as of 2026-09-13 (Ward start). An earlier
-version of this table mixed greedy-merge 512 rows with linkage rows at 5,000 and
-10,000 without saying so; `docs/PERFORMANCE.md` has both starts at every size.
+bonsai-rs is `BonsaiParams::default()` as of 2026-09-13 (Ward start).
 
 Robinson-Foulds is to the generating tree, lower is better. Distance recovery
 correlates tree path distance with true squared Euclidean distance (the paper's
@@ -56,9 +54,6 @@ different constants and aren't comparable across the two.
   topology.** bonsai-rs's 0.466 beats the truth's 0.461, which is expected: the
   truth's branch lengths are expected displacements, ours are fitted to what was
   realised.
-
-Peak RSS for bonsai-rs isn't recorded; that's a harness gap. The published
-5,686 MB at 10,000 is what a dense `n x n` working set costs.
 
 ## Counts to tree
 
@@ -92,12 +87,12 @@ Bonsai, seconds:
 | 10,000 | 16,062 | 9,439.3 | 631.0 | 177.1 |
 
 Exact is SPR and NNI as the paper specifies them; approximate is the default
-(see the README). Rust search times are on CPU-Sanity input. On GPU-Sanity input, exact took
-151.8 s and 740.9 s at 5,000 and 10,000, approximate 61.1 s and 172.8 s: the
-search path depends on the posteriors. Published single-core times at 5,000 and
-10,000 are the harness's, reproduced within half a per cent on 2026-09-14; the
-rest are reruns. The original route also spends 2.0, 0.8, 29.7 and 66.5 s on
-gene selection, included below.
+(see the README). Rust search times are on CPU-Sanity input. On GPU-Sanity
+input, exact took 151.8 s and 740.9 s at 5,000 and 10,000, approximate 61.1 s
+and 172.8 s: the search path depends on the posteriors. Published single-core
+times at 5,000 and 10,000 are the harness's, reproduced within half a per cent
+on 2026-09-14; the rest are reruns. The original route also spends 2.0, 0.8,
+29.7 and 66.5 s on gene selection, included below.
 
 End to end, seconds:
 

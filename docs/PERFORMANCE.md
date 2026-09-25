@@ -115,6 +115,7 @@ What that says:
 | 2026-09-24 | SPR acceptance into a slot store instead of an `O(n p)` state copy | step 5 134.1 s to 101.4 s at 5,000 by 2,701, byte-identical tree |
 | 2026-09-24 | SPR revisit radius 5, the default `SprSearch::Approximate` | steps 5 to 8 132.7 s to 84.8 s at 5,000 and 461.0 s to 257.8 s at 10,000, within a few nats everywhere; see [Revisit radius](#revisit-radius) |
 | 2026-09-25 | Lazy NNI greedy phase, radius 5, the default `NniSearch::Approximate` | step 6 29.6 s to 5.9 s at 5,000 and 99.4 s to 16.5 s at 10,000, finished tree identical to the exact phase on all thirteen datasets; see [Lazy NNI](#lazy-nni) |
+| 2026-09-25 | SPR arenas built by `Tree::from_level_ordered`, skipping the relabel `from_parents` does | step 5 42.3 s to 41.4 s at 5,000 and 125.3 s to 121.3 s at 10,000, byte-identical tree |
 
 What the big ones have in common is not materialising things. The lazy rows
 form what a proposal reads and no more; the NNI filter tests the star result

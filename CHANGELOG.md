@@ -3,7 +3,7 @@
 ## 0.1.0
 
 First release. Clean-room, built from the paper and its CC-BY-4.0
-Supplementary Information; see `PROVENANCE.md`.
+Supplementary Information; see [provenance](PROVENANCE.md).
 
 **Model**
 
@@ -20,7 +20,7 @@ Supplementary Information; see `PROVENANCE.md`.
 **Search**
 
 - SPEC section 9's seven steps plus an eighth that collapses internal
-  zero-length edges. `docs/DESIGN.md` says why the order is fixed.
+  zero-length edges. [Design](docs/DESIGN.md) says why the order is fixed.
 - kNN candidate restriction (SPEC 11) and ellipsoid upper bounds (SPEC 10).
   Without them it's cubic.
 - Ward linkage start: same answer as the greedy merge, a fraction of the time.

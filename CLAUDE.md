@@ -10,9 +10,9 @@ Guidance for Claude Code in this repository.
 
 **Never open, clone, read or grep `dhdegroot/Bonsai-data-representation` or its Zenodo drop.** Not here, not in a sibling worktree, not through a subagent. It's CC-BY-NC-4.0; a port would be Adapted Material under section 1(a), incompatible with MIT.
 
-Implementation reads `docs/SPEC.md` and nothing else. It's transcribed from the CC-BY-4.0 paper and SI, which are free to implement. Every kernel cites its SI equation.
+Implementation reads [docs/SPEC.md](docs/SPEC.md) and nothing else. It's transcribed from the CC-BY-4.0 paper and SI, which are free to implement. Every kernel cites its SI equation.
 
-Don't carry over their tuned constants. Every threshold is a named `const` whose doc comment gives its source: an SI equation, or our measurement with the date. `PROVENANCE.md` has the full position.
+Don't carry over their tuned constants. Every threshold is a named `const` whose doc comment gives its source: an SI equation, or our measurement with the date. [PROVENANCE.md](PROVENANCE.md) has the full position.
 
 ## Commands
 
@@ -81,4 +81,4 @@ Means are judged on absolute error, loglikelihoods on relative.
 
 ## Elsewhere
 
-`docs/SPEC.md` the algorithm, `docs/DESIGN.md` the build, `docs/PERFORMANCE.md` what was optimised and what failed, `docs/COMPARISON.md` the black-box comparison and what may be said, `PROVENANCE.md` the licence position, `CHANGELOG.md` history.
+[docs/SPEC.md](docs/SPEC.md) the algorithm, [docs/DESIGN.md](docs/DESIGN.md) the build, [docs/PERFORMANCE.md](docs/PERFORMANCE.md) what was optimised and what failed, [docs/COMPARISON.md](docs/COMPARISON.md) the black-box comparison and what may be said, [PROVENANCE.md](PROVENANCE.md) the licence position, [CHANGELOG.md](CHANGELOG.md) history.

@@ -2,7 +2,7 @@
 
 Transcribed from the CC-BY-4.0 paper and Supplementary Information of de Groot,
 Morillo Leonardo, Pachkov and van Nimwegen, *Nature Biotechnology* 2026,
-doi 10.1038/s41587-026-03220-2. See [provenance](,,/PROVENANCE.md).
+doi 10.1038/s41587-026-03220-2. See [provenance](../PROVENANCE.md).
 
 **This file is the only implementation source.** Code cites the `(Sxx)` numbers
 below. Where this document restructures an SI expression for numerical or
@@ -427,7 +427,7 @@ sweeps propose only subtrees within five edges of a clade the previous sweep's
 moves created. `SprSearch::Exact` is the search as specified. Measured over
 three tree shapes at three noise levels and four real-data configurations up to
 10,000 cells, the approximation lands within a few nats of the exact search and
-roughly halves steps 5 to 8 at 5,000 and 10,000 cells; `docs/PERFORMANCE.md` has
+roughly halves steps 5 to 8 at 5,000 and 10,000 cells; [performance](PERFORMANCE.md) has
 the numbers. `test_a_revisit_radius_wider_than_the_tree_changes_nothing` pins
 the approximate path to the exact one when the radius covers the tree.
 

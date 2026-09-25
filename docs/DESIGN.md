@@ -29,7 +29,7 @@ internal rows are computed, never supplied.
 
 `NodeState`, row-major `[node][feature]`, sequential. Every prune goes through
 it. A second, feature-blocked parallel layout was faster on the kernel, only
-ever called by a benchmark, and deleted; `docs/PERFORMANCE.md` has the story.
+ever called by a benchmark, and deleted; [performance](PERFORMANCE.md) has the story.
 
 Where there's parallelism over a sweep it's over features, since the model
 factorises there. A ladder costs what a balanced tree costs.
@@ -116,7 +116,7 @@ scan.
 ## Knobs
 
 Every threshold is a named `const` citing an SI equation or our measurement.
-Nothing comes from the published source (see `PROVENANCE.md`). Ours: neighbour
+Nothing comes from the published source (see [provenance](../PROVENANCE.md)). Ours: neighbour
 count `k`, kNN rebuild cadence, placement tolerance, ellipsoid `nsteps`
 schedule, backbone size, SPR revisit radius, NNI rescore radius.
 

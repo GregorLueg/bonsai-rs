@@ -56,4 +56,4 @@ uv run --group docs mkdocs serve
 ## Licence
 
 MIT. Built from the paper and its CC-BY-4.0 Supplementary Information only;
-see `PROVENANCE.md` in the repository. Cite the paper.
+see [provenance](https://github.com/GregorLueg/bonsai-rs/blob/main/PROVENANCE.md) in the repository. Cite the paper.

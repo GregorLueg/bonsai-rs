@@ -8,7 +8,7 @@ licence on this crate.
 | source | licence | used for |
 |---|---|---|
 | de Groot, Morillo Leonardo, Pachkov, van Nimwegen. *Bonsai reconstructs tree representations for distortion-free visualization and exploration of high-dimensional data.* Nature Biotechnology (2026). doi 10.1038/s41587-026-03220-2 | CC-BY-4.0 (open access) | model, search outline, backbone mode, root selection |
-| Supplementary Information to the above, sections SI.B, SI.C, SI.D, SI.E, SI.G | CC-BY-4.0 | every equation in `docs/SPEC.md` |
+| Supplementary Information to the above, sections SI.B, SI.C, SI.D, SI.E, SI.G | CC-BY-4.0 | every equation in [specs](docs/SPEC.md) |
 | Felsenstein, *Inferring Phylogenies*, pp. 578-584 | textbook | equal-angle and equal-daylight layouts, which the SI defers to |
 
 ## Sources not used
@@ -32,7 +32,7 @@ worktree, not through a subagent.
 One thing no session rule covers: the reference is public, so it may be in a
 model's pretraining data. That can't be ruled out. The answer is the same as for
 a human who once saw the code: the implementation is written from
-`docs/SPEC.md`, and this file records how.
+[specs](docs/SPEC.md), and this file records how.
 
 ## Disclosure
 
@@ -40,7 +40,7 @@ A Claude Code session (Claude Opus 5.0) in August 2026, before this repository
 existed, read the reference source while drafting a feasibility proposal. That
 proposal (`bixverse-project/proposals/bonsai-rs.md`) is not an implementation
 source. What it carried across was SI.B maths or criticism of their
-engineering. Every design decision here comes from `docs/SPEC.md`.
+engineering. Every design decision here comes from [specs](docs/SPEC.md).
 
 ## Comparison harness, 2026-09-06
 
@@ -68,7 +68,7 @@ author's private machine, so NonCommercial isn't engaged.
 
 ## What ships, 2026-09-13
 
-`docs/COMPARISON.md` and `docs/figures/` carry the harness's tables and figures.
+[Comparison](docs/COMPARISON.md) and `docs/figures/` carry the harness's tables and figures.
 
 **Measurements are facts.** Wall time, peak RSS, Robinson-Foulds, distance
 recovery. Facts about a program's behaviour aren't copyrightable.
@@ -113,12 +113,12 @@ Material.
 
 ## Rules
 
-1. Implementation reads `docs/SPEC.md`, not the PDFs, not their code. Every
+1. Implementation reads [specs](docs/SPEC.md), not the PDFs, not their code. Every
    kernel cites its SI equation.
 2. No mirroring of their module structure, decomposition or naming.
 3. No carried-over tuned constants. Every threshold is a named `const` whose doc
    comment gives its source: an SI equation, or our measurement in
-   `docs/PERFORMANCE.md`. Ours to determine: neighbour count `k`, kNN rebuild
+   [performance](docs/PERFORMANCE.md). Ours to determine: neighbour count `k`, kNN rebuild
    cadence, placement-search tolerance, ellipsoid `n_steps` schedule, default
    backbone size.
 4. Output-level parity testing is fine (black-box, Art. 5(3)). Reference trees

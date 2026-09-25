@@ -19,11 +19,7 @@ both. `512 s32` is the same 512 cells at another seed with a harder gene panel.
 ## Speed and quality
 
 | cells | genes | method | seconds | Robinson-Foulds | distance recovery | loglikelihood |
-<<<<<<< HEAD
-|---|---|---|---|---|---|---|---|
-=======
 |---|---|---|---|---|---|---|
->>>>>>> caa8a8d (docs: links into markdowns)
 | 512 | 2,382 | bonsai-rs | 4.7 | 147 | 0.591 | -527,499 |
 | 512 | 2,382 | published | 386 | 146 | 0.633 | -527,255 |
 | 512 | 2,382 | truth | | 0 | 0.733 | |
@@ -124,8 +120,7 @@ process per rank. MPI also changes its answer: RF 141 against 146 at 512, 2,016
 against 1,937 at 5,000, 5,151 against 5,149 at 10,000.
 
 Two cautions. Differences between the Rust Sanity paths and search modes sit
-inside the run-to-run spread ([performance](docs/PERFORMANCE.md), "How much one
-real-data run says"): 0.45 against 0.57 at 5,000 is two basins, not the GPU
+inside the run-to-run spread ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)): 0.45 against 0.57 at 5,000 is two basins, not the GPU
 making better trees. The gaps to the published trees, hundreds to 2,500 splits,
 are far outside it.
 

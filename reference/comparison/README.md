@@ -1,6 +1,6 @@
 # Comparison harness
 
-The data generator, scorer and figure scripts behind `docs/COMPARISON.md`.
+The data generator, scorer and figure scripts behind [comparison](../../docs/COMPARISON.md).
 Not part of the published crate. Nothing here runs or knows about the published
 implementation: to compare against it, or anything else, drop its tree into a
 configuration as `theirs.nwk` and score.
@@ -78,7 +78,7 @@ counts-to-tree trees under the names in its `TREE_SETS`.
 
 ## Not here
 
-- The Rust counts-to-tree route of `docs/COMPARISON.md` ("Counts to tree"):
+- The Rust counts-to-tree route of [comparison](../../docs/COMPARISON.md#counts-to-tree):
   `sanity-sc-rs` on CPU or GPU, then `from_sanity_output` and `bonsai()`. The
   README's "From raw counts" section is that code.
-- Anything that invokes the published implementation. See `PROVENANCE.md`.
+- Anything that invokes the published implementation. See [provenance](../../PROVENANCE.md).

@@ -166,7 +166,7 @@ The default also starts from a Ward linkage rather than the paper's greedy merge
 3 to 5x slower. `StartTree::GreedyMerge` (Python `start="greedy"`) brings it
 back for like-for-like reproduction.
 
-`docs/PERFORMANCE.md` has the numbers and the failures, `docs/DESIGN.md` the
+[Performance](docs/PERFORMANCE.md) has the numbers and the failures, [design](docs/DESIGN.md) the
 build.
 
 ## Licence

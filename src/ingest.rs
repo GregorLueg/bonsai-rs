@@ -62,11 +62,13 @@ const VARIANCE_TOL: f64 = 1e-12;
 
 /// Default signal-to-noise threshold for retaining a feature.
 ///
-/// Ours, chosen by measurement; the paper's threshold is 1 and no constant of
-/// theirs is carried over. `S[g]` of SPEC.md section 3.3 is the mean ratio of
-/// posterior signal variance to measurement error variance, so `S[g] = 1` is
-/// the point at which a feature carries as much signal as noise and this
-/// threshold keeps features whose signal is at least a quarter of their noise.
+/// One, the paper's threshold (SPEC.md section 3.3), adopted 2026-09-25 so that
+/// a default run sees the gene panel the published method would. `S[g]` is the
+/// mean ratio of posterior signal variance to measurement error variance, so
+/// `S[g] = 1` is the point at which a feature carries as much signal as noise.
+/// It was `0.25` before, on the separation measured below; on Sanity-processed
+/// Baron data at 5,000 cells that kept 4,591 genes against 2,701 at `1`, and
+/// search time is linear in the gene count.
 ///
 /// ### What was measured
 ///
@@ -96,11 +98,12 @@ const VARIANCE_TOL: f64 = 1e-12;
 ///
 /// `0.25` sits above the 95th percentile of the pure-noise scores at every cell
 /// count tested and below the 5th percentile of the informative scores at every
-/// cell count and noise level tested. A threshold of `1` does not: in the
-/// hardest row it would discard most of the informative panel, since a feature
-/// carrying exactly as much signal as noise scores `1` only in expectation and
-/// scatters below it at finite `n`. Only at 64 cells do the two distributions
-/// touch `0.25` at all, and there a handful of noise features leak through.
+/// cell count and noise level tested. `1` does not: in the hardest row it
+/// discards most of the informative panel, since a feature carrying exactly as
+/// much signal as noise scores `1` only in expectation and scatters below it at
+/// finite `n`. So on small or noisy datasets a caller should expect `1` to drop
+/// informative features, and can pass `0.25` through
+/// [`IngestParams::min_signal_to_noise`] to keep them.
 ///
 /// ### On tree recovery
 ///
@@ -122,12 +125,10 @@ const VARIANCE_TOL: f64 = 1e-12;
 /// exactly `noise_sd = 1`, i.e. unit signal-to-noise. That is the cliff this
 /// filter exists to keep features away from.
 ///
-/// It is also mildly awkward for the value chosen here. The two are not
-/// directly comparable, `S` being a per-feature aggregate against a noise level
-/// uniform across features, so `0.25` stands on the distribution separation
-/// above. But the recovery cliff sits nearer `1` than to it, and a
-/// recovery-driven sweep of this constant is worth doing.
-pub const DEFAULT_MIN_SIGNAL_TO_NOISE: f64 = 0.25;
+/// The two are not directly comparable, `S` being a per-feature aggregate
+/// against a noise level uniform across features, but the recovery cliff sits
+/// nearer `1` than `0.25`, which is the other argument for the paper's value.
+pub const DEFAULT_MIN_SIGNAL_TO_NOISE: f64 = 1.0;
 
 /// Largest variance amplification `v / (v - eps^2)` [`from_sanity`] converts.
 ///

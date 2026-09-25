@@ -190,7 +190,7 @@ def bonsai(
             nats of the exact one on every dataset measured, several times
             faster. Worth an exact run to check on data of your own.
         min_signal_to_noise: Features below this signal-to-noise are dropped
-            before the search. ``None`` for the default of 0.25.
+            before the search. ``None`` for the default of 1, the paper's.
         reroot: Reroot for display once the search is done. Changes the
             picture, not the likelihood.
 

@@ -16,7 +16,7 @@ sim = bs.datasets.simulate_counts(256, 500, seed=0)  # cells x genes, int64
 res = bs.bonsai_from_counts(sim.counts, cell_totals=sim.cell_totals)
 
 res.tree.n_leaves, res.tree.n_nodes  # (256, 511)
-len(res.features), len(res.dropped)  # (487, 11)
+len(res.features), len(res.dropped)  # (462, 11)
 bs.robinson_foulds(res.tree, sim.tree)  # 0
 ```
 
@@ -52,13 +52,13 @@ for s in res.steps:
 ```
 
 ```text
-1-2 linkage    -82879.0      0.0
-3 polytomy     -82879.0      0.0
-4 branch       -33832.2  49046.7
-5 spr          -33697.4    134.8
-6 nni          -33697.4      0.0
-7 branch       -33649.4     48.0
-8 collapse     -33649.4      0.0
+1-2 linkage    -75784.5      0.0
+3 polytomy     -75784.5      0.0
+4 branch       -27494.3  48290.2
+5 spr          -27494.3      0.0
+6 nni          -27494.3      0.0
+7 branch       -27494.3      0.0
+8 collapse     -27494.3      0.0
 ```
 
 A step with zero gain found nothing to improve, which is fine. A negative gain

@@ -6,3 +6,11 @@
 
 # Point-in-time review output, not documentation.
 adversarial_review.md
+
+# Comparison harness outputs.
+/reference/comparison/target
+/reference/comparison/Cargo.lock
+/reference/comparison/work*/
+/reference/comparison/data/
+/reference/comparison/*.tsv
+/reference/comparison/figures/

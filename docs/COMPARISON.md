@@ -287,8 +287,12 @@ delete the part that's true.
 
 ## Reproducing
 
-The harness isn't part of this crate. It runs the published implementation per
-configuration on a Sanity-shaped subset this crate also consumes, scores both
-trees, and draws figures from Newick and CSV only. `faithfulness.py` makes the
-recovery table, `degeneracy.py` the zero-length counts, `figures.py` the
-layouts, scatters and fragmentation.
+`reference/comparison/` has the harness: the Baron count simulator, Sanity and
+gene selection, the scorer, and every figure and table script here.
+`faithfulness.py` makes the recovery table, `degeneracy.py` the zero-length
+counts, `figures.py` the layouts, scatters and fragmentation. Its README has
+the commands.
+
+What it leaves out is running the published implementation. Get a tree from it
+by its own documentation on the same Sanity output, save it as `theirs.nwk` in
+the configuration, and `harness score` puts it next to ours.

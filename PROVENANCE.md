@@ -78,6 +78,20 @@ Not carried across: the scripts that invoke their CLI and shape its input. Both
 encode their configuration semantics, and no session writing crate code should
 have that in front of it.
 
+## Harness published, 2026-09-25
+
+`reference/comparison/` is the harness minus everything that touches the
+reference. A Claude Code subagent, with no access to the clone (a sibling
+directory, never entered), audited the harness and staged the copy. It removed:
+the scripts that invoke the reference, a data export in the reference's input
+layout, a compatibility step for the reference's file naming, a parser for the
+reference's log format, a scorer loop over the reference's intermediate outputs,
+and comments naming its CLI flags or defaults. The session writing this crate
+then reviewed the staged copy, which by then contained none of that. The data
+generator follows SI section E and Sanity's documented interface; the author
+states the harness contains no reference code, and the audit found no imports,
+paths or copied content from the clone.
+
 ## Stating differences
 
 This never changes with time. The line is where a claim's evidence comes from.

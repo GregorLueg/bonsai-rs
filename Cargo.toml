@@ -13,7 +13,7 @@ categories = [
     "science::computational-biology",
 ]
 # The comparison figures are for the repository, not for the published tarball.
-exclude = ["docs/figures/*"]
+exclude = ["docs/figures/*", "reference/comparison/*"]
 
 [lib]
 name = "bonsai_rs"

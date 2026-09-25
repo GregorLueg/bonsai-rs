@@ -41,6 +41,74 @@ What that says:
   `edge_newton_simd`, `split_derivative` and `log` are the top three by self
   time.
 
+## Counts to tree, against the published pipeline
+
+Raw UMI counts to a finished tree, measured 2026-09-25 on **one node**: a
+ten-core M1 Max with 64 GB, every run alone on the machine. The published
+implementation is written for MPI across nodes, and nothing here says how
+either side behaves on a cluster.
+
+The data is the comparison harness's simulated Baron counts, 17,499 genes. The
+original route is the Sanity binary (10 threads, `-v_m MAP`), the harness's
+gene selection at `S >= 1`, and the published Bonsai run black box through
+the harness, on one core and under MPI with 10 ranks. The Rust route is
+`sanity-sc-rs` on CPU or GPU with `f32` storage, then `from_sanity_output`
+and `bonsai()` at its defaults, which select at `S >= 1` too. Rust Sanity runs
+its default variance rule, `marginalise`, which does more work per gene than
+the `MAP` rule the original was given.
+
+Stage by stage, seconds:
+
+| cells | original Sanity | Rust Sanity, CPU | Rust Sanity, GPU | published Bonsai, 1 core | published Bonsai, 10 ranks | Rust search, exact | Rust search, approximate |
+|---|---|---|---|---|---|---|---|
+| 512 | 71.9 | 29.7 | 0.5 | 371.7 | 170.2 | 4.2 | 3.5 |
+| 512 s32 | 72.1 | 29.5 | 0.5 | 371.0 | | 5.4 | 3.8 |
+| 5,000 | 766.9 | 284.8 | 3.4 | 4,868 | 3,208.6 | 117.2 | 60.4 |
+| 10,000 | 1,604.7 | 555.9 | 6.6 | 16,062 | | 631.0 | 177.1 |
+
+Rust search times are on CPU-Sanity input. On GPU-Sanity input the exact
+search took 151.8 s and 740.9 s at 5,000 and 10,000 cells, the approximate
+61.1 s and 172.8 s: the search's own path depends on the posteriors it is
+given. The published Bonsai's 5,000 and 10,000 single-core times are the
+harness's, reproduced within half a per cent on 2026-09-14; the other published
+times are re-runs. The original route also spends 2.0, 0.8, 29.7 and 66.5 s in
+the harness's gene selection, which the totals below include.
+
+End to end, seconds:
+
+| cells | original, 1 core | original, 10 ranks | Rust CPU + exact | Rust GPU + approximate | speed-up over the original on 1 core / 10 ranks |
+|---|---|---|---|---|---|
+| 512 | 445.6 | 244.1 | 34.1 | 3.8 | 117x / 64x |
+| 512 s32 | 443.9 | | 34.7 | 4.3 | 103x / |
+| 5,000 | 5,664.2 | 4,005.2 | 400.0 | 64.9 | 87x / 62x |
+| 10,000 | 17,733.2 | | 1,184.4 | 180.4 | 98x / |
+
+Quality against the generating tree, the same scorer for every tree: distance
+recovery here correlates tree path distance with squared distance in the true
+positions over all 17,499 genes, so it is not the headline number of
+`docs/COMPARISON.md`, which uses the selected genes.
+
+| cells | original, 1 core | original, 10 ranks | Rust CPU + exact | Rust GPU + approximate |
+|---|---|---|---|---|
+| 512 | RF 146, 0.492 | RF 141, 0.496 | RF 136, 0.632 | RF 137, 0.632 |
+| 512 s32 | RF 240, 0.165 | | RF 244, 0.232 | RF 237, 0.233 |
+| 5,000 | RF 1,937, 0.352 | RF 2,016, 0.261 | RF 1,285, 0.451 | RF 1,277, 0.572 |
+| 10,000 | RF 5,149, 0.162 | | RF 2,607, 0.388 | RF 2,627, 0.386 |
+
+Memory for the published implementation, peak resident set summed over every
+process: 543 MB at 512 cells and 2,965 MB at 5,000 on one core; 3,009 MB and
+10,033 MB with 10 ranks, 5.5 and 3.4 times as much for 2.2 and 1.5 times the
+speed. MPI starts one Python process per rank and each holds its own data, so
+memory grows with the rank count. Running under MPI also changes its result, RF
+141 against 146 at 512 cells and 2,016 against 1,937 at 5,000.
+
+Two cautions. The Rust quality differences between Sanity paths and search
+modes are inside the run-to-run spread of [How much one real-data run
+says](#how-much-one-real-data-run-says): the 0.45 against 0.57 at 5,000 cells is
+the two basins, not the GPU making better trees. And the gaps to the published
+trees at 5,000 and 10,000 cells, several hundred to 2,500 splits, are far outside
+that spread.
+
 ## Rules
 
 1. **Measure a component's share of the whole before optimising it.** A

@@ -16,5 +16,7 @@ jobs:
     with:
       # `sanity` carries the counts-to-tree test; it is not a default feature.
       cpu-args: '--release --features sanity'
-      # No GPU lane: bonsai-rs is CPU only.
+      # No GPU kernels here; this checks the GPU Sanity handover still builds
+      # and recovers the tree, on lavapipe (Linux) and Metal (macOS).
+      gpu-args: '--release --features gpu-tests'
     secrets: inherit

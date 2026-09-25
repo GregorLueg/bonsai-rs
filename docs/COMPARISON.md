@@ -18,20 +18,20 @@ both. `512 s32` is the same 512 cells at another seed with a harder gene panel.
 
 ## Speed and quality
 
-| cells | genes | method | seconds | peak RSS | Robinson-Foulds | distance recovery | loglikelihood |
+| cells | genes | method | seconds | Robinson-Foulds | distance recovery | loglikelihood |
 |---|---|---|---|---|---|---|---|
-| 512 | 2,382 | bonsai-rs | 4.7 | | 147 | 0.591 | -527,499 |
-| 512 | 2,382 | published | 386 | 566 MB | 146 | 0.633 | -527,255 |
-| 512 | 2,382 | truth | | | 0 | 0.733 | |
-| 512 s32 | 2,302 | bonsai-rs | 6.1 | | 220 | 0.318 | -513,567 |
-| 512 s32 | 2,302 | published | 368 | 551 MB | 240 | 0.303 | -513,553 |
-| 512 s32 | 2,302 | truth | | | 0 | 0.500 | |
-| 5,000 | 2,701 | bonsai-rs | 166 | | 1,293 | 0.666 | -5,557,975 |
-| 5,000 | 2,701 | published | 4,868 | 2,965 MB | 1,937 | 0.496 | -5,563,770 |
-| 5,000 | 2,701 | truth | | | 0 | 0.679 | |
-| 10,000 | 2,767 | bonsai-rs | 611 | | 2,632 | 0.466 | -11,253,188 |
-| 10,000 | 2,767 | published | 16,062 | 5,686 MB | 5,149 | 0.281 | -11,280,721 |
-| 10,000 | 2,767 | truth | | | 0 | 0.461 | |
+| 512 | 2,382 | bonsai-rs | 4.7 | 147 | 0.591 | -527,499 |
+| 512 | 2,382 | published | 386 | 146 | 0.633 | -527,255 |
+| 512 | 2,382 | truth | | 0 | 0.733 | |
+| 512 s32 | 2,302 | bonsai-rs | 6.1 | 220 | 0.318 | -513,567 |
+| 512 s32 | 2,302 | published | 368 | 240 | 0.303 | -513,553 |
+| 512 s32 | 2,302 | truth | | 0 | 0.500 | |
+| 5,000 | 2,701 | bonsai-rs | 166 | 1,293 | 0.666 | -5,557,975 |
+| 5,000 | 2,701 | published | 4,868 | 1,937 | 0.496 | -5,563,770 |
+| 5,000 | 2,701 | truth | | 0 | 0.679 | |
+| 10,000 | 2,767 | bonsai-rs | 611 | 2,632 | 0.466 | -11,253,188 |
+| 10,000 | 2,767 | published | 16,062 | 5,149 | 0.281 | -11,280,721 |
+| 10,000 | 2,767 | truth | | 0 | 0.461 | |
 
 bonsai-rs is `BonsaiParams::default()` as of 2026-09-13 (Ward start).
 

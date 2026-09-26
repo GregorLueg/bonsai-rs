@@ -131,8 +131,11 @@ fn run() -> Fallible<()> {
             }
             let (_, n_cells, _) = read_csv(&Path::new(&args[2]).join("ours").join("means.csv"))?;
             let labels = cell_labels(n_cells);
-            let index_of: HashMap<&str, usize> =
-                labels.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+            let index_of: HashMap<&str, usize> = labels
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.as_str(), i))
+                .collect();
             let a = load_tree(Path::new(&args[3]), &index_of)?;
             let b = load_tree(Path::new(&args[4]), &index_of)?;
             println!("rf\t{}", robinson_foulds(&a, &b)?);
@@ -144,7 +147,9 @@ fn run() -> Fallible<()> {
             }
             refine_tree(Path::new(&args[2]), Path::new(&args[3]))
         }
-        _ => Err("usage: harness <gen|prep|sanity-rs|ours|refine-tree|score|score-tree|rf> ...".into()),
+        _ => Err(
+            "usage: harness <gen|prep|sanity-rs|ours|refine-tree|score|score-tree|rf> ...".into(),
+        ),
     }
 }
 
@@ -940,8 +945,15 @@ fn score_tree(dir: &Path, nwk: &Path) -> Fallible<()> {
     let rf = robinson_foulds(&tree, &truth_tree)?;
     let mut state = NodeState::new(tree.n_nodes(), p, &means, &precisions)?;
     let loglik = state.prune(&tree);
+    // The same topology with its branch lengths fitted to this data by our
+    // global solve (search steps 4 and 7). Another implementation's lengths
+    // were fitted to its own preprocessing, so `loglik` mixes topology with
+    // that mismatch; `loglik_refit` compares topologies alone.
+    let mut refit = tree.clone();
+    let mut refit_state = NodeState::new(refit.n_nodes(), p, &means, &precisions)?;
+    let loglik_refit = optimise_branch_lengths(&mut refit, &mut refit_state, None)?;
     println!(
-        "{}\tloglik\t{loglik:.3}\trf\t{rf}\trecovery\t{recovery:.6}\tnodes\t{}",
+        "{}\tloglik\t{loglik:.3}\tloglik_refit\t{loglik_refit:.3}\trf\t{rf}\trecovery\t{recovery:.6}\tnodes\t{}",
         nwk.display(),
         tree.n_nodes()
     );

@@ -18,42 +18,78 @@ both. `512 s32` is the same 512 cells at another seed with a harder gene panel.
 
 ## Speed and quality
 
-| cells | genes | method | seconds | Robinson-Foulds | distance recovery | loglikelihood |
-|---|---|---|---|---|---|---|
-| 512 | 2,382 | bonsai-rs | 4.7 | 147 | 0.591 | -527,499 |
-| 512 | 2,382 | published | 386 | 146 | 0.633 | -527,255 |
-| 512 | 2,382 | truth | | 0 | 0.733 | |
-| 512 s32 | 2,302 | bonsai-rs | 6.1 | 220 | 0.318 | -513,567 |
-| 512 s32 | 2,302 | published | 368 | 240 | 0.303 | -513,553 |
-| 512 s32 | 2,302 | truth | | 0 | 0.500 | |
-| 5,000 | 2,701 | bonsai-rs | 166 | 1,293 | 0.666 | -5,557,975 |
-| 5,000 | 2,701 | published | 4,868 | 1,937 | 0.496 | -5,563,770 |
-| 5,000 | 2,701 | truth | | 0 | 0.679 | |
-| 10,000 | 2,767 | bonsai-rs | 611 | 2,632 | 0.466 | -11,253,188 |
-| 10,000 | 2,767 | published | 16,062 | 5,149 | 0.281 | -11,280,721 |
-| 10,000 | 2,767 | truth | | 0 | 0.461 | |
+| cells | genes | method | seconds | Robinson-Foulds | distance recovery | loglikelihood, as given | loglikelihood, refit |
+|---|---|---|---|---|---|---|---|
+| 512 | 2,382 | bonsai-rs | 3.5 | 136 | 0.652 | -527,187 | -527,187 |
+| 512 | 2,382 | published | 386 | 146 | 0.633 | -527,255 | -527,248 |
+| 512 | 2,382 | truth | | 0 | 0.733 | | -528,223 |
+| 512 s32 | 2,302 | bonsai-rs | 4.5 | 221 | 0.317 | -513,570 | -513,570 |
+| 512 s32 | 2,302 | published | 368 | 240 | 0.303 | -513,553 | -513,536 |
+| 512 s32 | 2,302 | truth | | 0 | 0.500 | | -515,853 |
+| 5,000 | 2,701 | bonsai-rs | 53 | 1,301 | 0.667 | -5,557,888 | -5,557,888 |
+| 5,000 | 2,701 | published | 4,868 | 1,937 | 0.496 | -5,563,770 | -5,561,535 |
+| 5,000 | 2,701 | published, backbone 2,048 | 2,514 | 1,899 | 0.578 | -5,571,002 | -5,565,342 |
+| 5,000 | 2,701 | published, backbone 1,000 | 1,794 | 1,959 | 0.569 | -5,572,684 | -5,566,018 |
+| 5,000 | 2,701 | truth | | 0 | 0.679 | | -5,571,449 |
+| 10,000 | 2,767 | bonsai-rs | 144 | 2,612 | 0.386 | -11,253,773 | -11,253,773 |
+| 10,000 | 2,767 | published | 16,062 | 5,149 | 0.281 | -11,280,721 | -11,274,900 |
+| 10,000 | 2,767 | published, backbone 2,048 | 3,529 | 3,946 | 0.368 | -11,280,324 | -11,264,651 |
+| 10,000 | 2,767 | published, backbone 1,000 | 3,594 | 4,191 | 0.347 | -11,284,311 | -11,268,274 |
+| 10,000 | 2,767 | truth | | 0 | 0.461 | | -11,282,910 |
 
-bonsai-rs is `BonsaiParams::default()` as of 2026-09-13 (Ward start).
+bonsai-rs is `BonsaiParams::default()` in 0.2.0, 2026-09-26. Published is its
+standard run on one core; the published backbone is its backbone-based mode
+with `n_initial_cells` 2,048 or 1,000 and `growth_factor_guide` 10, one
+process. Its default of 10,000 initial cells needs more cells than these sets
+have.
 
 Robinson-Foulds is to the generating tree, lower is better. Distance recovery
 correlates tree path distance with true squared Euclidean distance (the paper's
-Fig. S8), higher is better; the truth row is the ceiling. Loglikelihoods drop
-different constants and aren't comparable across the two.
+Fig. S8), higher is better; the truth row is the ceiling for Robinson-Foulds,
+and recovery can pass it (last bullet).
 
-- **512 is a tie.** 147 splits against 146, recovery 0.591 against 0.633. The
-  replicate flips both: 220 against 240, 0.318 against 0.303.
-- **From 5,000 bonsai-rs pulls ahead**, and at 10,000 by a lot: 2,632 against
-  5,149 splits, 0.466 against 0.281.
-- **The two trees differ from each other** by 57, 108, 1,474 and 4,221 splits.
+**Two loglikelihood columns, both from our scorer on the same data**, so the
+dropped constants are the same and the numbers line up. What differs is the
+branch lengths:
+
+- *As given* scores each tree with its own branch lengths. The published
+  implementation fitted its lengths to its own preprocessing, so for its trees
+  this column mixes the topology with that mismatch.
+- *Refit* first optimises the branch lengths of each topology on this data with
+  our global solve (search steps 4 and 7), then scores. That compares the
+  topologies alone, and it is the column to read. bonsai-rs doesn't move,
+  because its lengths already are that optimum. The truth has no as-given value:
+  its lengths are expected displacements in simulation units.
+
+Higher is better, but the truth is no ceiling here. A maximum-likelihood tree
+fits the noise that was realised, so both searches score above the true
+topology. The loglikelihood is what the search optimises; Robinson-Foulds and
+recovery are what it's for.
+
+- **512 is a tie.** 136 splits against 146, recovery 0.652 against 0.633, 61
+  nats ahead after the refit. The replicate flips it: 221 against 240 and 0.317
+  against 0.303, but 34 nats behind.
+- **From 5,000 bonsai-rs pulls ahead**, and at 10,000 by a lot: 2,612 against
+  5,149 splits, 21,000 nats after the refit.
+- **The refit matters for the published trees.** It recovers 2,200 nats at 5,000
+  and 5,800 at 10,000; 15,700 for the 10,000 backbone. The as-given column
+  overstates bonsai-rs's lead by 60 per cent at 5,000 and 28 at 10,000.
+- **The published backbone pays off in the published implementation**: 2 to 4.5
+  times faster than its standard run, and at 10,000 better on splits and on the
+  refit loglikelihood. It is still 25 times slower than bonsai-rs's standard run
+  at 10,000 and behind it on every column.
+- **The two trees differ from each other** by 26, 111, 1,472 and 4,285 splits.
   Equal scores against the truth don't mean the same tree.
 - **The published implementation is deterministic.** A 2026-09-14 rerun gave
   byte-identical Newick at all four sizes. Wall times moved under half a per
   cent where the first run had an idle machine, 30 per cent at 512 and 8 at
   10,000 where it hadn't.
-- **At 10,000 both are at the ceiling on recovery, neither is close on
-  topology.** bonsai-rs's 0.466 beats the truth's 0.461, which is expected: the
-  truth's branch lengths are expected displacements, ours are fitted to what was
-  realised.
+- **Recovery at 10,000 depends on SPR's candidate order.** 0.2.0 re-applies the
+  rest of a chunk after an acceptance (`SprApprox::recheck`) and lands at 0.386;
+  with that off the same data gives 0.476, and random candidate orders alone
+  span 0.40 to 0.48 ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)).
+  Recovery above the truth's 0.461 is possible because the truth's branch
+  lengths are expected displacements and ours are fitted to what was realised.
 
 ## Counts to tree
 
@@ -222,7 +258,8 @@ not because it placed them better.
 **The ladder is more faithful, most of all exactly where a fan looks
 defensible.** Pearson correlation of true squared distance with path distance
 at 10,000 cells (`faithfulness.py` in the harness). The subset rows use every
-pair; the first samples 200,000, which is why it isn't the headline 0.466.
+pair; the first samples 200,000, which is why it isn't that tree's 0.466
+(the 2026-09-13 run; the table above is 0.2.0).
 
 | pairs drawn from | cells | in bonsai-rs's tree | in the reference's tree |
 |---|---|---|---|

@@ -59,7 +59,7 @@ first call to cap it; after that it's fixed.
 ## Large datasets
 
 The largest run measured is 10,000 cells by 2,767 genes of Sanity-preprocessed
-Baron pancreas in 210 seconds; see the [comparison](https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md).
+Baron pancreas in 144 seconds on a ten-core laptop; see the [comparison](https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md).
 
 
 ## The start tree

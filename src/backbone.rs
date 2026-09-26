@@ -13,12 +13,13 @@
 //! its own this trades away the cheap step and keeps the expensive one.** It is
 //! worth having because it composes with anything that makes SPR cheaper.
 //!
-//! Measured, 2026-09-25, Baron 10k: 336 s against 211 s for the linkage-start
-//! search, 8k nats below it. The grown tree matches the linkage start on
-//! loglikelihood at a 4096-cell backbone, but the refinement still costs more
-//! from it (253 s against 205 s), NNI above all. What the refinement costs
-//! tracks the quality of its start, 42 s from a converged tree, so this only
-//! pays once a grown tree beats the linkage start outright.
+//! Measured 2026-09-26: below the full search's loglikelihood on every dataset
+//! and seed tried (Baron 5k, 10k and 25k, two synthetic 8k sets), and slower
+//! than it at every size up to 25k. The backbone seed alone moves the result
+//! at 10k by 5k nats and distance recovery from 0.31 to 0.47, three times the
+//! full search's run-to-run spread, so one backbone run says little. What the
+//! refinement costs tracks the quality of its start, so this only pays once a
+//! grown tree beats the linkage start outright.
 //!
 //! ### The one place this differs from the standard algorithm's answer
 //!
@@ -59,20 +60,21 @@ use std::time::Instant;
 /// cells will be placed against; too small and every placement is deciding
 /// between branches that are not there yet. The paper suggests ten thousand.
 ///
-/// Ours, measured 2026-09-25 on Baron 10k. Grown-tree loglikelihood after
-/// branch optimisation, against the seed search's cost: 1024 cells -11,460,009
-/// in 15 s, 2048 -11,378,038 in 40 s, 4096 -11,326,618 in 75 s, the last level
-/// with the linkage start's -11,327,995. End to end 4096 took 336 s and 2048
-/// 372 s, one run each.
-pub const DEFAULT_BACKBONE_CELLS: usize = 4096;
+/// Ours. A larger backbone grows a better tree (Baron 10k, grown loglikelihood
+/// after branch optimisation: 1024 cells -11,460,009, 2048 -11,378,038, 4096
+/// -11,326,618), but the finished tree does not follow: 2048 and 4096 were
+/// indistinguishable within the seed spread on Baron 5k and 10k and a
+/// synthetic 8k set, measured 2026-09-26, and 2048 costs half the seed search.
+pub const DEFAULT_BACKBONE_CELLS: usize = 2048;
 
 /// Growth per placement round, as a fraction of the current leaf count.
 ///
 /// Each round places its cells against one collapse of the tree as it stood, so
 /// a cell cannot see its own round. Smaller rounds cost a collapse each and buy
-/// sight of more of the tree. Ours, measured 2026-09-25 on Baron 10k with a
-/// 2048-cell backbone: 0.05 grew a tree 16k nats better than 0.25 for 7 s more
-/// placement, and a single round was 43k worse than 0.25.
+/// sight of more of the tree. Ours: 0.05 grew a better tree than 0.25 on every
+/// dataset measured 2026-09-26, by 11k nats on Baron 10k, 1k on Baron 5k, 15k
+/// and 0.8k on synthetic 8k sets at two noise levels; a single round was 43k
+/// worse than 0.25 on Baron 10k.
 pub const DEFAULT_REGROW_FRACTION: f64 = 0.05;
 
 /// Passes of [`Growing::resolve_new`] per round. Each pass resolves every
@@ -95,7 +97,11 @@ const NEAREST_METRIC: &str = "euclidean";
 /// loglikelihood after branch optimisation: none -12,031,580, 4 leaves
 /// -11,411,956, 16 leaves -11,389,458, exhaustive -11,378,943. Placement stayed
 /// near 5 s throughout; exhaustive took 314 s. Widening the beam instead gets
-/// less: tolerance 100 with the spread starts reached -11,463,839.
+/// less: tolerance 100 with the spread starts reached -11,463,839. Checked
+/// 2026-09-26 on Baron 5k, where 4 and 16 both gain 13.6k over none, and on
+/// synthetic 8k sets, where the spread starts already find the basin and the
+/// leaf starts change nothing. 16 over 4 only shows on Baron 10k and costs
+/// nothing elsewhere.
 pub const DEFAULT_LEAF_STARTS: usize = 16;
 
 ////////////////////
@@ -118,7 +124,9 @@ pub struct BackboneParams {
     /// Resolve the polytomy at every node that received cells, after each
     /// round (SI.B.4.2: a cell attachment is always followed by resolving the
     /// polytomy it made). One settle per round serves every centre; see
-    /// `search::polytomy::resolve_centres` for the approximation.
+    /// `search::polytomy::resolve_centres` for the approximation. On by
+    /// default: quality within the seed spread on every dataset measured
+    /// 2026-09-26, and the refinement after it faster on every real one.
     pub resolve_attachments: bool,
     /// Run the full refinement over the cells placed so far each time the tree
     /// has grown by this factor since the last one, and grow on from the
@@ -146,7 +154,7 @@ impl Default for BackboneParams {
             regrow_fraction: DEFAULT_REGROW_FRACTION,
             seed: 0,
             leaf_starts: DEFAULT_LEAF_STARTS,
-            resolve_attachments: false,
+            resolve_attachments: true,
             stage_growth: f64::INFINITY,
             placement: PlacementParams::default(),
             growth_branch: GlobalBranchParams {

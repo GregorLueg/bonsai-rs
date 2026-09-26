@@ -271,6 +271,61 @@ pub fn splice_star<T: BonsaiFloat>(
     })
 }
 
+/// [`splice_star`], plus where every node of the new tree came from.
+///
+/// The same tree [`splice_star`] builds, node for node, so a caller that keeps
+/// rows across moves sees exactly the arena the plain splice would have given
+/// it. The map is recovered by walking up from each leaf in the spliced parent
+/// array and in the rebuilt tree in step, which pairs every reachable node once.
+///
+/// ### Params
+///
+/// * `tree` - The tree the star was built from
+/// * `star` - The star, from [`centre_star`] or from an interchange's collapse
+/// * `params` - Star primitive knobs, or `None` for the defaults
+///
+/// ### Returns
+///
+/// The new tree and, per node of it, its node in `tree` or [`NO_NODE`] for a
+/// node the splice created; or the error the primitive or the arena failed
+/// with.
+pub(crate) fn splice_star_mapped<T: BonsaiFloat>(
+    tree: &Tree,
+    star: &CentreStar<T>,
+    params: Option<StarParams>,
+) -> Result<(Tree, Vec<u32>), BonsaiErrors> {
+    let result = resolve_star(star.view(), params)?;
+    let mut parent: Vec<u32> = (0..tree.n_nodes())
+        .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
+        .collect();
+    let mut branch = tree.branches().to_vec();
+    apply_splice(&mut parent, &mut branch, star, &result);
+    let out = rebuild(&parent, &branch, tree.root(), tree.n_leaves())?;
+
+    let mut to_old = vec![NO_NODE; out.n_nodes()];
+    for leaf in 0..out.n_leaves() as u32 {
+        let (mut from, mut to) = (leaf, leaf);
+        while to_old[to as usize] == NO_NODE {
+            to_old[to as usize] = from;
+            match (parent[from as usize], out.parent(to)) {
+                (NO_NODE, None) => break,
+                (up, Some(next)) if up != NO_NODE => (from, to) = (up, next),
+                _ => {
+                    return Err(BonsaiErrors::MalformedTree {
+                        reason: format!("splice map lost step at leaf {leaf}"),
+                    });
+                }
+            }
+        }
+    }
+    for old in &mut to_old {
+        if *old != NO_NODE && *old as usize >= tree.n_nodes() {
+            *old = NO_NODE;
+        }
+    }
+    Ok((out, to_old))
+}
+
 /// Map a resolved star back onto tree node ids and rebuild the arena.
 ///
 /// Local index `i < n_members` is the member's own node, except the upstream

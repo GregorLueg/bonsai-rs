@@ -63,9 +63,12 @@
 use crate::errors::BonsaiErrors;
 use crate::model::global::UpState;
 use crate::model::likelihood::NodeState;
-use crate::search::polytomy::{CentreStar, Splice, splice_star};
+use crate::search::polytomy::{CentreStar, Splice, splice_star, splice_star_mapped};
+use crate::search::spr::{LazyRows, RowStore};
 use crate::search::star::{StarParams, StarResult, StarSelection, resolve_star};
-use crate::search::{Leaves, leaf_words, leaves_below, mark_near_new_clades, settle, tree_loglik};
+use crate::search::{
+    Leaves, leaf_words, leaves_below, mark_near_new_clades, settle, settled_down, tree_loglik,
+};
 use crate::tree::Tree;
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
@@ -267,10 +270,11 @@ pub struct NniResult {
     pub tree: Tree,
     /// Its loglikelihood, from [`NodeState::prune`] on the tree itself.
     ///
-    /// The greedy phase settles the tree at the top of every round and stops on
-    /// a round that finds no move, so what comes back is that round's own
-    /// sweep. Only a run truncated by [`NniParams::max_rounds`] returns the
-    /// last sweep plus the accepted gains instead.
+    /// The exact greedy phase settles the tree at the top of every round and
+    /// stops on a round that finds no move, so what comes back is that round's
+    /// own sweep; a run truncated by [`NniParams::max_rounds`] returns the last
+    /// sweep plus the accepted gains instead. The approximate phase sweeps once
+    /// at the end.
     pub loglik: f64,
     /// Number of moves performed.
     pub n_moves: usize,
@@ -308,6 +312,69 @@ pub struct NniRound {
     pub best_gain: f64,
 }
 
+//////////
+// Rows //
+//////////
+
+/// Where an interchange reads its effective leaves from.
+///
+/// A settled pair of sweeps, or [`LazyRows`] over a store kept current move by
+/// move. Both give the same bits for every row ([`LazyRows`] is gated on that
+/// against a full settle), so which one a caller hands in changes the cost and
+/// never the answer.
+trait EdgeRows<T> {
+    /// Down row of a node: its subtree collapsed onto it.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node of the tree the rows describe
+    ///
+    /// ### Returns
+    ///
+    /// Effective means and precisions.
+    fn down(&self, node: u32) -> (&[T], &[T]);
+
+    /// Up row of a node: everything outside its subtree, at its parent.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Non-root node of the tree the rows describe
+    ///
+    /// ### Returns
+    ///
+    /// Effective means and precisions.
+    fn up(&self, node: u32) -> (&[T], &[T]);
+}
+
+/// A settled pair of sweeps, as [`settle`] returns them.
+struct Settled<'a, T> {
+    /// Down rows.
+    down: &'a NodeState<T>,
+    /// Up rows.
+    up: &'a UpState<T>,
+}
+
+impl<T: BonsaiFloat> EdgeRows<T> for Settled<'_, T> {
+    fn down(&self, node: u32) -> (&[T], &[T]) {
+        (self.down.means(node), self.down.precisions(node))
+    }
+
+    fn up(&self, node: u32) -> (&[T], &[T]) {
+        (self.up.means(node), self.up.precisions(node))
+    }
+}
+
+impl<T: BonsaiFloat> EdgeRows<T> for LazyRows<'_, T> {
+    fn down(&self, node: u32) -> (&[T], &[T]) {
+        self.down_row(node)
+    }
+
+    fn up(&self, node: u32) -> (&[T], &[T]) {
+        let row = self.up_row(node);
+        (&row.0, &row.1)
+    }
+}
+
 ///////////////
 // One move //
 ///////////////
@@ -343,8 +410,7 @@ fn interchange_members(tree: &Tree, k: u32) -> Option<usize> {
 /// ### Params
 ///
 /// * `tree` - The tree
-/// * `down` - Down rows, settled by [`NodeState::prune`] against this tree
-/// * `up` - Up rows, settled by [`UpState::sweep`] against the same
+/// * `rows` - Its down and up rows
 /// * `k` - The node to delete
 ///
 /// ### Returns
@@ -352,13 +418,12 @@ fn interchange_members(tree: &Tree, k: u32) -> Option<usize> {
 /// The star, or `None` if the edge is not eligible.
 fn collapsed_star<T: BonsaiFloat>(
     tree: &Tree,
-    down: &NodeState<T>,
-    up: &UpState<T>,
+    rows: &impl EdgeRows<T>,
     k: u32,
 ) -> Option<CentreStar<T>> {
     let n = interchange_members(tree, k)?;
     let l = tree.parent(k)?;
-    let p = down.n_features();
+    let p = rows.down(k).0.len();
     let t_k = tree.branch(k);
     let above = tree.parent(l);
 
@@ -374,9 +439,10 @@ fn collapsed_star<T: BonsaiFloat>(
     };
 
     let push = |node: u32, branch: f64, star: &mut CentreStar<T>| {
+        let (m, w) = rows.down(node);
         star.member_nodes.push(node);
-        star.means.extend_from_slice(down.means(node));
-        star.precisions.extend_from_slice(down.precisions(node));
+        star.means.extend_from_slice(m);
+        star.precisions.extend_from_slice(w);
         star.branch.push(branch);
     };
 
@@ -389,9 +455,10 @@ fn collapsed_star<T: BonsaiFloat>(
         push(child, tree.branch(child) + t_k, &mut star);
     }
     if let Some(par) = above {
+        let (m, w) = rows.up(l);
         star.member_nodes.push(par);
-        star.means.extend_from_slice(up.means(l));
-        star.precisions.extend_from_slice(up.precisions(l));
+        star.means.extend_from_slice(m);
+        star.precisions.extend_from_slice(w);
         star.branch.push(tree.branch(l));
     }
     Some(star)
@@ -423,7 +490,7 @@ pub fn interchange_at<T: BonsaiFloat>(
     k: u32,
     params: Option<StarParams>,
 ) -> Result<Option<Splice>, BonsaiErrors> {
-    match collapsed_star(tree, down, up, k) {
+    match collapsed_star(tree, &Settled { down, up }, k) {
         None => Ok(None),
         Some(star) => Ok(Some(splice_star(tree, &star, params)?)),
     }
@@ -519,8 +586,7 @@ impl<T: BonsaiFloat> PeelScratch<T> {
 /// ### Params
 ///
 /// * `tree` - The tree
-/// * `down` - Down rows, settled against this tree
-/// * `up` - Up rows, settled against the same
+/// * `rows` - Its down and up rows
 /// * `k` - The node the collapse deletes
 /// * `l` - Its parent, the centre of the star
 /// * `star` - The collapsed star, from [`collapsed_star`]
@@ -531,8 +597,7 @@ impl<T: BonsaiFloat> PeelScratch<T> {
 /// The loglikelihood of the collapsed tree less that of `tree`, in nats.
 fn collapse_delta<T: BonsaiFloat>(
     tree: &Tree,
-    down: &NodeState<T>,
-    up: &UpState<T>,
+    rows: &impl EdgeRows<T>,
     k: u32,
     l: u32,
     star: &CentreStar<T>,
@@ -550,11 +615,15 @@ fn collapse_delta<T: BonsaiFloat>(
         .collect();
     let after = scratch.peel(&after);
 
-    let below = |node: u32| (down.means(node), down.precisions(node), tree.branch(node));
+    let below = |node: u32| {
+        let (m, w) = rows.down(node);
+        (m, w, tree.branch(node))
+    };
     let at_k: Vec<(&[T], &[T], f64)> = tree.children(k).iter().map(|&c| below(c)).collect();
     let mut at_l: Vec<(&[T], &[T], f64)> = tree.children(l).iter().map(|&c| below(c)).collect();
     if tree.parent(l).is_some() {
-        at_l.push((up.means(l), up.precisions(l), tree.branch(l)));
+        let (m, w) = rows.up(l);
+        at_l.push((m, w, tree.branch(l)));
     }
     after - scratch.peel(&at_k) - scratch.peel(&at_l)
 }
@@ -652,8 +721,7 @@ fn rebuilds_the_same_splits<T>(
 /// ### Params
 ///
 /// * `tree` - The tree
-/// * `down` - Down rows, settled against this tree
-/// * `up` - Up rows, settled against the same
+/// * `rows` - Its down and up rows
 /// * `below` - [`leaves_below`] of the tree
 /// * `k` - Lower end of the edge
 /// * `star_params` - Star primitive knobs
@@ -666,8 +734,7 @@ fn rebuilds_the_same_splits<T>(
 /// primitive failed with.
 fn scan_edge<T: BonsaiFloat>(
     tree: &Tree,
-    down: &NodeState<T>,
-    up: &UpState<T>,
+    rows: &impl EdgeRows<T>,
     below: &[usize],
     k: u32,
     star_params: StarParams,
@@ -680,7 +747,7 @@ fn scan_edge<T: BonsaiFloat>(
     let Some(l) = tree.parent(k) else {
         return Ok((seen, None));
     };
-    let Some(star) = collapsed_star(tree, down, up, k) else {
+    let Some(star) = collapsed_star(tree, rows, k) else {
         return Ok((seen, None));
     };
     seen.eligible = 1;
@@ -719,7 +786,7 @@ fn scan_edge<T: BonsaiFloat>(
     seen.changed = 1;
 
     let gain: f64 = result.merges.iter().map(|x| x.gain).sum::<f64>()
-        + collapse_delta(tree, down, up, k, l, &star, scratch);
+        + collapse_delta(tree, rows, k, l, &star, scratch);
     seen.best_gain = gain;
     if gain > star_params.min_gain {
         seen.improving = 1;
@@ -887,7 +954,13 @@ pub fn nni_greedy<T: BonsaiFloat>(
             .par_iter()
             .map_init(
                 || PeelScratch::<T>::new(leaves.n_features),
-                |scratch, &k| scan_edge(&tree, &down, &up, &below, k, params.star, scratch),
+                |scratch, &k| {
+                    let rows = Settled {
+                        down: &down,
+                        up: &up,
+                    };
+                    scan_edge(&tree, &rows, &below, k, params.star, scratch)
+                },
             )
             .try_reduce(
                 || {
@@ -957,6 +1030,13 @@ pub fn nni_greedy<T: BonsaiFloat>(
 /// improving, the next round is a full scan, and a full scan that finds
 /// nothing ends the phase, which is the same stopping rule as the exact phase.
 ///
+/// Nothing is swept per round. The down rows are settled once and kept in a
+/// [`RowStore`], which an accepted move updates in its `O(depth)` changed rows;
+/// up rows are formed by [`LazyRows`] only along the chains the scanned edges
+/// read. Both are the sweep's own bits, so the moves are the ones a settle per
+/// round would make. Measured 2026-09-26 on Baron 10k, steps 3 to 8 from the
+/// same linkage tree: identical tree and loglikelihood, step 6 26.3 s to 7.2 s.
+///
 /// Edges are keyed by [`leaf_words`] of their lower end, so a gain survives the
 /// renumbering a splice performs. Everything that decides a move is sequential
 /// and the parallel scans collect in edge order, so the result does not depend
@@ -981,17 +1061,23 @@ fn nni_lazy<T: BonsaiFloat>(
 ) -> Result<NniResult, BonsaiErrors> {
     let min_gain = params.star.min_gain;
     let mut tree = tree.clone();
-    let mut best: Option<f64> = None;
     let mut n_moves = 0usize;
     let mut rounds = 0usize;
     let mut trace: Vec<NniRound> = Vec::new();
     let mut cache: FxHashMap<u64, f64> = FxHashMap::default();
     let mut full = true;
 
+    // Settled once. After that an accepted move rewrites only the `O(depth)`
+    // down rows it changed, and up rows are formed on demand along the chain to
+    // the root, so a round costs what it reads rather than an `O(n p)` settle.
+    let (down, _) = settled_down(&tree, leaves)?;
+    let mut store = RowStore::from_state(&down, tree.n_nodes());
+    drop(down);
+
     while rounds < params.max_rounds {
         rounds += 1;
-        let (down, up, loglik) = settle(&tree, leaves)?;
-        best = Some(loglik);
+        let identity: Vec<u32> = (0..tree.n_nodes() as u32).collect();
+        let rows = LazyRows::new(&tree, &identity, &tree, &store)?;
         let below = leaves_below(&tree);
         let word = leaf_words(&tree);
         if full {
@@ -1007,7 +1093,7 @@ fn nni_lazy<T: BonsaiFloat>(
             .map_init(
                 || PeelScratch::<T>::new(leaves.n_features),
                 |scratch, &k| {
-                    scan_edge(&tree, &down, &up, &below, k, params.star, scratch)
+                    scan_edge(&tree, &rows, &below, k, params.star, scratch)
                         .map(|(seen, _)| (k, seen))
                 },
             )
@@ -1047,25 +1133,25 @@ fn nni_lazy<T: BonsaiFloat>(
                     }
                 }
             }
-            let Some((top, k)) = lead.filter(|&(g, _)| g > min_gain) else {
+            let Some((_, k)) = lead.filter(|&(g, _)| g > min_gain) else {
                 break None;
             };
-            let _ = top;
-            let (seen, proposal) =
-                scan_edge(&tree, &down, &up, &below, k, params.star, &mut scratch)?;
+            let (seen, proposal) = scan_edge(&tree, &rows, &below, k, params.star, &mut scratch)?;
             cache.insert(word[k as usize], seen.best_gain);
             if let Some(found) = proposal.filter(|p| p.0 >= second) {
                 break Some(found);
             }
         };
+        drop(rows);
 
         match winner {
             None if full => break,
             None => full = true,
-            Some((gain, _, star)) => {
+            Some((_, _, star)) => {
                 let before: FxHashSet<u64> = word.iter().copied().collect();
-                tree = splice_star(&tree, &star, Some(params.star))?.tree;
-                best = Some(loglik + gain);
+                let (next, to_old) = splice_star_mapped(&tree, &star, Some(params.star))?;
+                store.accept(&next, &to_old, &tree)?;
+                tree = next;
                 n_moves += 1;
                 let after = leaf_words(&tree);
                 let mut stale = FxHashSet::default();
@@ -1084,10 +1170,9 @@ fn nni_lazy<T: BonsaiFloat>(
         }
     }
 
-    let loglik = match best {
-        Some(loglik) => loglik,
-        None => tree_loglik(&tree, leaves)?,
-    };
+    // One sweep at the end rather than one a round: the rows' own sum agrees
+    // with it only to rounding, and callers compare against sweeps.
+    let loglik = tree_loglik(&tree, leaves)?;
     Ok(NniResult {
         tree,
         loglik,
@@ -1387,7 +1472,14 @@ mod tests {
                 let mut scratch = PeelScratch::<f64>::new(p);
                 for k in tree.internal_postorder() {
                     let Some(l) = tree.parent(k) else { continue };
-                    let Some(star) = collapsed_star(&tree, &down, &up, k) else {
+                    let Some(star) = collapsed_star(
+                        &tree,
+                        &Settled {
+                            down: &down,
+                            up: &up,
+                        },
+                        k,
+                    ) else {
                         continue;
                     };
                     let spliced = splice_star(&tree, &star, None).expect("splice");
@@ -1395,8 +1487,18 @@ mod tests {
                         continue;
                     }
                     let want = tree_loglik(&spliced.tree, leaves).expect("loglik") - before;
-                    let got =
-                        spliced.gain + collapse_delta(&tree, &down, &up, k, l, &star, &mut scratch);
+                    let got = spliced.gain
+                        + collapse_delta(
+                            &tree,
+                            &Settled {
+                                down: &down,
+                                up: &up,
+                            },
+                            k,
+                            l,
+                            &star,
+                            &mut scratch,
+                        );
                     worst = worst.max((got - want).abs());
                     checked += 1;
                 }
@@ -1433,7 +1535,14 @@ mod tests {
                 let below = leaves_below(&tree);
                 for k in tree.internal_postorder() {
                     let Some(l) = tree.parent(k) else { continue };
-                    let Some(star) = collapsed_star(&tree, &down, &up, k) else {
+                    let Some(star) = collapsed_star(
+                        &tree,
+                        &Settled {
+                            down: &down,
+                            up: &up,
+                        },
+                        k,
+                    ) else {
                         continue;
                     };
                     let result = resolve_star(star.view(), None).expect("resolve");

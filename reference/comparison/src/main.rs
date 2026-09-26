@@ -133,6 +133,19 @@ fn run() -> Fallible<()> {
             }
             score_tree(Path::new(&args[2]), Path::new(&args[3]))
         }
+        Some("rf") => {
+            if args.len() != 5 {
+                return Err("usage: harness rf <dir> <a.nwk> <b.nwk>".into());
+            }
+            let (_, n_cells, _) = read_csv(&Path::new(&args[2]).join("ours").join("means.csv"))?;
+            let labels = cell_labels(n_cells);
+            let index_of: HashMap<&str, usize> =
+                labels.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+            let a = load_tree(Path::new(&args[3]), &index_of)?;
+            let b = load_tree(Path::new(&args[4]), &index_of)?;
+            println!("rf\t{}", robinson_foulds(&a, &b)?);
+            Ok(())
+        }
         Some("refine-tree") => {
             if args.len() != 4 {
                 return Err("usage: harness refine-tree <dir> <newick>".into());
@@ -1062,6 +1075,10 @@ fn refine_tree(dir: &Path, nwk: &Path) -> Fallible<()> {
         "refine: {total:.2} s, spr moves {} rounds {}, nni moves {}",
         r.spr_moves, r.spr_rounds, r.nni_moves
     );
+    // REFINE_OUT names a file for the refined tree, to compare two builds.
+    if let Ok(out) = env::var("REFINE_OUT") {
+        fs::write(out, write_newick(&r.tree, &labels)? + "\n")?;
+    }
     Ok(())
 }
 

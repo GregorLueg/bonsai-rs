@@ -101,7 +101,7 @@ use crate::utils::simd::prune_binary;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 
 ////////////////
 // Parameters //
@@ -686,7 +686,7 @@ fn prune_subtree(tree: &Tree, x: u32) -> Result<Option<Pruned>, BonsaiErrors> {
 /// subtree the move left alone and writes only the rows it changed, into slots
 /// the move freed.
 #[derive(Clone)]
-struct RowStore<T> {
+pub(crate) struct RowStore<T> {
     /// Number of features.
     p: usize,
     /// Per node of the current tree, its slot.
@@ -710,7 +710,7 @@ impl<T: BonsaiFloat> RowStore<T> {
     /// ### Returns
     ///
     /// The store.
-    fn from_state(state: &NodeState<T>, n_nodes: usize) -> Self {
+    pub(crate) fn from_state(state: &NodeState<T>, n_nodes: usize) -> Self {
         let p = state.n_features();
         let mut m = Vec::with_capacity(n_nodes * p);
         let mut w = Vec::with_capacity(n_nodes * p);
@@ -800,7 +800,12 @@ impl<T: BonsaiFloat> RowStore<T> {
     ///
     /// `Ok` once the store describes `tree`, or the error [`LazyRows::new`]
     /// failed with.
-    fn accept(&mut self, tree: &Tree, to_old: &[u32], was: &Tree) -> Result<(), BonsaiErrors> {
+    pub(crate) fn accept(
+        &mut self,
+        tree: &Tree,
+        to_old: &[u32],
+        was: &Tree,
+    ) -> Result<(), BonsaiErrors> {
         let LazyRows {
             inherited,
             slot: fresh_slot,
@@ -853,7 +858,7 @@ impl<T: BonsaiFloat> RowStore<T> {
 /// Owned and boxed rather than written into a slab, because the beam search's
 /// provider hands out a borrow that has to stay valid for the whole search
 /// while later rows are still being formed behind it.
-type Row<T> = (Box<[T]>, Box<[T]>);
+pub(crate) type Row<T> = (Box<[T]>, Box<[T]>);
 
 /// A tree's settled rows, computed only where they are read.
 ///
@@ -899,7 +904,7 @@ type Row<T> = (Box<[T]>, Box<[T]>);
 /// full [`NodeState::prune`], a full [`crate::model::global::UpState::sweep`]
 /// and a collapse of every node, bit for bit, at every node of both trees a
 /// proposal builds. That is the gate this is allowed through on.
-struct LazyRows<'a, T> {
+pub(crate) struct LazyRows<'a, T> {
     /// The tree the rows describe.
     tree: &'a Tree,
     /// Number of features.
@@ -918,9 +923,9 @@ struct LazyRows<'a, T> {
     /// Loglikelihood contribution of each recomputed row, `[slot]`.
     fresh_contrib: Vec<f64>,
     /// Up rows, filled a chain at a time.
-    up: Vec<OnceCell<Row<T>>>,
+    up: Vec<OnceLock<Row<T>>>,
     /// Effective leaves, filled as the beam search asks for them.
-    eff: Vec<OnceCell<Row<T>>>,
+    eff: Vec<OnceLock<Row<T>>>,
 }
 
 impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
@@ -940,7 +945,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     /// anywhere but to a leaf. [`assemble`] never does, because it numbers the
     /// leaves it keeps out of the leaves it was given, but a row read through a
     /// map that did would silently be the wrong node's.
-    fn new(
+    pub(crate) fn new(
         tree: &'a Tree,
         to_old: &[u32],
         was: &Tree,
@@ -1001,8 +1006,8 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
             fresh_m: vec![T::zero(); dirty.len() * p],
             fresh_w: vec![T::zero(); dirty.len() * p],
             fresh_contrib: vec![0.0; dirty.len()],
-            up: (0..n).map(|_| OnceCell::new()).collect(),
-            eff: (0..n).map(|_| OnceCell::new()).collect(),
+            up: (0..n).map(|_| OnceLock::new()).collect(),
+            eff: (0..n).map(|_| OnceLock::new()).collect(),
         };
 
         // Ascending node index is a valid post-order on the arena, so a dirty
@@ -1063,7 +1068,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     /// ### Returns
     ///
     /// The loglikelihood, up to the dropped additive constants.
-    fn loglik(&self) -> f64 {
+    pub(crate) fn loglik(&self) -> f64 {
         let mut total = 0.0f64;
         for v in self.tree.n_leaves()..self.tree.n_nodes() {
             let old = self.inherited[v];
@@ -1085,7 +1090,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     /// ### Returns
     ///
     /// Its effective means and precisions.
-    fn down_row(&self, node: u32) -> (&[T], &[T]) {
+    pub(crate) fn down_row(&self, node: u32) -> (&[T], &[T]) {
         read_down(self, node)
     }
 
@@ -1099,7 +1104,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     ///
     /// Everything outside the node's subtree, positioned at its parent and not
     /// diffused along the branch above it, which is the up sweep's convention.
-    fn up_row(&self, node: u32) -> &Row<T> {
+    pub(crate) fn up_row(&self, node: u32) -> &Row<T> {
         let mut chain: Vec<u32> = Vec::new();
         let mut here = node;
         while self.up[here as usize].get().is_none() {

@@ -934,6 +934,13 @@ fn backbone(dir: &Path, backbone_cells: Option<usize>) -> Fallible<()> {
         params.regrow_fraction = v;
     }
     params.resolve_attachments = env::var("RESOLVE_ATTACH").is_ok();
+    if let Some(v) = env::var("BACKBONE_SEED")
+        .ok()
+        .map(|v| v.parse::<u64>())
+        .transpose()?
+    {
+        params.seed = v;
+    }
     if let Some(v) = env::var("STAGE_GROWTH")
         .ok()
         .map(|v| v.parse::<f64>())

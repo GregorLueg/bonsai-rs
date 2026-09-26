@@ -89,10 +89,11 @@ use crate::model::global::{LOGLIK_SCALE_FLOOR, up_part};
 use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place};
-use crate::search::polytomy::{CentreStar, splice_star};
-use crate::search::star::StarParams;
+use crate::search::polytomy::{CentreStar, splice_result};
+use crate::search::star::{StarParams, StarResult, resolve_star};
 use crate::search::{
-    Leaves, leaf_words, mark_near_new_clades, settled_down, split_fingerprint_with, tree_loglik,
+    Leaves, leaf_words, leaves_below, mark_near_new_clades, settled_down,
+    split_fingerprint_counted, split_fingerprint_with, split_hash, tree_loglik,
 };
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
@@ -1493,20 +1494,49 @@ fn propose<T: BonsaiFloat>(
     // degree, which the arena answers on its own, and the handful of rows it
     // reads if there is are the ones the regraft left alone plus the centre's
     // own ancestors.
+    //
+    // Most proposals put the subtree back where it came from and change no
+    // split, and they are known to before the candidate is spliced: the
+    // resolution only adds one split per ancestor it creates, so the
+    // candidate's fingerprint is the attached tree's plus those. Measured at
+    // 10k cells, 76 per cent of proposals end here, and splicing each of them
+    // was an arena rebuild and a relabel for nothing.
     let members = attached.children(centre).len() + usize::from(attached.parent(centre).is_some());
-    let candidate = if members <= crate::search::polytomy::RESOLVED_STAR_MEMBERS {
-        attached
+    let attached_word = leaf_words(&attached);
+    let attached_below = leaves_below(&attached);
+    let attached_print = split_fingerprint_counted(&attached, &attached_word, &attached_below);
+    let (candidate, word) = if members <= crate::search::polytomy::RESOLVED_STAR_MEMBERS {
+        if attached_print == here {
+            return Ok(None);
+        }
+        (attached, attached_word)
     } else {
         let attached_rows = LazyRows::new(&attached, &to_old, tree, down)?;
         let star = lazy_centre_star(&attached, &attached_rows, centre)?;
-        splice_star(&attached, &star, Some(params.star))?.tree
+        let result = resolve_star(star.view(), Some(params.star))?;
+        let print = attached_print.wrapping_add(resolution_splits(
+            &attached,
+            &attached_word,
+            &attached_below,
+            &star,
+            &result,
+        ));
+        #[cfg(debug_assertions)]
+        {
+            let full = splice_result(&attached, &star, &result)?;
+            debug_assert_eq!(
+                split_fingerprint_with(&full, &leaf_words(&full)),
+                print,
+                "the resolution's splits did not predict the spliced tree's fingerprint"
+            );
+        }
+        if print == here {
+            return Ok(None);
+        }
+        let candidate = splice_result(&attached, &star, &result)?;
+        let word = leaf_words(&candidate);
+        (candidate, word)
     };
-
-    let word = leaf_words(&candidate);
-    let same = split_fingerprint_with(&candidate, &word) == here;
-    if same {
-        return Ok(None);
-    }
 
     let n_leaves = tree.n_leaves();
     let to_old: Vec<u32> = (0..candidate.n_nodes())
@@ -1529,6 +1559,63 @@ fn propose<T: BonsaiFloat>(
         pruned: x,
         loglik,
     }))
+}
+
+/// Fingerprint terms of the splits a star resolution adds.
+///
+/// Resolving the star at `centre` keeps every edge of `attached` and adds one
+/// per ancestor it creates, whose split is its members' leaves against the
+/// rest. The upstream member, when there is one, stands for everything outside
+/// the centre's subtree. So the spliced tree's fingerprint is the attached
+/// tree's plus this, bit for bit, without splicing: the fingerprint is a
+/// wrapping sum over distinct splits, and a tree has no two edges with the
+/// same split.
+///
+/// ### Params
+///
+/// * `attached` - The tree the star was built from
+/// * `word` - Its [`leaf_words`]
+/// * `below` - Its [`leaves_below`]
+/// * `star` - The star at the attachment point
+/// * `result` - What the primitive built from it
+///
+/// ### Returns
+///
+/// The wrapping sum of [`split_hash`] over the added non-trivial splits.
+fn resolution_splits<T: BonsaiFloat>(
+    attached: &Tree,
+    word: &[u64],
+    below: &[usize],
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+) -> u64 {
+    let n_members = result.n_members;
+    let n_leaves = attached.n_leaves();
+    let total = word[attached.root() as usize];
+    let n_local = n_members + result.merges.len();
+    let mut group = vec![0u64; n_local];
+    let mut count = vec![0usize; n_local];
+    for (i, &node) in star.member_nodes.iter().enumerate() {
+        if star.has_upstream && i == n_members - 1 {
+            group[i] = total.wrapping_sub(word[star.centre as usize]);
+            count[i] = n_leaves - below[star.centre as usize];
+        } else {
+            group[i] = word[node as usize];
+            count[i] = below[node as usize];
+        }
+    }
+    let mut print = 0u64;
+    for (j, merge) in result.merges.iter().enumerate() {
+        let a = n_members + j;
+        debug_assert_eq!(merge.ancestor as usize, a);
+        let (l, r) = (merge.left as usize, merge.right as usize);
+        group[a] = group[l].wrapping_add(group[r]);
+        count[a] = count[l] + count[r];
+        if count[a] >= 2 && n_leaves - count[a] >= 2 {
+            print = print.wrapping_add(split_hash(group[a], total));
+        }
+    }
+    print
 }
 
 ////////////

@@ -385,7 +385,7 @@ fn map_back(parent: &[u32], out: &Tree, n_old: usize) -> Result<Vec<u32>, Bonsai
 /// ### Returns
 ///
 /// The spliced tree, or the error the arena failed with.
-fn splice_result<T: BonsaiFloat>(
+pub(crate) fn splice_result<T: BonsaiFloat>(
     tree: &Tree,
     star: &CentreStar<T>,
     result: &StarResult<T>,

@@ -801,8 +801,17 @@ final standard run, which in practice is mostly SPR, NNI and branch-length
 optimisation because few polytomies survive.
 
 Reoptimise branch lengths and recompute the beam search start points after the
-backbone has grown by a set fraction. Their default backbone is 10k cells; ours
-is ours. Growing in more than one round costs time but can find a better optimum.
+backbone has grown by a set fraction. Their default backbone is 10k cells.
+Growing in more than one round costs time but can find a better optimum.
+
+**Not implemented here.** Built and measured, then removed in 0.2.0. With the
+Ward linkage start (9.1's replacement here) the step backbone mode saves is
+already about 3 per cent of a run, and the final whole-tree refinement it keeps
+is most of the rest. Measured 2026-09-26 on Baron 5k, 10k and 25k and two
+synthetic 8k sets: below the full search's loglikelihood on every dataset and
+backbone seed, slower up to 25k, and the backbone seed alone moved the 10k
+result by 5k nats. What scales is making SPR and NNI cheaper;
+[scaling](SCALING.md) has the proposal.
 
 ## 16. Open questions
 
@@ -811,8 +820,7 @@ is ours. Growing in more than one round costs time but can find a better optimum
   and document it; if random NNI underperforms, this is the first thing to check.
 - The clustering used for beam-search start points (section 7.2) and for root
   selection is described in the Methods as iterative branch cutting minimising
-  the summed pairwise leaf distances. Cheap enough, but the cost of recomputing
-  it during backbone growth needs measuring.
+  the summed pairwise leaf distances.
 - `1/W` appears throughout. Nodes with a very small effective precision want a
   guard. Decide whether to clamp or to carry variance rather than precision in
   the hot path.

@@ -407,9 +407,9 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
 /// Steps 1 and 2 build a tree from nothing; this improves one that is already
 /// there.
 ///
-/// That is what backbone mode's final pass needs, and what a caller with a tree
-/// from elsewhere wants. The paper recommends seeding the search with cells
-/// grouped by an external clustering, which is the same entry point.
+/// That is what a caller with a tree from elsewhere wants. The paper
+/// recommends seeding the search with cells grouped by an external clustering,
+/// which is the same entry point.
 ///
 /// The returned `steps` start at step 3, since 1 and 2 did not happen.
 ///
@@ -689,9 +689,9 @@ mod tests {
 
     #[test]
     fn test_refining_a_finished_tree_finds_nothing_left() {
-        // `refine` is the entry point backbone mode's final pass uses. Run on a
-        // tree the full pipeline already produced, it should have nothing to do,
-        // which is what says the two paths agree about when the search is done.
+        // Run on a tree the full pipeline already produced, `refine` should
+        // have nothing to do, which is what says the two paths agree about when
+        // the search is done.
         let (n, p) = (32usize, 128usize);
         let (means, sds, variances, _) = raw_fixture(n, p, 0.2, 13);
         let full = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");

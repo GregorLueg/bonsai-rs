@@ -1,5 +1,14 @@
 # News
 
+## 0.2.0
+
+Vendors `bonsai-rs` 0.2.0.
+
+- **Breaking:** `backbone` removed. It lost to the plain search on every dataset
+  measured; see the core crate's changelog.
+- The search is faster with the same trees: about half the time at 25,000 cells,
+  from NNI, polytomy resolution and SPR no longer re-settling the whole tree.
+
 ## 0.1.0
 
 First release, vendoring `bonsai-rs` 0.1.0 and `sanity-sc-rs` 0.0.1.

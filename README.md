@@ -50,8 +50,7 @@ println!("{}", write_newick(&out.tree, &cell_names)?);
 dud run tells you which step did nothing. Tune via `BonsaiParams`; `None` takes
 the documented defaults. `ingest::prepare` plus `bonsai_prepared` splits ingest
 from search, for your own feature selection or several parameter settings on
-one ingest. Too big to search directly? `backbone::backbone` reconstructs on a
-subset and places the rest (see SPEC 15).
+one ingest.
 
 ### From raw counts
 

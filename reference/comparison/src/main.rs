@@ -9,9 +9,9 @@
 //!   the per-feature scale transform, through the crate's own ingest.
 //! * `ours` runs the eight search steps over the CSV one at a time, timing each,
 //!   and emits a Newick string, a wall time and a per-step table.
-//! * `backbone` runs `backbone::backbone` over the same CSV: search a random
-//!   subset, place the rest, refine the whole tree. One wall time, since the
-//!   crate does not split its phases.
+//! * `refine-tree` runs steps 3 to 8 from a Newick tree, timing each; `rf`
+//!   compares two trees; `sanity-rs` preprocesses raw counts through
+//!   `sanity-sc-rs` when the original Sanity binary is not to hand.
 //! * `score` loads every Newick it can find for a configuration, puts them all
 //!   on the same leaf indexing, and reports distance recovery, Robinson-Foulds
 //!   and loglikelihood, plus one layout CSV per tree. A Newick named
@@ -33,7 +33,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use bonsai_rs::backbone::BackboneParams;
 use bonsai_rs::bonsai::BonsaiParams;
 use bonsai_rs::ingest::{IngestParams, PreparedData, from_sanity, from_sanity_output, prepare};
 use bonsai_rs::model::global::optimise_branch_lengths;
@@ -114,13 +113,6 @@ fn run() -> Fallible<()> {
             }
             ours(Path::new(&args[2]))
         }
-        Some("backbone") => {
-            if !(3..=4).contains(&args.len()) {
-                return Err("usage: harness backbone <dir> [backbone_cells]".into());
-            }
-            let cells = args.get(3).map(|v| v.parse()).transpose()?;
-            backbone(Path::new(&args[2]), cells)
-        }
         Some("score") => {
             if args.len() != 3 {
                 return Err("usage: harness score <dir>".into());
@@ -152,7 +144,7 @@ fn run() -> Fallible<()> {
             }
             refine_tree(Path::new(&args[2]), Path::new(&args[3]))
         }
-        _ => Err("usage: harness <gen|prep|ours|backbone|score|score-tree> ...".into()),
+        _ => Err("usage: harness <gen|prep|sanity-rs|ours|refine-tree|score|score-tree|rf> ...".into()),
     }
 }
 
@@ -771,7 +763,7 @@ fn ours(dir: &Path) -> Fallible<()> {
 }
 
 /// A refined tree plus what the search steps did, for the `ours` and
-/// `backbone` subcommands.
+/// `refine-tree` subcommands.
 struct Refined {
     /// The finished tree.
     tree: Tree,
@@ -878,192 +870,6 @@ fn refine_steps(
         nni_moves: nni_result.n_moves,
         nni_rounds: nni_result.rounds,
     })
-}
-
-/// Run backbone mode over the CSV and write `backbone.nwk`,
-/// `backbone_seconds.txt` and `backbone_steps.tsv`.
-///
-/// Same input as [`ours`], wrapped as a `PreparedData` with every feature kept
-/// and unit variances, the way `backbone`'s own subset step builds one, so
-/// ingest never runs and both searches see identical leaves. Runs
-/// `backbone::grow`, then steps 3 to 8 one at a time as [`ours`] does, so the
-/// wall time is growth plus the refinement steps, loglikelihood evaluations
-/// excluded. `backbone_steps.tsv` holds the per-step timings and the growth
-/// report. Growth knobs from the environment: `REGROW`, `LEAF_STARTS`,
-/// `PLACE_TOL`, `PLACE_STARTS`, `GROW_ITER`, `GROW_TOL`; `GROW_ONLY` stops after
-/// the grown tree's branch optimisation.
-///
-/// With `BACKBONE_TAG` set, the outputs are suffixed `_<tag>`.
-fn backbone(dir: &Path, backbone_cells: Option<usize>) -> Fallible<()> {
-    let (means, n_cells, p) = read_csv(&dir.join("ours").join("means.csv"))?;
-    let (sds, sd_cells, sd_p) = read_csv(&dir.join("ours").join("sds.csv"))?;
-    if (n_cells, p) != (sd_cells, sd_p) {
-        return Err(format!(
-            "means are {n_cells}x{p} but standard deviations are {sd_cells}x{sd_p}"
-        )
-        .into());
-    }
-    let precisions: Vec<f64> = sds.iter().map(|&s| 1.0 / (s * s)).collect();
-    if precisions.iter().any(|v| !v.is_finite()) {
-        return Err("a standard deviation is zero or not finite".into());
-    }
-    let data = PreparedData {
-        transformed_means: means,
-        transformed_precisions: precisions,
-        features: (0..p).collect(),
-        variances: vec![1.0; p],
-        signal_to_noise: vec![f64::INFINITY; p],
-        n_cells,
-        n_features_in: p,
-    };
-    let mut params = BackboneParams::default();
-    if let Some(c) = backbone_cells {
-        params.backbone_cells = c;
-    }
-    let tag = env::var("BACKBONE_TAG").ok().filter(|t| !t.is_empty());
-    let named = |base: &str, ext: &str| match &tag {
-        Some(t) => format!("{base}_{t}.{ext}"),
-        None => format!("{base}.{ext}"),
-    };
-
-    if let Some(v) = env::var("REGROW")
-        .ok()
-        .map(|v| v.parse::<f64>())
-        .transpose()?
-    {
-        params.regrow_fraction = v;
-    }
-    if let Ok(v) = env::var("RESOLVE_ATTACH") {
-        params.resolve_attachments = v != "0";
-    }
-    if let Some(v) = env::var("BACKBONE_SEED")
-        .ok()
-        .map(|v| v.parse::<u64>())
-        .transpose()?
-    {
-        params.seed = v;
-    }
-    if let Some(v) = env::var("STAGE_GROWTH")
-        .ok()
-        .map(|v| v.parse::<f64>())
-        .transpose()?
-    {
-        params.stage_growth = v;
-    }
-    if let Some(v) = env::var("GROW_ITER")
-        .ok()
-        .map(|v| v.parse::<usize>())
-        .transpose()?
-    {
-        params.growth_branch.max_iter = v;
-    }
-    if let Some(v) = env::var("GROW_TOL")
-        .ok()
-        .map(|v| v.parse::<f64>())
-        .transpose()?
-    {
-        params.growth_branch.tol = v;
-    }
-    if let Some(v) = env::var("LEAF_STARTS")
-        .ok()
-        .map(|v| v.parse::<usize>())
-        .transpose()?
-    {
-        params.leaf_starts = v;
-    }
-    if let Some(v) = env::var("PLACE_TOL")
-        .ok()
-        .map(|v| v.parse::<f64>())
-        .transpose()?
-    {
-        params.placement.tolerance = v;
-    }
-    if let Some(v) = env::var("PLACE_STARTS")
-        .ok()
-        .map(|v| v.parse::<usize>())
-        .transpose()?
-    {
-        params.placement.n_starts = v;
-    }
-
-    let t0 = Instant::now();
-    let (grown, report) = bonsai_rs::backbone::grow(&data, Some(params))?;
-    let grow_secs = t0.elapsed().as_secs_f64();
-
-    let leaves = Leaves {
-        means: &data.transformed_means,
-        precisions: &data.transformed_precisions,
-        n_features: p,
-    };
-    let mut table = String::from("step\tseconds\tloglik\tgain\tloglik_seconds\n");
-    let mut total = grow_secs;
-    let mut last: Option<f64> = None;
-    let mut record = |step: &str, secs: f64, loglik: f64, loglik_secs: f64| {
-        let gain = last.map_or(0.0, |l| loglik - l);
-        last = Some(loglik);
-        total += secs;
-        let _ = writeln!(
-            table,
-            "{step}\t{secs:.3}\t{loglik:.3}\t{gain:.3}\t{loglik_secs:.3}"
-        );
-        println!("backbone: {step:<10} {secs:>9.2} s   loglik {loglik:>16.2}   gain {gain:>12.2}");
-    };
-    for (step, secs) in [
-        ("seed", report.seed_seconds),
-        ("place", report.place_seconds),
-        ("reoptimise", report.reoptimise_seconds),
-        ("resolve", report.resolve_seconds),
-        ("stages", report.stage_seconds),
-    ] {
-        println!("backbone: {step:<10} {secs:>9.2} s");
-    }
-    let t1 = Instant::now();
-    let loglik = tree_loglik(&grown, leaves)?;
-    record("0 grown", 0.0, loglik, t1.elapsed().as_secs_f64());
-    if env::var("GROW_ONLY").is_ok() {
-        // The grown tree with its branch lengths optimised and nothing else,
-        // for sweeping the growth knobs without paying for the refinement.
-        let mut tree = grown;
-        let mut state = NodeState::new(tree.n_nodes(), p, leaves.means, leaves.precisions)?;
-        let t0 = Instant::now();
-        let loglik = optimise_branch_lengths(&mut tree, &mut state, Some(params.bonsai.branch))?;
-        record("4 branch", t0.elapsed().as_secs_f64(), loglik, 0.0);
-        return Ok(());
-    }
-    let r = refine_steps(grown, leaves, &params.bonsai, &mut record)?;
-
-    let _ = writeln!(
-        table,
-        "# backbone_cells\t{}\n# placed\t{}\n# reoptimisations\t{}\n# mean_scored\t{:.2}\n\
-         # seed_seconds\t{:.3}\n# place_seconds\t{:.3}\n# reoptimise_seconds\t{:.3}\n\
-         # spr_moves\t{}\n# spr_rounds\t{}\n# nni_moves\t{}",
-        report.backbone_cells,
-        report.placed,
-        report.reoptimisations,
-        report.mean_scored,
-        report.seed_seconds,
-        report.place_seconds,
-        report.reoptimise_seconds,
-        r.spr_moves,
-        r.spr_rounds,
-        r.nni_moves
-    );
-
-    fs::write(
-        dir.join(named("backbone", "nwk")),
-        write_newick(&r.tree, &cell_labels(n_cells))? + "\n",
-    )?;
-    fs::write(
-        dir.join(named("backbone_seconds", "txt")),
-        format!("{total}\n"),
-    )?;
-    fs::write(dir.join(named("backbone_steps", "tsv")), &table)?;
-    println!(
-        "backbone: {n_cells} cells by {p} features, backbone {} placed {} reopt {} \
-         in {total:.2} s, loglik {:.1}",
-        report.backbone_cells, report.placed, report.reoptimisations, r.loglik
-    );
-    Ok(())
 }
 
 /// Run steps 3 to 8 over a Newick tree and print each step's timing. What the

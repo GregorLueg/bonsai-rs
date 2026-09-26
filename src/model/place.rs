@@ -1,8 +1,7 @@
 //! Placing a node on an existing tree.
 //!
-//! Used twice by the search: regrafting the pruned subtree of an SPR move,
-//! and adding a cell to an existing backbone. Both reduce to the same question,
-//! "which node of this tree should `q` hang off", so both go through [`place`].
+//! Used by the search to regraft the pruned subtree of an SPR move: "which
+//! node of this tree should `q` hang off".
 //!
 //! ### Why the score is an ordinary edge
 //!
@@ -60,11 +59,7 @@ const DEFAULT_TOLERANCE: f64 = 4.0;
 ///
 /// Eight ships because on the shape that fails it is nearly free, and what it
 /// costs on the shapes that do not fail is a handful of extra node scores per
-/// query. A caller placing millions of cells against a fixed backbone, and
-/// willing to accept the ladder case, can drop it to one through
-/// [`PlacementParams::n_starts`]. Eight is also roughly `log2(n)` over the few
-/// hundred nodes a backbone round works with, the same order as the `log(n)`
-/// the paper describes.
+/// query.
 const DEFAULT_STARTS: usize = 8;
 
 /// Tuning knobs for the beam search of SPEC.md section 7.2.
@@ -287,9 +282,9 @@ fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
 /// are everything outside a node's subtree, positioned at the node's *parent*
 /// and not diffused along the branch above it, so a caller who passes them
 /// straight in is wrong on two counts. The composition that is right is
-/// `model::global::collapse_onto_every_node`, which is what
-/// `backbone` hands in; `search::spr` forms the same rows one node at a time
-/// rather than all at once, because a proposal reads a few dozen of them.
+/// `model::global::collapse_onto_every_node`; `search::spr` forms the same
+/// rows one node at a time rather than all at once, because a proposal reads a
+/// few dozen of them.
 ///
 /// A plain closure is used rather than a trait because the provider is free to
 /// store the sweep in whatever layout suits it, needs no wrapper type, and the
@@ -318,39 +313,7 @@ pub fn place<'a, T: BonsaiFloat, F>(
 where
     F: Fn(u32) -> EffLeaf<'a, T>,
 {
-    place_from(tree, q, eff, &[], params)
-}
-
-/// [`place`] with extra start points supplied by the caller.
-///
-/// The extra starts are searched right after the root and before the evenly
-/// spread ones, so they get the second-least impeded search. Meant for starts
-/// that already sit near the answer, such as the leaves nearest `q`: on a
-/// 10k-cell tree the spread starts alone leave the beam in a local optimum;
-/// `backbone::DEFAULT_LEAF_STARTS` has the measurement.
-///
-/// ### Params
-///
-/// * `tree` - The existing tree, which is not modified
-/// * `q` - Effective leaf summarising the node being attached
-/// * `eff` - Effective leaf of the whole tree seen from each node; see [`place`]
-/// * `extra` - Additional start points, node indices of `tree`
-/// * `params` - Search parameters, or `None` for [`PlacementParams::default`]
-///
-/// ### Returns
-///
-/// As [`place`].
-pub fn place_from<'a, T: BonsaiFloat, F>(
-    tree: &Tree,
-    q: EffLeaf<'_, T>,
-    eff: F,
-    extra: &[u32],
-    params: Option<PlacementParams>,
-) -> Result<Placement, BonsaiErrors>
-where
-    F: Fn(u32) -> EffLeaf<'a, T>,
-{
-    place_walk(tree, q, eff, extra, params)
+    place_walk(tree, q, eff, params)
 }
 
 /// What the beam search needs from the tree it walks.
@@ -384,14 +347,13 @@ impl Walk for Tree {
     }
 }
 
-/// [`place_from`] over anything the search can walk.
+/// [`place`] over anything the search can walk.
 ///
 /// ### Params
 ///
 /// * `walk` - The tree, or a view of one
 /// * `q` - Effective leaf summarising the node being attached
 /// * `eff` - Effective leaf of the whole tree seen from each node
-/// * `extra` - Additional start points, searched after the root
 /// * `params` - Search parameters, or `None` for [`PlacementParams::default`]
 ///
 /// ### Returns
@@ -401,7 +363,6 @@ pub(crate) fn place_walk<'a, T: BonsaiFloat, F, W: Walk>(
     walk: &W,
     q: EffLeaf<'_, T>,
     eff: F,
-    extra: &[u32],
     params: Option<PlacementParams>,
 ) -> Result<Placement, BonsaiErrors>
 where
@@ -425,8 +386,7 @@ where
         scored: 0,
     };
 
-    let starts = spread[..1].iter().chain(extra).chain(&spread[1..]).copied();
-    for start in starts {
+    for start in spread {
         if visited[start as usize] {
             continue;
         }

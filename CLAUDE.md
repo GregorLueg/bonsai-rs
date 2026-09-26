@@ -42,7 +42,6 @@ src/
   errors.rs       # single BonsaiErrors enum, sectioned by subsystem
   bonsai.rs       # the pipeline: ingest, steps 1 to 8
   ingest.rs       # scale transform, feature selection, Sanity handover (SPEC 3)
-  backbone.rs     # subset, place, refine (SPEC 15)
   model/          # likelihood, branch, merge, place, global
   search/         # star, polytomy, spr, nni, candidates, bounds
   tree/           # arena, linkage, newick, layout, distance, cluster, simulate

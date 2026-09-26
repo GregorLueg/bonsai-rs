@@ -118,7 +118,7 @@ scan.
 Every threshold is a named `const` citing an SI equation or our measurement.
 Nothing comes from the published source (see [provenance](../PROVENANCE.md)). Ours: neighbour
 count `k`, kNN rebuild cadence, placement tolerance, ellipsoid `nsteps`
-schedule, backbone size, SPR revisit radius, NNI rescore radius.
+schedule, SPR revisit radius, NNI rescore radius.
 
 `SprSearch` and `NniSearch` follow `StartTree`: `Exact` is SPEC 9.3 and 9.4,
 `Approximate` is the default with our shortcuts, each measured across shapes and

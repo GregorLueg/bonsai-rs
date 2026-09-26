@@ -1,4 +1,4 @@
-"""Reconstruction: Sanity, the S5 conversion, Bonsai and backbone mode."""
+"""Reconstruction: Sanity, the S5 conversion and Bonsai."""
 
 from typing import Any, Literal
 
@@ -263,48 +263,5 @@ def bonsai_from_counts(
             min_signal_to_noise,
             max_amplification,
             reroot,
-        )
-    )
-
-
-@beartype
-def backbone(
-    means: np.ndarray,
-    sds: np.ndarray,
-    *,
-    variances: np.ndarray | None = None,
-    backbone_cells: int | None = None,
-    seed: int = 0,
-    start: Start = "linkage",
-    search: Search = "approximate",
-    min_signal_to_noise: float | None = None,
-    reroot: bool = True,
-) -> BonsaiResult:
-    """Backbone mode for datasets too large to search directly.
-
-    Reconstructs on a random subset, places every other cell onto it one at a
-    time, then refines the whole tree. This is the paper's route to large
-    datasets.
-
-    Args:
-        means: As `bonsai`.
-        sds: As `bonsai`.
-        variances: As `bonsai`.
-        backbone_cells: Cells in the initial backbone. ``None`` for the default
-            of 2048.
-        seed: Seed for choosing the backbone subset.
-        start: As `bonsai`, for the backbone.
-        search: As `bonsai`.
-        min_signal_to_noise: As `bonsai`.
-        reroot: As `bonsai`.
-
-    Returns:
-        As `bonsai`.
-    """
-    m, s = check_pair(means, sds)
-    v = _variances(variances, m.shape[1])
-    return _result(
-        _core.backbone(
-            m, s, v, start, search, min_signal_to_noise, reroot, backbone_cells, seed
         )
     )

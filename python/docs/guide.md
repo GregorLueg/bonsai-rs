@@ -61,8 +61,6 @@ first call to cap it; after that it's fixed.
 The largest run measured is 10,000 cells by 2,767 genes of Sanity-preprocessed
 Baron pancreas in 210 seconds; see the [comparison](https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md).
 
-Beyond that, `backbone` reconstructs on a random subset (`backbone_cells`,
-default 2048), places every other cell onto it and refines the whole tree.
 
 ## The start tree
 

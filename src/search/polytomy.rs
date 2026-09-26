@@ -39,7 +39,6 @@ use crate::search::spr::{LazyRows, RowStore, lazy_centre_star};
 use crate::search::star::{Star, StarParams, StarResult, resolve_star};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::traits::BonsaiFloat;
-use rayon::prelude::*;
 
 ////////////////
 // Parameters //
@@ -486,89 +485,6 @@ fn apply_splice<T: BonsaiFloat>(
             }
         }
     }
-}
-
-/// Resolve the polytomies at a given set of centres in one pass.
-///
-/// One settle of the tree, then every centre's star is resolved against it in
-/// parallel and all the splices are written into one parent array and rebuilt
-/// once. That is an approximation [`resolve_polytomies`] refuses to make: a
-/// splice moves the up rows the later centres were resolved against. It is
-/// meant for backbone growth, whose output the full refinement then scores
-/// exactly.
-///
-/// Two centres where one is the other's parent would both rewrite the lower
-/// one's parent pointer, so the lower one is skipped and reported back; the
-/// caller can pass the skipped centres again.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `leaves` - The leaf data the tree is scored against
-/// * `centres` - Internal nodes to resolve; leaves, non-polytomies and
-///   duplicates are ignored
-/// * `params` - Star primitive knobs, or `None` for the defaults
-///
-/// ### Returns
-///
-/// The tree with the centres resolved, the summed claimed gain, and the number
-/// of centres skipped because their parent was also a centre.
-pub(crate) fn resolve_centres<T: BonsaiFloat>(
-    tree: &Tree,
-    leaves: Leaves<'_, T>,
-    centres: &[u32],
-    params: Option<StarParams>,
-) -> Result<(Tree, f64, usize), BonsaiErrors> {
-    let n_leaves = tree.n_leaves();
-    let mut chosen = vec![false; tree.n_nodes()];
-    for &c in centres {
-        if (c as usize) >= n_leaves && is_polytomy(tree, c) {
-            chosen[c as usize] = true;
-        }
-    }
-    let mut todo: Vec<u32> = Vec::new();
-    let mut skipped = 0usize;
-    for c in 0..tree.n_nodes() as u32 {
-        if !chosen[c as usize] {
-            continue;
-        }
-        if tree.parent(c).is_some_and(|up| chosen[up as usize]) {
-            skipped += 1;
-        } else {
-            todo.push(c);
-        }
-    }
-    if todo.is_empty() {
-        return Ok((tree.clone(), 0.0, skipped));
-    }
-
-    let (down, up, _) = crate::search::settle(tree, leaves)?;
-    let resolved: Vec<(CentreStar<T>, StarResult<T>)> = todo
-        .par_iter()
-        .map(|&c| {
-            let star = centre_star(tree, &down, &up, c)?;
-            let result = resolve_star(star.view(), params)?;
-            Ok((star, result))
-        })
-        .collect::<Result<_, BonsaiErrors>>()?;
-
-    let mut parent: Vec<u32> = (0..tree.n_nodes())
-        .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
-        .collect();
-    let mut branch = tree.branches().to_vec();
-    let mut gain = 0.0f64;
-    for (star, result) in &resolved {
-        if result.merges.is_empty() {
-            continue;
-        }
-        gain += result.merges.iter().map(|x| x.gain).sum::<f64>();
-        apply_splice(&mut parent, &mut branch, star, result);
-    }
-    Ok((
-        rebuild(&parent, &branch, tree.root(), n_leaves)?,
-        gain,
-        skipped,
-    ))
 }
 
 /// Renumber an arbitrary parent array into the arena invariant and build it.

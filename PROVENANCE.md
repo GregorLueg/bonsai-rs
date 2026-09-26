@@ -119,8 +119,7 @@ Material.
 3. No carried-over tuned constants. Every threshold is a named `const` whose doc
    comment gives its source: an SI equation, or our measurement in
    [performance](docs/PERFORMANCE.md). Ours to determine: neighbour count `k`, kNN rebuild
-   cadence, placement-search tolerance, ellipsoid `n_steps` schedule, default
-   backbone size.
+   cadence, placement-search tolerance, ellipsoid `n_steps` schedule.
 4. Output-level parity testing is fine (black-box, Art. 5(3)). Reference trees
    are generated on demand, never committed, never on commercial hardware; the
    constraint there is NonCommercial, not copyright.

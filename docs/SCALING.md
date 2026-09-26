@@ -123,6 +123,10 @@ quality risk we'd have to measure, on top of the speed.
 is a legitimate way to *produce the start tree* for the scheme below. They're not
 competitors; they answer different questions.
 
+Measured since this was written: an implementation of it lost to the full
+search on every dataset and seed up to 25k cells, and was removed in 0.2.0; SPEC
+section 15 has the numbers.
+
 ## 3. The property everything rests on
 
 A subtree collapses to one effective leaf `(M, W)` per feature, exactly (SPEC

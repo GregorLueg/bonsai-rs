@@ -10,7 +10,6 @@ Counts to posteriors, posteriors to likelihood parameters, and the search.
         - sanity
         - from_sanity
         - bonsai
-        - backbone
 
 ::: bonsai_rs.BonsaiError
 

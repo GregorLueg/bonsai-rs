@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0
+
+**Breaking**
+
+- Backbone mode removed: `backbone`, `grow`, `BackboneParams`,
+  `BackboneReport`, and `model::place::place_from`. With the Ward linkage start
+  it saved about 3 per cent of a run and kept the whole-tree refinement that is
+  the rest; measured on Baron 5k, 10k and 25k and two synthetic sets it was below
+  the full search's loglikelihood on every dataset and seed and slower up to 25k.
+  SPEC section 15 has the numbers.
+
+**Search**
+
+- NNI keeps its rows across moves instead of settling the tree every round:
+  identical trees, step 6 from 295 s to 18 s at 25k cells.
+- Polytomy resolution (steps 3 and 8) does the same across sweeps: identical
+  trees, step 3 from 69 s to 3.5 s at 25k.
+- SPR decides that a proposal changes no split from the resolution star before
+  splicing it: identical trees, step 5 down 8 per cent at 25k.
+- Full search at 25k cells, 1,009 s to 522 s, same tree.
+
 ## 0.1.0
 
 First release. Clean-room, built from the paper and its CC-BY-4.0

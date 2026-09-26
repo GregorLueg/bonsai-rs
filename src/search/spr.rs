@@ -5,7 +5,7 @@
 //! this module is mostly the plumbing between them: the subtree is summarised
 //! as an effective leaf by the pruning recursion of SPEC.md section 4, its new
 //! home is found by the beam search of [`place`] (SPEC.md section 7.2), and the
-//! polytomy the attachment creates is resolved by [`splice_star`] (SPEC.md
+//! polytomy the attachment creates is resolved by [`crate::search::polytomy::splice_star`] (SPEC.md
 //! sections 7.3 and 9.2).
 //!
 //! ### Detaching leaves a degree-two node behind
@@ -1762,7 +1762,7 @@ fn fast_no_move<T: BonsaiFloat>(
     };
     let found = {
         let rows = PrunedRows::new(&view, down, cache);
-        let best = place_walk(&view, q, |v| rows.eff_leaf(v), &[], Some(params.placement))?;
+        let best = place_walk(&view, q, |v| rows.eff_leaf(v), Some(params.placement))?;
         let attached = attach(
             &rows,
             best.node,

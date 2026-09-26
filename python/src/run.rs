@@ -1,13 +1,12 @@
 //! The reconstruction entry points: Sanity, the S5 conversion, Bonsai, the
-//! chain from counts, backbone mode and the simulator.
+//! chain from counts and the simulator.
 //!
 //! Every numeric entry point dispatches on the input's element type and runs
 //! generic over it, so `float32` in means `float32` storage all the way down.
 //! Reductions are `f64` either way; that is the core's policy, not ours.
 
-use bonsai_rs::backbone::{BackboneParams, backbone as backbone_run};
 use bonsai_rs::bonsai::{BonsaiParams, StartTree, bonsai as bonsai_run};
-use bonsai_rs::ingest::{IngestParams, from_sanity as s5, from_sanity_output, prepare};
+use bonsai_rs::ingest::{IngestParams, from_sanity as s5, from_sanity_output};
 use bonsai_rs::search::nni::{NniParams, NniSearch};
 use bonsai_rs::search::spr::{SprParams, SprSearch};
 use bonsai_rs::tree::simulate::{
@@ -478,73 +477,6 @@ fn chain<'py, T: Float>(
     // `res.features` indexes the S5 survivors; map back to the count matrix.
     let features = res.features.iter().map(|&k| genes[k]).collect();
     result_out(py, res, features, dropped)
-}
-
-/// Backbone mode (SPEC 15): build on a subset, place the rest, refine.
-///
-/// ### Params
-///
-/// * `means`, `sds`, `variances`, `start`, `search`, `min_snr`, `reroot` - As
-///   [`bonsai`]
-/// * `backbone_cells` - Cells in the backbone, `None` for the default
-/// * `seed` - Seed for choosing the backbone
-///
-/// ### Returns
-///
-/// As [`bonsai`].
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-pub fn backbone<'py>(
-    py: Python<'py>,
-    means: &Bound<'py, PyAny>,
-    sds: &Bound<'py, PyAny>,
-    variances: Option<PyReadonlyArray1<'py, f64>>,
-    start: &str,
-    search: &str,
-    min_snr: Option<f64>,
-    reroot: bool,
-    backbone_cells: Option<usize>,
-    seed: u64,
-) -> PyResult<Bound<'py, PyDict>> {
-    let v = variances.as_ref().map(slice).transpose()?;
-    let mut bb = BackboneParams {
-        bonsai: params(start, search, min_snr, None, reroot)?,
-        seed,
-        ..BackboneParams::default()
-    };
-    if let Some(c) = backbone_cells {
-        bb.backbone_cells = c;
-    }
-    match pair(means, sds)? {
-        Pair::F32(m, s) => backbone_out(py, &m, &s, v, bb),
-        Pair::F64(m, s) => backbone_out(py, &m, &s, v, bb),
-    }
-}
-
-/// [`backbone`] at one float type.
-///
-/// ### Params
-///
-/// As [`backbone`], typed and resolved.
-///
-/// ### Returns
-///
-/// As [`backbone`].
-fn backbone_out<'py, T: Float>(
-    py: Python<'py>,
-    m: &PyReadonlyArray2<'py, T>,
-    s: &PyReadonlyArray2<'py, T>,
-    v: Option<&[f64]>,
-    bb: BackboneParams,
-) -> PyResult<Bound<'py, PyDict>> {
-    let (mean, n, p) = flat(m)?;
-    let (sd, _, _) = flat(s)?;
-    let (res, _) = py.detach(|| -> Result<_, BErr> {
-        let data = prepare(mean, sd, n, p, v, Some(bb.bonsai.ingest))?;
-        Ok(backbone_run(&data, Some(bb))?)
-    })?;
-    let features = res.features.clone();
-    result_out(py, res, features, Vec::new())
 }
 
 //////////////

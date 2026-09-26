@@ -109,8 +109,3 @@ def test_rejects_an_unknown_start(sim):
 def test_an_impossible_threshold_is_a_bonsai_error(sim):
     with pytest.raises(bs.BonsaiError):
         bs.bonsai(sim.means, sim.sds, min_signal_to_noise=1e12)
-
-
-def test_backbone(sim):
-    res = bs.backbone(sim.means, sim.sds, backbone_cells=32)
-    assert bs.robinson_foulds(res.tree, sim.tree) <= 10

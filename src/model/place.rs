@@ -350,23 +350,81 @@ pub fn place_from<'a, T: BonsaiFloat, F>(
 where
     F: Fn(u32) -> EffLeaf<'a, T>,
 {
+    place_walk(tree, q, eff, extra, params)
+}
+
+/// What the beam search needs from the tree it walks.
+///
+/// A [`Tree`] is one. The other is a tree that exists only as a view, the one
+/// an SPR cut would leave behind, walked in the original tree's node ids
+/// without being built; see [`crate::search::masked`]. Both have to present
+/// the same start points and the same neighbour order, since the search's
+/// answer depends on both.
+pub(crate) trait Walk {
+    /// Size of the node id space, for the visited set.
+    fn id_space(&self) -> usize;
+    /// The spread start points, root first; [`start_points`] for a tree.
+    fn spread_starts(&self, n_starts: usize) -> Vec<u32>;
+    /// A node's children in arena order, then its parent.
+    fn neighbours(&self, node: u32, out: &mut Vec<u32>);
+}
+
+impl Walk for Tree {
+    fn id_space(&self) -> usize {
+        self.n_nodes()
+    }
+
+    fn spread_starts(&self, n_starts: usize) -> Vec<u32> {
+        start_points(self, n_starts)
+    }
+
+    fn neighbours(&self, node: u32, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend(neighbours(self, node));
+    }
+}
+
+/// [`place_from`] over anything the search can walk.
+///
+/// ### Params
+///
+/// * `walk` - The tree, or a view of one
+/// * `q` - Effective leaf summarising the node being attached
+/// * `eff` - Effective leaf of the whole tree seen from each node
+/// * `extra` - Additional start points, searched after the root
+/// * `params` - Search parameters, or `None` for [`PlacementParams::default`]
+///
+/// ### Returns
+///
+/// As [`place`], with the node in the walk's own ids.
+pub(crate) fn place_walk<'a, T: BonsaiFloat, F, W: Walk>(
+    walk: &W,
+    q: EffLeaf<'_, T>,
+    eff: F,
+    extra: &[u32],
+    params: Option<PlacementParams>,
+) -> Result<Placement, BonsaiErrors>
+where
+    F: Fn(u32) -> EffLeaf<'a, T>,
+{
     let params = params.unwrap_or_default();
     let p = q.m.len();
     let mut s = vec![0.0f64; p];
     let mut d = vec![0.0f64; p];
 
-    let mut visited = vec![false; tree.n_nodes()];
+    let mut visited = vec![false; walk.id_space()];
     let mut stack: Vec<u32> = Vec::new();
+    let mut around: Vec<u32> = Vec::new();
+    let spread = walk.spread_starts(params.n_starts);
     // The root is always the first start point and is therefore always scored,
     // so this placeholder is always overwritten before it is returned.
     let mut best = Placement {
-        node: tree.root(),
+        node: spread[0],
         branch: 0.0,
         loglik: f64::NEG_INFINITY,
         scored: 0,
     };
 
-    let spread = start_points(tree, params.n_starts);
     let starts = spread[..1].iter().chain(extra).chain(&spread[1..]).copied();
     for start in starts {
         if visited[start as usize] {
@@ -383,7 +441,8 @@ where
         stack.push(start);
 
         while let Some(a) = stack.pop() {
-            for nb in neighbours(tree, a) {
+            walk.neighbours(a, &mut around);
+            for &nb in &around {
                 if visited[nb as usize] {
                     continue;
                 }

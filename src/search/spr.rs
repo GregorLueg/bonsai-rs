@@ -88,12 +88,17 @@ use crate::errors::BonsaiErrors;
 use crate::model::global::{LOGLIK_SCALE_FLOOR, up_part};
 use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
-use crate::model::place::{PlacementParams, place};
+use crate::model::place::{PlacementParams, place, place_walk};
+#[cfg(debug_assertions)]
+use crate::search::masked::Attached;
+use crate::search::masked::{Pruned as PrunedView, PrunedRows, ViewCache, attach};
 use crate::search::polytomy::{CentreStar, splice_result};
+#[cfg(any(test, debug_assertions))]
+use crate::search::split_fingerprint_with;
 use crate::search::star::{StarParams, StarResult, resolve_star};
 use crate::search::{
     Leaves, leaf_words, leaves_below, mark_near_new_clades, settled_down,
-    split_fingerprint_counted, split_fingerprint_with, split_hash, tree_loglik,
+    split_fingerprint_counted, split_hash, tree_loglik,
 };
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
@@ -102,7 +107,7 @@ use crate::utils::simd::prune_binary;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 ////////////////
 // Parameters //
@@ -734,7 +739,7 @@ impl<T: BonsaiFloat> RowStore<T> {
     ///
     /// The feature count.
     #[inline]
-    fn n_features(&self) -> usize {
+    pub(crate) fn n_features(&self) -> usize {
         self.p
     }
 
@@ -748,7 +753,7 @@ impl<T: BonsaiFloat> RowStore<T> {
     ///
     /// Its row.
     #[inline]
-    fn means(&self, node: u32) -> &[T] {
+    pub(crate) fn means(&self, node: u32) -> &[T] {
         let lo = self.slot[node as usize] as usize * self.p;
         &self.m[lo..lo + self.p]
     }
@@ -763,7 +768,7 @@ impl<T: BonsaiFloat> RowStore<T> {
     ///
     /// Its row.
     #[inline]
-    fn precisions(&self, node: u32) -> &[T] {
+    pub(crate) fn precisions(&self, node: u32) -> &[T] {
         let lo = self.slot[node as usize] as usize * self.p;
         &self.w[lo..lo + self.p]
     }
@@ -1139,55 +1144,26 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     ///
     /// The node's up row.
     fn compute_up(&self, node: u32) -> Row<T> {
-        let p = self.p;
         let Some(a) = self.tree.parent(node) else {
-            // The root has nothing outside it.
-            return (
-                vec![T::zero(); p].into_boxed_slice(),
-                vec![T::zero(); p].into_boxed_slice(),
-            );
+            return root_up(self.p);
         };
-        let mut m_out = vec![T::zero(); p];
-        let mut w_out = vec![T::zero(); p];
-
-        let is_root = self.tree.parent(a).is_none();
-        let t_a = self.tree.branch(a);
         let above = self.up_row(a);
-        let (up_m, up_w) = (&above.0, &above.1);
         let kids = self.tree.children(a);
-        let t_c = self.tree.branch(node);
-        let (m_c, w_c) = self.down_row(node);
-
-        if kids.len() == 2 {
+        let side = if kids.len() == 2 {
             let other = if kids[0] == node { kids[1] } else { kids[0] };
-            let t_o = self.tree.branch(other);
             let (m_o, w_o) = self.down_row(other);
-            for g in 0..p {
-                let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
-                let wo = wide(w_o[g]);
-                let wdo = wo / (1.0 + t_o * wo);
-                let mo = wide(m_o[g]);
-                let tot = wdo + w_up;
-                w_out[g] = narrow(tot);
-                m_out[g] = narrow(mo + (m_up - mo) * (w_up / tot));
-            }
-            return (m_out.into_boxed_slice(), w_out.into_boxed_slice());
-        }
-
-        let (m_a, w_a) = self.down_row(a);
-        for g in 0..p {
-            let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
-            let ma = wide(m_a[g]);
-            let tot = wide(w_a[g]) + w_up;
-            let m_tot = ma + (m_up - ma) * (w_up / tot);
-            let wc = wide(w_c[g]);
-            let wdc = wc / (1.0 + t_c * wc);
-            let rest = tot - wdc;
-            let mc = wide(m_c[g]);
-            w_out[g] = narrow(rest);
-            m_out[g] = narrow(m_tot + (m_tot - mc) * (wdc / rest));
-        }
-        (m_out.into_boxed_slice(), w_out.into_boxed_slice())
+            UpSide::Sibling(self.tree.branch(other), m_o, w_o)
+        } else {
+            let (m_a, w_a) = self.down_row(a);
+            let (m_c, w_c) = self.down_row(node);
+            UpSide::Parent(m_a, w_a, self.tree.branch(node), m_c, w_c)
+        };
+        up_step(
+            self.tree.parent(a).is_none(),
+            self.tree.branch(a),
+            (&above.0, &above.1),
+            side,
+        )
     }
 
     /// The whole tree collapsed onto one node.
@@ -1210,28 +1186,13 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     /// The effective leaf the beam search scores an attachment against.
     fn eff_leaf(&self, node: u32) -> EffLeaf<'_, T> {
         let rows = self.eff[node as usize].get_or_init(|| {
-            let p = self.p;
-            let is_root = self.tree.parent(node).is_none();
-            let t = self.tree.branch(node);
-            let (m_down, w_down) = self.down_row(node);
             let above = self.up_row(node);
-            let (m_up, w_up) = (&above.0, &above.1);
-            let mut m = vec![T::zero(); p];
-            let mut w = vec![T::zero(); p];
-            for g in 0..p {
-                let w_above = if is_root {
-                    0.0
-                } else {
-                    let wu = wide(w_up[g]);
-                    wu / (1.0 + t * wu)
-                };
-                let below = wide(w_down[g]);
-                let total = below + w_above;
-                let md = wide(m_down[g]);
-                m[g] = narrow(md + (wide(m_up[g]) - md) * (w_above / total));
-                w[g] = narrow(total);
-            }
-            (m.into_boxed_slice(), w.into_boxed_slice())
+            eff_step(
+                self.tree.parent(node).is_none(),
+                self.tree.branch(node),
+                self.down_row(node),
+                (&above.0, &above.1),
+            )
         });
         EffLeaf {
             m: &rows.0,
@@ -1317,6 +1278,129 @@ pub(crate) fn lazy_centre_star<T: BonsaiFloat>(
 /// ### Returns
 ///
 /// Its effective means and precisions.
+/// The up row of a root: nothing outside it.
+///
+/// ### Params
+///
+/// * `p` - Number of features
+///
+/// ### Returns
+///
+/// Zero means and precisions.
+pub(crate) fn root_up<T: BonsaiFloat>(p: usize) -> Row<T> {
+    (
+        vec![T::zero(); p].into_boxed_slice(),
+        vec![T::zero(); p].into_boxed_slice(),
+    )
+}
+
+/// What [`up_step`] reads besides the parent's own up row.
+pub(crate) enum UpSide<'r, T> {
+    /// The parent is binary: the other child's branch and down row.
+    Sibling(f64, &'r [T], &'r [T]),
+    /// Anything else: the parent's down row, then the node's branch and down
+    /// row, which is peeled back off the parent's total.
+    Parent(&'r [T], &'r [T], f64, &'r [T], &'r [T]),
+}
+
+/// One node's up row from its parent's.
+///
+/// A transcription of [`crate::model::global::UpState::sweep`]'s per-node
+/// step, shared by [`LazyRows`] and the masked views of
+/// [`crate::search::masked`], so that both are the same bits as the sweep.
+///
+/// ### Params
+///
+/// * `parent_is_root` - Whether the node's parent is the root
+/// * `t_a` - Branch above the parent
+/// * `up_a` - The parent's up row
+/// * `side` - The rest of what the step reads; see [`UpSide`]
+///
+/// ### Returns
+///
+/// The node's up row.
+pub(crate) fn up_step<T: BonsaiFloat>(
+    parent_is_root: bool,
+    t_a: f64,
+    up_a: (&[T], &[T]),
+    side: UpSide<'_, T>,
+) -> Row<T> {
+    let (up_m, up_w) = up_a;
+    let p = up_m.len();
+    let is_root = parent_is_root;
+    let mut m_out = vec![T::zero(); p];
+    let mut w_out = vec![T::zero(); p];
+    match side {
+        UpSide::Sibling(t_o, m_o, w_o) => {
+            for g in 0..p {
+                let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
+                let wo = wide(w_o[g]);
+                let wdo = wo / (1.0 + t_o * wo);
+                let mo = wide(m_o[g]);
+                let tot = wdo + w_up;
+                w_out[g] = narrow(tot);
+                m_out[g] = narrow(mo + (m_up - mo) * (w_up / tot));
+            }
+        }
+        UpSide::Parent(m_a, w_a, t_c, m_c, w_c) => {
+            for g in 0..p {
+                let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
+                let ma = wide(m_a[g]);
+                let tot = wide(w_a[g]) + w_up;
+                let m_tot = ma + (m_up - ma) * (w_up / tot);
+                let wc = wide(w_c[g]);
+                let wdc = wc / (1.0 + t_c * wc);
+                let rest = tot - wdc;
+                let mc = wide(m_c[g]);
+                w_out[g] = narrow(rest);
+                m_out[g] = narrow(m_tot + (m_tot - mc) * (wdc / rest));
+            }
+        }
+    }
+    (m_out.into_boxed_slice(), w_out.into_boxed_slice())
+}
+
+/// The whole tree collapsed onto one node, from its down and up rows.
+///
+/// Shared by [`LazyRows::eff_leaf`] and the masked views; see there.
+///
+/// ### Params
+///
+/// * `is_root` - Whether the node is the root
+/// * `t` - Branch above the node
+/// * `down` - Its down row
+/// * `up` - Its up row
+///
+/// ### Returns
+///
+/// The effective leaf's means and precisions.
+pub(crate) fn eff_step<T: BonsaiFloat>(
+    is_root: bool,
+    t: f64,
+    down: (&[T], &[T]),
+    up: (&[T], &[T]),
+) -> Row<T> {
+    let (m_down, w_down) = down;
+    let (m_up, w_up) = up;
+    let p = m_down.len();
+    let mut m = vec![T::zero(); p];
+    let mut w = vec![T::zero(); p];
+    for g in 0..p {
+        let w_above = if is_root {
+            0.0
+        } else {
+            let wu = wide(w_up[g]);
+            wu / (1.0 + t * wu)
+        };
+        let below = wide(w_down[g]);
+        let total = below + w_above;
+        let md = wide(m_down[g]);
+        m[g] = narrow(md + (wide(m_up[g]) - md) * (w_above / total));
+        w[g] = narrow(total);
+    }
+    (m.into_boxed_slice(), w.into_boxed_slice())
+}
+
 fn read_down<'r, T: BonsaiFloat>(rows: &'r LazyRows<'_, T>, node: u32) -> (&'r [T], &'r [T]) {
     let old = rows.inherited[node as usize];
     if old != NO_NODE {
@@ -1514,11 +1598,29 @@ fn propose<T: BonsaiFloat>(
         let attached_rows = LazyRows::new(&attached, &to_old, tree, down)?;
         let star = lazy_centre_star(&attached, &attached_rows, centre)?;
         let result = resolve_star(star.view(), Some(params.star))?;
+        let n_leaves = attached.n_leaves();
+        let total = attached_word[attached.root() as usize];
+        let last = star.member_nodes.len() - 1;
+        let (member_word, member_count): (Vec<u64>, Vec<usize>) = star
+            .member_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &node)| {
+                if star.has_upstream && i == last {
+                    (
+                        total.wrapping_sub(attached_word[centre as usize]),
+                        n_leaves - attached_below[centre as usize],
+                    )
+                } else {
+                    (attached_word[node as usize], attached_below[node as usize])
+                }
+            })
+            .unzip();
         let print = attached_print.wrapping_add(resolution_splits(
-            &attached,
-            &attached_word,
-            &attached_below,
-            &star,
+            &member_word,
+            &member_count,
+            n_leaves,
+            total,
             &result,
         ));
         #[cfg(debug_assertions)]
@@ -1573,37 +1675,28 @@ fn propose<T: BonsaiFloat>(
 ///
 /// ### Params
 ///
-/// * `attached` - The tree the star was built from
-/// * `word` - Its [`leaf_words`]
-/// * `below` - Its [`leaves_below`]
-/// * `star` - The star at the attachment point
-/// * `result` - What the primitive built from it
+/// * `member_word` - Leaf word of each star member, upstream last
+/// * `member_count` - Leaf count of each, the same
+/// * `n_leaves` - Leaves in the tree
+/// * `total` - Leaf word of every leaf
+/// * `result` - What the primitive built from the star
 ///
 /// ### Returns
 ///
 /// The wrapping sum of [`split_hash`] over the added non-trivial splits.
 fn resolution_splits<T: BonsaiFloat>(
-    attached: &Tree,
-    word: &[u64],
-    below: &[usize],
-    star: &CentreStar<T>,
+    member_word: &[u64],
+    member_count: &[usize],
+    n_leaves: usize,
+    total: u64,
     result: &StarResult<T>,
 ) -> u64 {
     let n_members = result.n_members;
-    let n_leaves = attached.n_leaves();
-    let total = word[attached.root() as usize];
     let n_local = n_members + result.merges.len();
     let mut group = vec![0u64; n_local];
     let mut count = vec![0usize; n_local];
-    for (i, &node) in star.member_nodes.iter().enumerate() {
-        if star.has_upstream && i == n_members - 1 {
-            group[i] = total.wrapping_sub(word[star.centre as usize]);
-            count[i] = n_leaves - below[star.centre as usize];
-        } else {
-            group[i] = word[node as usize];
-            count[i] = below[node as usize];
-        }
-    }
+    group[..n_members].copy_from_slice(member_word);
+    count[..n_members].copy_from_slice(member_count);
     let mut print = 0u64;
     for (j, merge) in result.merges.iter().enumerate() {
         let a = n_members + j;
@@ -1616,6 +1709,175 @@ fn resolution_splits<T: BonsaiFloat>(
         }
     }
     print
+}
+
+/// What the current tree's fingerprint terms are built from, for the fast
+/// path.
+struct Prints<'a> {
+    /// Leaf words of the current tree.
+    word: &'a [u64],
+    /// Leaf counts of the current tree.
+    below: &'a [usize],
+    /// Its split fingerprint.
+    here: u64,
+}
+
+/// Whether pruning `x` and regrafting it where the beam search likes best
+/// changes no split, decided without building either tree.
+///
+/// The pruned and the regrafted trees are views of the current one
+/// ([`crate::search::masked`]), so a proposal that puts the subtree back where
+/// it came from costs its beam search and two `O(depth p)` paths instead of
+/// two arena assemblies and their row maps. A proposal that does move
+/// something is left to [`propose`], which builds and scores it as before.
+///
+/// ### Params
+///
+/// * `tree` - The current tree
+/// * `down` - Its rows
+/// * `x` - Node to prune
+/// * `params` - Knobs
+/// * `prints` - The current tree's words, counts and fingerprint
+/// * `cache` - Up-row cells for the pruned view, returned emptied
+///
+/// ### Returns
+///
+/// `Some(true)` for a proposal that changes no split, `Some(false)` for one
+/// that does, `None` where the views decline and the built path has to
+/// decide; or the error the placement or the primitive failed with.
+fn fast_no_move<T: BonsaiFloat>(
+    tree: &Tree,
+    down: &RowStore<T>,
+    x: u32,
+    params: &SprParams,
+    prints: &Prints<'_>,
+    cache: &mut ViewCache<T>,
+) -> Result<Option<bool>, BonsaiErrors> {
+    let Some(view) = PrunedView::new(tree, x) else {
+        return Ok(None);
+    };
+    let q = EffLeaf {
+        m: down.means(x),
+        w: down.precisions(x),
+    };
+    let found = {
+        let rows = PrunedRows::new(&view, down, cache);
+        let best = place_walk(&view, q, |v| rows.eff_leaf(v), &[], Some(params.placement))?;
+        let attached = attach(
+            &rows,
+            best.node,
+            best.branch,
+            prints.word,
+            prints.below,
+            prints.here,
+        );
+        (best, attached)
+    };
+    cache.reset();
+    let (best, Some(attached)) = found else {
+        return Ok(None);
+    };
+    #[cfg(debug_assertions)]
+    check_against_built(tree, down, x, params, &best, &attached)?;
+    let _ = best;
+    let print =
+        if attached.star.member_nodes.len() <= crate::search::polytomy::RESOLVED_STAR_MEMBERS {
+            attached.print
+        } else {
+            let result = resolve_star(attached.star.view(), Some(params.star))?;
+            attached.print.wrapping_add(resolution_splits(
+                &attached.member_word,
+                &attached.member_count,
+                tree.n_leaves(),
+                prints.word[tree.root() as usize],
+                &result,
+            ))
+        };
+    Ok(Some(print == prints.here))
+}
+
+/// Debug builds: the views' placement, star and fingerprint against the built
+/// path's, bit for bit.
+///
+/// ### Params
+///
+/// * `tree` - The current tree
+/// * `down` - Its rows
+/// * `x` - The pruned node
+/// * `params` - Knobs
+/// * `best` - The placement the view found
+/// * `attached` - The star and fingerprint the view built
+///
+/// ### Returns
+///
+/// `Ok` if they agree; panics otherwise, which is the point.
+#[cfg(debug_assertions)]
+fn check_against_built<T: BonsaiFloat>(
+    tree: &Tree,
+    down: &RowStore<T>,
+    x: u32,
+    params: &SprParams,
+    best: &crate::model::place::Placement,
+    attached: &Attached<T>,
+) -> Result<(), BonsaiErrors> {
+    let pruned = prune_subtree(tree, x)?.expect("the view accepted the cut");
+    let rows = LazyRows::new(&pruned.tree, &pruned.to_old, tree, down)?;
+    let q = EffLeaf {
+        m: down.means(x),
+        w: down.precisions(x),
+    };
+    let built = place(
+        &pruned.tree,
+        q,
+        |node: u32| rows.eff_leaf(node),
+        Some(params.placement),
+    )?;
+    assert_eq!(
+        pruned.to_old[built.node as usize], best.node,
+        "placement node"
+    );
+    assert_eq!(
+        built.branch.to_bits(),
+        best.branch.to_bits(),
+        "placement branch"
+    );
+    assert_eq!(
+        built.loglik.to_bits(),
+        best.loglik.to_bits(),
+        "placement score"
+    );
+
+    let target = pruned.to_old[built.node as usize];
+    let (tree_a, centre, to_old) = regraft(&pruned, x, target, built.branch, tree.n_leaves())?;
+    let word = leaf_words(&tree_a);
+    let below = leaves_below(&tree_a);
+    assert_eq!(
+        split_fingerprint_counted(&tree_a, &word, &below),
+        attached.print,
+        "regrafted fingerprint"
+    );
+    let rows_a = LazyRows::new(&tree_a, &to_old, tree, down)?;
+    let star = lazy_centre_star(&tree_a, &rows_a, centre)?;
+    assert_eq!(star.branch, attached.star.branch, "star branches");
+    assert_eq!(
+        star.has_upstream, attached.star.has_upstream,
+        "star upstream"
+    );
+    assert!(
+        star.means
+            .iter()
+            .zip(&attached.star.means)
+            .all(|(a, b)| a.to_f64().map(f64::to_bits) == b.to_f64().map(f64::to_bits)),
+        "star means"
+    );
+    assert!(
+        star.precisions
+            .iter()
+            .zip(&attached.star.precisions)
+            .all(|(a, b)| a.to_f64().map(f64::to_bits) == b.to_f64().map(f64::to_bits)),
+        "star precisions"
+    );
+    Ok(())
 }
 
 ////////////
@@ -1735,8 +1997,16 @@ fn sweep<T: BonsaiFloat>(
     let mut down = RowStore::from_state(&settled, tree.n_nodes());
     drop(settled);
     let mut word = leaf_words(&tree);
-    let mut here = split_fingerprint_with(&tree, &word);
+    let mut below = leaves_below(&tree);
+    let mut here = split_fingerprint_counted(&tree, &word, &below);
     let mut by_word = word_index(&word);
+    // One up-row cache per worker, reused across proposals. Taken with
+    // `try_lock`: the star primitive runs rayon work, so a worker can pick up
+    // another proposal while it holds its own, and that one then falls back to
+    // the built path rather than wait.
+    let caches: Vec<Mutex<ViewCache<T>>> = (0..rayon::current_num_threads() + 1)
+        .map(|_| Mutex::new(ViewCache::new(tree.n_nodes() + 1)))
+        .collect();
 
     let mut order = candidate_order(&tree, &params, &mut rng);
     if let Some(look) = look {
@@ -1747,11 +2017,41 @@ fn sweep<T: BonsaiFloat>(
     let mut chunk = PROPOSAL_CHUNK_MIN;
     while next < order.len() {
         let end = (next + chunk).min(order.len());
+        let prints = Prints {
+            word: &word,
+            below: &below,
+            here,
+        };
         let proposals: Vec<Option<Proposal>> = order[next..end]
             .par_iter()
-            .map(|want| match by_word.get(want) {
-                Some(&x) => propose(&tree, &down, x, &params, here, &by_word),
-                None => Ok(None),
+            .map(|want| -> Result<Option<Proposal>, BonsaiErrors> {
+                let Some(&x) = by_word.get(want) else {
+                    return Ok(None);
+                };
+                let slot = rayon::current_thread_index().unwrap_or(caches.len() - 1);
+                let fast = match caches[slot.min(caches.len() - 1)].try_lock() {
+                    Ok(mut cache) => {
+                        if cache.len() < tree.n_nodes() + 1 {
+                            *cache = ViewCache::new(tree.n_nodes() + 1);
+                        }
+                        fast_no_move(&tree, &down, x, &params, &prints, &mut cache)?
+                    }
+                    Err(_) => None,
+                };
+                if fast == Some(true) {
+                    #[cfg(debug_assertions)]
+                    assert!(
+                        propose(&tree, &down, x, &params, here, &by_word)?.is_none(),
+                        "the views called a move no move"
+                    );
+                    return Ok(None);
+                }
+                let built = propose(&tree, &down, x, &params, here, &by_word)?;
+                debug_assert!(
+                    fast.is_none() || built.is_some(),
+                    "the views called no move a move"
+                );
+                Ok(built)
             })
             .collect::<Result<_, _>>()?;
 
@@ -1771,7 +2071,8 @@ fn sweep<T: BonsaiFloat>(
             down.accept(&proposal.tree, &proposal.to_old, &tree)?;
             tree = proposal.tree;
             word = leaf_words(&tree);
-            here = split_fingerprint_with(&tree, &word);
+            below = leaves_below(&tree);
+            here = split_fingerprint_counted(&tree, &word, &below);
             by_word = word_index(&word);
             if params.search.revisit_radius() > 0 {
                 mark_near_new_clades(

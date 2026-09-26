@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 
 pub mod bounds;
 pub mod candidates;
+pub(crate) mod masked;
 pub mod nni;
 pub mod polytomy;
 pub mod spr;
@@ -170,6 +171,7 @@ pub(crate) fn split_fingerprint(tree: &Tree) -> u64 {
 /// ### Returns
 ///
 /// The fingerprint.
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn split_fingerprint_with(tree: &Tree, word: &[u64]) -> u64 {
     split_fingerprint_counted(tree, word, &leaves_below(tree))
 }

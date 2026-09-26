@@ -1255,7 +1255,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
 ///
 /// The star, or `NodeOutOfRange` for an index outside the arena, or
 /// `MalformedTree` if the centre is a leaf.
-fn lazy_centre_star<T: BonsaiFloat>(
+pub(crate) fn lazy_centre_star<T: BonsaiFloat>(
     tree: &Tree,
     rows: &LazyRows<'_, T>,
     centre: u32,

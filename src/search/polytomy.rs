@@ -35,6 +35,7 @@ use crate::errors::BonsaiErrors;
 use crate::model::global::UpState;
 use crate::model::likelihood::NodeState;
 use crate::search::Leaves;
+use crate::search::spr::{LazyRows, RowStore, lazy_centre_star};
 use crate::search::star::{Star, StarParams, StarResult, resolve_star};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::traits::BonsaiFloat;
@@ -295,13 +296,54 @@ pub(crate) fn splice_star_mapped<T: BonsaiFloat>(
     params: Option<StarParams>,
 ) -> Result<(Tree, Vec<u32>), BonsaiErrors> {
     let result = resolve_star(star.view(), params)?;
+    splice_result_mapped(tree, star, &result)
+}
+
+/// [`splice_result`], plus the node map of [`splice_star_mapped`].
+///
+/// ### Params
+///
+/// * `tree` - The tree the star was built from
+/// * `star` - The star that was resolved
+/// * `result` - What the primitive built
+///
+/// ### Returns
+///
+/// The spliced tree and, per node of it, its node in `tree` or [`NO_NODE`].
+fn splice_result_mapped<T: BonsaiFloat>(
+    tree: &Tree,
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+) -> Result<(Tree, Vec<u32>), BonsaiErrors> {
     let mut parent: Vec<u32> = (0..tree.n_nodes())
         .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
         .collect();
     let mut branch = tree.branches().to_vec();
-    apply_splice(&mut parent, &mut branch, star, &result);
+    apply_splice(&mut parent, &mut branch, star, result);
     let out = rebuild(&parent, &branch, tree.root(), tree.n_leaves())?;
+    let to_old = map_back(&parent, &out, tree.n_nodes())?;
+    Ok((out, to_old))
+}
 
+/// Where every node of a rebuilt tree came from.
+///
+/// [`rebuild`] numbers the arena for itself, so the map is recovered by walking
+/// up from each leaf in the input parent array and in the rebuilt tree in step.
+/// Leaves keep their indices, and every internal node has a leaf below it, so
+/// each reachable node is paired exactly once.
+///
+/// ### Params
+///
+/// * `parent` - The parent array [`rebuild`] was given
+/// * `out` - The tree it built
+/// * `n_old` - Node count of the tree the array was edited from; input indices
+///   at or above it are nodes the edit created
+///
+/// ### Returns
+///
+/// Per node of `out`, its node in the original tree or [`NO_NODE`] for a
+/// created one, or `MalformedTree` if the two walks disagree.
+fn map_back(parent: &[u32], out: &Tree, n_old: usize) -> Result<Vec<u32>, BonsaiErrors> {
     let mut to_old = vec![NO_NODE; out.n_nodes()];
     for leaf in 0..out.n_leaves() as u32 {
         let (mut from, mut to) = (leaf, leaf);
@@ -312,18 +354,18 @@ pub(crate) fn splice_star_mapped<T: BonsaiFloat>(
                 (up, Some(next)) if up != NO_NODE => (from, to) = (up, next),
                 _ => {
                     return Err(BonsaiErrors::MalformedTree {
-                        reason: format!("splice map lost step at leaf {leaf}"),
+                        reason: format!("rebuild map lost step at leaf {leaf}"),
                     });
                 }
             }
         }
     }
     for old in &mut to_old {
-        if *old != NO_NODE && *old as usize >= tree.n_nodes() {
+        if *old != NO_NODE && *old as usize >= n_old {
             *old = NO_NODE;
         }
     }
-    Ok((out, to_old))
+    Ok(to_old)
 }
 
 /// Map a resolved star back onto tree node ids and rebuild the arena.
@@ -658,9 +700,10 @@ fn rebuild(
 ///
 /// ### Returns
 ///
-/// The collapsed tree, or `None` if there was no zero-length internal edge, or
-/// the error the arena rejected the rebuild with.
-fn collapse_zero_edges(tree: &Tree) -> Result<Option<Tree>, BonsaiErrors> {
+/// The collapsed tree and, per node of it, its node in `tree`; or `None` if
+/// there was no zero-length internal edge, or the error the arena rejected the
+/// rebuild with.
+fn collapse_zero_edges(tree: &Tree) -> Result<Option<(Tree, Vec<u32>)>, BonsaiErrors> {
     let n = tree.n_nodes();
     let n_leaves = tree.n_leaves();
     let root = tree.root();
@@ -694,7 +737,9 @@ fn collapse_zero_edges(tree: &Tree) -> Result<Option<Tree>, BonsaiErrors> {
         branch[i] = tree.branch(i as u32);
     }
 
-    rebuild(&parent, &branch, root, n_leaves).map(Some)
+    let out = rebuild(&parent, &branch, root, n_leaves)?;
+    let to_old = map_back(&parent, &out, n)?;
+    Ok(Some((out, to_old)))
 }
 
 /// Resolve every polytomy in a tree (SPEC.md section 9.2).
@@ -801,7 +846,7 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
         });
     }
     let mut tree = match collapse_zero_edges(tree)? {
-        Some(collapsed) => collapsed,
+        Some((collapsed, _)) => collapsed,
         None => tree.clone(),
     };
     let n_polytomies = count_polytomies(&tree);
@@ -809,17 +854,27 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
     let mut n_resolved = 0usize;
     let mut sweeps = 0usize;
 
+    // Settled once. A collapse or a splice then rewrites only the down rows it
+    // changed, and each sweep forms up rows only along the chains its stars
+    // read; both are the sweep's own bits, so every resolution is the one a
+    // settle per sweep would make, at `O(depth p)` a sweep instead of `O(n p)`.
+    let (down, _) = crate::search::settled_down(&tree, leaves)?;
+    let mut store = RowStore::from_state(&down, tree.n_nodes());
+    drop(down);
+
     loop {
         sweeps += 1;
         // A no-op on the first sweep, since the entry tree was collapsed above.
         // Later sweeps need it because a resolution can itself place an
         // ancestor at zero distance from its centre.
-        if let Some(collapsed) = collapse_zero_edges(&tree)? {
+        if let Some((collapsed, to_old)) = collapse_zero_edges(&tree)? {
+            store.accept(&collapsed, &to_old, &tree)?;
             tree = collapsed;
         }
-        let (down, up, _) = crate::search::settle(&tree, leaves)?;
+        let identity: Vec<u32> = (0..tree.n_nodes() as u32).collect();
+        let rows = LazyRows::new(&tree, &identity, &tree, &store)?;
 
-        let mut accepted: Option<Splice> = None;
+        let mut accepted: Option<(f64, Tree, Vec<u32>)> = None;
         for node in tree.internal_postorder() {
             // The degree test first, off the tree, and the star only for a node
             // that passes it. `CentreStar::is_polytomy` reads nothing the tree
@@ -829,27 +884,26 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
             if !is_polytomy(&tree, node) {
                 continue;
             }
-            let star = centre_star(&tree, &down, &up, node)?;
+            let star = lazy_centre_star(&tree, &rows, node)?;
             // Splicing builds a tree, which is `O(n)`; the primitive that
             // decides whether there is anything to splice is `O(deg^3 p)` over
             // a handful of members. So resolve first and splice only the
             // resolution that is kept.
             let result = resolve_star(star.view(), params)?;
             if !result.merges.is_empty() {
-                accepted = Some(Splice {
-                    gain: result.merges.iter().map(|x| x.gain).sum(),
-                    n_merges: result.merges.len(),
-                    tree: splice_result(&tree, &star, &result)?,
-                });
+                let (next, to_old) = splice_result_mapped(&tree, &star, &result)?;
+                accepted = Some((result.merges.iter().map(|x| x.gain).sum(), next, to_old));
                 break;
             }
         }
+        drop(rows);
         match accepted {
             None => break,
-            Some(spliced) => {
-                gain += spliced.gain;
+            Some((merged, next, to_old)) => {
+                store.accept(&next, &to_old, &tree)?;
+                gain += merged;
                 n_resolved += 1;
-                tree = spliced.tree;
+                tree = next;
             }
         }
         if sweeps >= MAX_SWEEPS {
@@ -1332,7 +1386,8 @@ mod tests {
 
         let collapsed = collapse_zero_edges(&tree)
             .expect("collapse")
-            .expect("the zero-length edge was not found");
+            .expect("the zero-length edge was not found")
+            .0;
         let after = loglik(&collapsed, leaves);
 
         assert_eq!(collapsed.n_nodes(), tree.n_nodes() - 1);

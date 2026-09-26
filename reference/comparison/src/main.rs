@@ -802,7 +802,12 @@ fn refine_steps(
     let p = leaves.n_features;
     // Step 3.
     let t0 = Instant::now();
-    tree = resolve_polytomies(&tree, leaves, Some(params.star))?.tree;
+    let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
+    println!(
+        "polytomy: {} polytomies, {} resolved, {} sweeps",
+        resolved.n_polytomies, resolved.n_resolved, resolved.sweeps
+    );
+    tree = resolved.tree;
     let secs = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
     let loglik = tree_loglik(&tree, leaves)?;
@@ -853,7 +858,12 @@ fn refine_steps(
     // steps 4 to 7 leave behind, then reoptimise. Step 3 is the only other
     // collapse and it runs before step 4, so nothing else removes these.
     let t0 = Instant::now();
-    tree = resolve_polytomies(&tree, leaves, Some(params.star))?.tree;
+    let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
+    println!(
+        "polytomy: {} polytomies, {} resolved, {} sweeps",
+        resolved.n_polytomies, resolved.n_resolved, resolved.sweeps
+    );
+    tree = resolved.tree;
     let mut state = NodeState::new(tree.n_nodes(), p, leaves.means, leaves.precisions)?;
     let loglik = optimise_branch_lengths(&mut tree, &mut state, Some(params.branch))?;
     record("8 collapse", t0.elapsed().as_secs_f64(), loglik, 0.0);

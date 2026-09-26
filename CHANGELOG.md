@@ -17,9 +17,10 @@
   identical trees, step 6 from 295 s to 18 s at 25k cells.
 - Polytomy resolution (steps 3 and 8) does the same across sweeps: identical
   trees, step 3 from 69 s to 3.5 s at 25k.
-- SPR decides that a proposal changes no split from the resolution star before
-  splicing it: identical trees, step 5 down 8 per cent at 25k.
-- Full search at 25k cells, 1,009 s to 522 s, same tree.
+- SPR decides whether a proposal changes any split on views of the pruned and
+  regrafted trees, without building either: identical trees, step 5 from 395 s
+  to 301 s at 25k.
+- Full search at 25k cells, 1,009 s to about 460 s, same tree.
 
 ## 0.1.0
 

@@ -619,9 +619,41 @@ struct Pruned {
 /// The remaining tree and the maps back, `None` if `x` may not be pruned, or
 /// the error the arena failed with.
 fn prune_subtree(tree: &Tree, x: u32) -> Result<Option<Pruned>, BonsaiErrors> {
-    let Some(par) = tree.parent(x).filter(|_| can_prune(tree, x)) else {
+    let Some((parent, branch, root)) = cut(tree, x) else {
         return Ok(None);
     };
+    let (remaining, to_new) = assemble(&parent, &branch, root, tree.n_leaves())?;
+    let mut to_old = vec![NO_NODE; remaining.n_nodes()];
+    for (old, &new) in to_new.iter().enumerate() {
+        if new != NO_NODE {
+            to_old[new as usize] = old as u32;
+        }
+    }
+    Ok(Some(Pruned {
+        tree: remaining,
+        to_old,
+        parent,
+        branch,
+        root,
+    }))
+}
+
+/// [`prune_subtree`]'s arrays without the arena: the parent and branch arrays
+/// of the remaining tree in the original index space, and its root.
+///
+/// All [`regraft`] reads. A proposal whose placement is already known skips
+/// the remaining tree's assembly entirely.
+///
+/// ### Params
+///
+/// * `tree` - The tree; not modified
+/// * `x` - Node to detach
+///
+/// ### Returns
+///
+/// The arrays and the root, `None` if `x` may not be pruned.
+fn cut(tree: &Tree, x: u32) -> Option<(Vec<u32>, Vec<f64>, u32)> {
+    let par = tree.parent(x).filter(|_| can_prune(tree, x))?;
     let n = tree.n_nodes();
     let mut parent: Vec<u32> = (0..n)
         .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
@@ -660,21 +692,7 @@ fn prune_subtree(tree: &Tree, x: u32) -> Result<Option<Pruned>, BonsaiErrors> {
         }
         _ => {}
     }
-
-    let (remaining, to_new) = assemble(&parent, &branch, root, tree.n_leaves())?;
-    let mut to_old = vec![NO_NODE; remaining.n_nodes()];
-    for (old, &new) in to_new.iter().enumerate() {
-        if new != NO_NODE {
-            to_old[new as usize] = old as u32;
-        }
-    }
-    Ok(Some(Pruned {
-        tree: remaining,
-        to_old,
-        parent,
-        branch,
-        root,
-    }))
+    Some((parent, branch, root))
 }
 
 //////////////////
@@ -1441,6 +1459,7 @@ fn read_down<'r, T: BonsaiFloat>(rows: &'r LazyRows<'_, T>, node: u32) -> (&'r [
 /// The fresh node an attachment below a leaf creates has no original index and
 /// is [`NO_NODE`] in the map, which is what [`LazyRows`] reads as a node the
 /// move made and has to settle.
+#[cfg(any(test, debug_assertions))]
 fn regraft(
     pruned: &Pruned,
     x: u32,
@@ -1448,8 +1467,38 @@ fn regraft(
     branch: f64,
     n_leaves: usize,
 ) -> Result<(Tree, u32, Vec<u32>), BonsaiErrors> {
-    let mut par = pruned.parent.clone();
-    let mut len = pruned.branch.clone();
+    regraft_cut(
+        (&pruned.parent, &pruned.branch, pruned.root),
+        x,
+        target,
+        branch,
+        n_leaves,
+    )
+}
+
+/// [`regraft`] onto [`cut`]'s arrays.
+///
+/// ### Params
+///
+/// * `cut` - Parent array, branch array and root of the remaining tree
+/// * `x` - The detached node
+/// * `target` - Node to attach below
+/// * `branch` - Length of the new branch
+/// * `n_leaves` - Leaf count of the original tree
+///
+/// ### Returns
+///
+/// As [`regraft`].
+fn regraft_cut(
+    cut: (&[u32], &[f64], u32),
+    x: u32,
+    target: u32,
+    branch: f64,
+    n_leaves: usize,
+) -> Result<(Tree, u32, Vec<u32>), BonsaiErrors> {
+    let (parent, lengths, root) = cut;
+    let mut par = parent.to_vec();
+    let mut len = lengths.to_vec();
     // A root always has children, so it is never a leaf and this arm never
     // moves the root.
     let centre = if (target as usize) < n_leaves {
@@ -1466,7 +1515,7 @@ fn regraft(
         len[x as usize] = branch;
         target
     };
-    let (tree, map) = assemble(&par, &len, pruned.root, n_leaves)?;
+    let (tree, map) = assemble(&par, &len, root, n_leaves)?;
     let mut to_old = vec![NO_NODE; tree.n_nodes()];
     for (old, &new) in map.iter().enumerate() {
         if new != NO_NODE {
@@ -1539,6 +1588,9 @@ fn word_index(word: &[u64]) -> FxHashMap<u64, u32> {
 /// * `params` - Knobs
 /// * `here` - Split fingerprint of `tree`
 /// * `by_word` - [`word_index`] of `tree`
+/// * `placed` - The attachment node, in `tree`'s ids, and branch, when
+///   [`fast_no_move`] has already found them; the pruned tree is then never
+///   built
 ///
 /// ### Returns
 ///
@@ -1552,25 +1604,46 @@ fn propose<T: BonsaiFloat>(
     params: &SprParams,
     here: u64,
     by_word: &FxHashMap<u64, u32>,
+    placed: Option<(u32, f64)>,
 ) -> Result<Option<Proposal>, BonsaiErrors> {
-    let Some(pruned) = prune_subtree(tree, x)? else {
-        return Ok(None);
+    let (arrays, target, placed_branch) = match placed {
+        Some((target, branch)) => {
+            let Some(arrays) = cut(tree, x) else {
+                return Ok(None);
+            };
+            (arrays, target, branch)
+        }
+        None => {
+            let Some(pruned) = prune_subtree(tree, x)? else {
+                return Ok(None);
+            };
+            let rows = LazyRows::new(&pruned.tree, &pruned.to_old, tree, down)?;
+            let q = EffLeaf {
+                m: down.means(x),
+                w: down.precisions(x),
+            };
+            let best = place(
+                &pruned.tree,
+                q,
+                |node: u32| rows.eff_leaf(node),
+                Some(params.placement),
+            )?;
+            let target = pruned.to_old[best.node as usize];
+            drop(rows);
+            (
+                (pruned.parent, pruned.branch, pruned.root),
+                target,
+                best.branch,
+            )
+        }
     };
-    let rows = LazyRows::new(&pruned.tree, &pruned.to_old, tree, down)?;
-
-    let q = EffLeaf {
-        m: down.means(x),
-        w: down.precisions(x),
-    };
-    let best = place(
-        &pruned.tree,
-        q,
-        |node: u32| rows.eff_leaf(node),
-        Some(params.placement),
+    let (attached, centre, to_old) = regraft_cut(
+        (&arrays.0, &arrays.1, arrays.2),
+        x,
+        target,
+        placed_branch,
+        tree.n_leaves(),
     )?;
-
-    let target = pruned.to_old[best.node as usize];
-    let (attached, centre, to_old) = regraft(&pruned, x, target, best.branch, tree.n_leaves())?;
 
     // Settling the attached tree was the single most expensive thing a proposal
     // did, and the only thing it fed was this resolution. Neither is needed:
@@ -1729,7 +1802,10 @@ struct Prints<'a> {
 /// ([`crate::search::masked`]), so a proposal that puts the subtree back where
 /// it came from costs its beam search and two `O(depth p)` paths instead of
 /// two arena assemblies and their row maps. A proposal that does move
-/// something is left to [`propose`], which builds and scores it as before.
+/// something is handed to [`propose`] with the placement already found, so the
+/// remaining tree is never assembled for it either. Measured 2026-09-26 against
+/// the build without the views, same trees: step 5 from 116 s to 110 s at 10k
+/// cells and from 364 s to 301 s at 25k.
 ///
 /// ### Params
 ///
@@ -1742,9 +1818,7 @@ struct Prints<'a> {
 ///
 /// ### Returns
 ///
-/// `Some(true)` for a proposal that changes no split, `Some(false)` for one
-/// that does, `None` where the views decline and the built path has to
-/// decide; or the error the placement or the primitive failed with.
+/// See [`Fast`]; or the error the placement or the primitive failed with.
 fn fast_no_move<T: BonsaiFloat>(
     tree: &Tree,
     down: &RowStore<T>,
@@ -1752,9 +1826,9 @@ fn fast_no_move<T: BonsaiFloat>(
     params: &SprParams,
     prints: &Prints<'_>,
     cache: &mut ViewCache<T>,
-) -> Result<Option<bool>, BonsaiErrors> {
+) -> Result<Fast, BonsaiErrors> {
     let Some(view) = PrunedView::new(tree, x) else {
-        return Ok(None);
+        return Ok(Fast::Declined);
     };
     let q = EffLeaf {
         m: down.means(x),
@@ -1775,11 +1849,10 @@ fn fast_no_move<T: BonsaiFloat>(
     };
     cache.reset();
     let (best, Some(attached)) = found else {
-        return Ok(None);
+        return Ok(Fast::Declined);
     };
     #[cfg(debug_assertions)]
     check_against_built(tree, down, x, params, &best, &attached)?;
-    let _ = best;
     let print =
         if attached.star.member_nodes.len() <= crate::search::polytomy::RESOLVED_STAR_MEMBERS {
             attached.print
@@ -1793,7 +1866,23 @@ fn fast_no_move<T: BonsaiFloat>(
                 &result,
             ))
         };
-    Ok(Some(print == prints.here))
+    Ok(if print == prints.here {
+        Fast::NoMove
+    } else {
+        Fast::Move(best.node, best.branch)
+    })
+}
+
+/// What the views decided about one proposal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fast {
+    /// The proposal changes no split.
+    NoMove,
+    /// It does: the attachment node in the current tree's ids and its branch,
+    /// the same bits the built path's beam search finds.
+    Move(u32, f64),
+    /// The views declined; the built path decides.
+    Declined,
 }
 
 /// Debug builds: the views' placement, star and fingerprint against the built
@@ -2036,22 +2125,32 @@ fn sweep<T: BonsaiFloat>(
                         }
                         fast_no_move(&tree, &down, x, &params, &prints, &mut cache)?
                     }
-                    Err(_) => None,
+                    Err(_) => Fast::Declined,
                 };
-                if fast == Some(true) {
-                    #[cfg(debug_assertions)]
-                    assert!(
-                        propose(&tree, &down, x, &params, here, &by_word)?.is_none(),
-                        "the views called a move no move"
-                    );
-                    return Ok(None);
+                match fast {
+                    Fast::NoMove => {
+                        #[cfg(debug_assertions)]
+                        assert!(
+                            propose(&tree, &down, x, &params, here, &by_word, None)?.is_none(),
+                            "the views called a move no move"
+                        );
+                        Ok(None)
+                    }
+                    Fast::Move(target, branch) => {
+                        let built = propose(
+                            &tree,
+                            &down,
+                            x,
+                            &params,
+                            here,
+                            &by_word,
+                            Some((target, branch)),
+                        )?;
+                        debug_assert!(built.is_some(), "the views called no move a move");
+                        Ok(built)
+                    }
+                    Fast::Declined => propose(&tree, &down, x, &params, here, &by_word, None),
                 }
-                let built = propose(&tree, &down, x, &params, here, &by_word)?;
-                debug_assert!(
-                    fast.is_none() || built.is_some(),
-                    "the views called no move a move"
-                );
-                Ok(built)
             })
             .collect::<Result<_, _>>()?;
 
@@ -3174,6 +3273,7 @@ mod tests {
                 &SprParams::default(),
                 here,
                 &word_index(&word),
+                None,
             )
             .expect("propose") else {
                 continue;
@@ -3212,7 +3312,8 @@ mod tests {
         let mut checked = 0usize;
         for x in 0..tree.n_nodes() as u32 {
             let Some(proposal) =
-                propose(&tree, &down, x, &SprParams::default(), here, &by_word).expect("propose")
+                propose(&tree, &down, x, &SprParams::default(), here, &by_word, None)
+                    .expect("propose")
             else {
                 continue;
             };
@@ -3351,7 +3452,8 @@ mod tests {
             let word = leaf_words(&tree);
             let here = split_fingerprint_with(&tree, &word);
             let by_word = word_index(&word);
-            let proposal = propose(&tree, &store, x, &params, here, &by_word).expect("propose");
+            let proposal =
+                propose(&tree, &store, x, &params, here, &by_word, None).expect("propose");
             x += 1;
             let Some(proposal) = proposal else {
                 continue;
@@ -3521,7 +3623,7 @@ mod tests {
             let mut seen = 0usize;
             for x in 0..tree.n_nodes() as u32 {
                 let Some(proposal) =
-                    propose(&tree, &down, x, &params, here, &by_word).expect("propose")
+                    propose(&tree, &down, x, &params, here, &by_word, None).expect("propose")
                 else {
                     continue;
                 };

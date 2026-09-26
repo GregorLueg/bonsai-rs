@@ -794,25 +794,19 @@ fn collapse_zero_edges(tree: &Tree) -> Result<Option<(Tree, Vec<u32>)>, BonsaiEr
 /// seeds came out with a worse Robinson-Foulds despite a four-fold larger gain,
 /// which is the data's noise rather than the search's doing.
 ///
-/// ### What a sweep costs, and what is left in it
+/// ### What a sweep costs
 ///
-/// One resolution per sweep and one settling of the whole tree per sweep, so
-/// the step is `O(sweeps * n * p)` and `sweeps` grows with the leaf count.
-/// Almost all of a sweep is the down-and-up pass itself, and the share grows
-/// with the tree.
-///
-/// Everything this module does per sweep is now the remaining 4 per cent, and
-/// the exponent is the two settling sweeps against a resolution count that
-/// grows. Getting it down needs one of two things, both outside this module.
-/// Either [`NodeState`] and [`UpState`] gain a way to settle only the rows a
-/// sweep actually reads, which is the down rows of a polytomy centre's children
-/// and the up row of the centre itself, `O(n_polytomies * depth * p)` rather
-/// than `O(n p)`; or they gain a way to be reused across sweeps, since
-/// `NodeState::prune` asserts on the node count and every sweep therefore
-/// reallocates and refills two `n * p` slabs. Resolving several polytomies per
-/// sweep would do it too and is not available: a resolution changes every up
-/// row in the tree, so the second centre of a sweep would be resolved against
-/// stale rows and the answer would move.
+/// One resolution per sweep. The down rows are settled once and kept in a
+/// [`RowStore`] that a collapse or a splice updates in the rows it changed,
+/// and each sweep's stars read their up rows through [`LazyRows`], so a sweep
+/// costs its stars and the `O(depth p)` chains above them rather than a settle
+/// of the whole tree. Every row is the settle's own bits, so the resolutions
+/// are the ones a settle per sweep makes. Measured 2026-09-26 on 25k
+/// Sanity-preprocessed cells, from the same tree: identical loglikelihood,
+/// 69 s to 3.5 s. Resolving several polytomies per sweep is still not
+/// available: a resolution changes every up row in the tree, so the second
+/// centre of a sweep would be resolved against stale rows and the answer would
+/// move.
 ///
 /// ### Params
 ///

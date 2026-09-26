@@ -438,6 +438,45 @@ fn acceptance_floor(params: &SprParams, best: f64) -> f64 {
         .max(params.min_relative_gain * best.abs().max(LOGLIK_SCALE_FLOOR))
 }
 
+/// Scale of the fixed-point loglikelihood totals SPR accepts on, `2^64`.
+///
+/// A candidate used to be scored by an `f64` sum over its arena, whose bits
+/// depend on the order the arena lists the nodes in, and a splice renumbers
+/// that order globally. Truncating every term onto a grid of `2^-64` nats and
+/// summing integers makes the total a function of the terms alone, so a move
+/// can be scored as the current total minus the terms it removes plus the
+/// terms it forms. The grid is `5e-20` nats, far below the `f64` rounding of
+/// any term, and an `i128` holds totals up to `9e18` nats.
+const FIXED_SCALE: f64 = 18_446_744_073_709_551_616.0;
+
+/// One loglikelihood term on the [`FIXED_SCALE`] grid.
+///
+/// ### Params
+///
+/// * `x` - The term, in nats
+///
+/// ### Returns
+///
+/// The term in units of `2^-64` nats, truncated towards zero.
+#[inline]
+pub(crate) fn fixed(x: f64) -> i128 {
+    (x * FIXED_SCALE) as i128
+}
+
+/// A fixed-point total back in nats.
+///
+/// ### Params
+///
+/// * `x` - The total, in units of `2^-64` nats
+///
+/// ### Returns
+///
+/// The total, rounded to `f64`.
+#[inline]
+pub(crate) fn unfixed(x: i128) -> f64 {
+    x as f64 / FIXED_SCALE
+}
+
 ////////////
 // Output //
 ////////////
@@ -852,6 +891,21 @@ impl<T: BonsaiFloat> RowStore<T> {
         self.contrib[self.slot[node as usize] as usize]
     }
 
+    /// The tree loglikelihood as a [`fixed`] total.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - The tree the store describes
+    ///
+    /// ### Returns
+    ///
+    /// The sum of every internal node's term on the fixed-point grid.
+    pub(crate) fn score(&self, tree: &Tree) -> i128 {
+        (tree.n_leaves()..tree.n_nodes())
+            .map(|v| fixed(self.contribution(v as u32)))
+            .sum()
+    }
+
     /// Make the store describe the tree an accepted move produced.
     ///
     /// Row for row what [`NodeState::prune`] would produce on `tree`, because
@@ -1128,26 +1182,29 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
         Ok(rows)
     }
 
-    /// The tree loglikelihood, from the rows.
+    /// The tree loglikelihood as a [`fixed`] total, from the rows.
     ///
     /// The same terms [`NodeState::prune`] sums, read off the base state where
-    /// the row was inherited and off the recomputed row where it was not. The
-    /// association differs from the level-wise one `prune` uses, so the two
-    /// agree to rounding and not to the bit; `test_the_incremental_loglik_matches_a_fresh_prune`
+    /// the row was inherited and off the recomputed row where it was not.
+    /// Summed in fixed point, so the total does not depend on the order the
+    /// arena happens to put the nodes in; the view scoring in
+    /// [`crate::search::masked`] relies on that to reach the same total from
+    /// the changed terms alone. It agrees with `prune`'s `f64` sum to rounding
+    /// and not to the bit; `test_the_incremental_loglik_matches_a_fresh_prune`
     /// pins how close.
     ///
     /// ### Returns
     ///
-    /// The loglikelihood, up to the dropped additive constants.
-    pub(crate) fn loglik(&self) -> f64 {
-        let mut total = 0.0f64;
+    /// The fixed-point total, up to the dropped additive constants.
+    pub(crate) fn score(&self) -> i128 {
+        let mut total = 0i128;
         for v in self.tree.n_leaves()..self.tree.n_nodes() {
             let old = self.inherited[v];
-            total += if old != NO_NODE {
+            total += fixed(if old != NO_NODE {
                 self.base.contribution(old)
             } else {
                 self.fresh_contrib[self.slot[v] as usize]
-            };
+            });
         }
         total
     }
@@ -1583,8 +1640,9 @@ struct Proposal {
     /// The subtree that was pruned, as a node of the tree the move started
     /// from.
     pruned: u32,
-    /// Loglikelihood of `tree`, from [`LazyRows::loglik`].
-    loglik: f64,
+    /// Loglikelihood of `tree` as a [`fixed`] total, from
+    /// [`LazyRows::score`]; what acceptance compares.
+    score: i128,
     /// Where the subtree was attached, as a node of the tree the move started
     /// from, and the new branch; with the two leaf words below, what
     /// [`SprApprox::recheck`] re-applies.
@@ -1791,12 +1849,12 @@ fn propose<T: BonsaiFloat>(
             }
         })
         .collect();
-    let loglik = LazyRows::new(&candidate, &to_old, tree, down)?.loglik();
+    let score = LazyRows::new(&candidate, &to_old, tree, down)?.score();
     Ok(Some(Proposal {
         tree: candidate,
         to_old,
         pruned: x,
-        loglik,
+        score,
         target,
         branch: placed_branch,
         pruned_word: 0,
@@ -2150,9 +2208,10 @@ fn sweep<T: BonsaiFloat>(
     // All of these describe the tree as it stands, and a rejected candidate
     // leaves it exactly as it stands, so they are settled once and again only
     // when a move is accepted.
-    let (settled, mut best) = settled_down(&tree, leaves)?;
+    let (settled, _) = settled_down(&tree, leaves)?;
     let mut down = RowStore::from_state(&settled, tree.n_nodes());
     drop(settled);
+    let mut best = down.score(&tree);
     let mut word = leaf_words(&tree);
     let mut below = leaves_below(&tree);
     let mut here = split_fingerprint_counted(&tree, &word, &below);
@@ -2261,14 +2320,15 @@ fn sweep<T: BonsaiFloat>(
                 proposal.pruned_word = word[proposal.pruned as usize];
                 proposal.target_word = word[proposal.target as usize];
             }
-            if proposal.loglik <= best + acceptance_floor(&params, best) {
+            let gain = unfixed(proposal.score - best);
+            if gain <= acceptance_floor(&params, unfixed(best)) {
                 continue;
             }
             gains.push(SprGain {
                 pruned: proposal.pruned,
-                gain: proposal.loglik - best,
+                gain,
             });
-            best = proposal.loglik;
+            best = proposal.score;
             down.accept(&proposal.tree, &proposal.to_old, &tree)?;
             tree = proposal.tree;
             word = leaf_words(&tree);
@@ -3426,7 +3486,7 @@ mod tests {
                 continue;
             };
             let (fresh, loglik) = settled_down(&proposal.tree, leaves).expect("settle");
-            assert_relative_eq!(proposal.loglik, loglik, max_relative = 1e-12);
+            assert_relative_eq!(unfixed(proposal.score), loglik, max_relative = 1e-12);
             let mut built = down.clone();
             built
                 .accept(&proposal.tree, &proposal.to_old, &tree)
@@ -3566,7 +3626,7 @@ mod tests {
             let Some(proposal) = proposal else {
                 continue;
             };
-            if proposal.loglik <= best + acceptance_floor(&params, best) {
+            if unfixed(proposal.score) <= best + acceptance_floor(&params, best) {
                 continue;
             }
             store
@@ -3693,7 +3753,7 @@ mod tests {
 
     #[test]
     fn test_the_acceptance_floor_outgrows_the_loglikelihood_rounding_floor() {
-        // A candidate is accepted on `proposal.loglik - best`, and both sides
+        // A candidate is accepted on `proposal.score - best`, and both sides
         // are sums over every internal node, so the smallest difference the
         // arithmetic can resolve grows with `|L|`, which is `O(n p)`. An
         // absolute floor therefore has a size above which it sits below the
@@ -3736,7 +3796,7 @@ mod tests {
                     continue;
                 };
                 let (_, fresh) = settled_down(&proposal.tree, leaves).expect("settle");
-                noise = noise.max((proposal.loglik - fresh).abs());
+                noise = noise.max((unfixed(proposal.score) - fresh).abs());
                 seen += 1;
             }
             assert!(seen > n / 2, "only {seen} candidates at {n} leaves");

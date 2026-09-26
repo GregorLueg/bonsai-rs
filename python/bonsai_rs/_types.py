@@ -4,9 +4,12 @@ Plain dataclasses over numpy arrays. ``eq=False`` because elementwise ``==`` on
 arrays does not return a bool, so a generated ``__eq__`` would raise.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any, Literal
 
 import numpy as np
+from beartype import beartype
 
 
 @dataclass(frozen=True, eq=False)
@@ -73,6 +76,108 @@ class BonsaiResult:
     node_means: np.ndarray
     node_sds: np.ndarray
     steps: list[Step]
+
+    # `ax` and the return value are matplotlib types; matplotlib is an
+    # optional dependency, so they are `Any`.
+    @beartype
+    def plot(
+        self,
+        *,
+        kind: Literal["daylight", "angle", "dendrogram"] = "angle",
+        colours: Sequence[Any] | np.ndarray | None = None,
+        ax: Any = None,
+        figsize: tuple[float, float] = (6.0, 6.0),
+    ) -> tuple[Any, Any]:
+        """Draw the tree: leaves scattered over a radial layout, edges as lines.
+
+        The look mirrors the comparison harness's tree-layout figure
+        (``reference/comparison/figures.py``): grey edges, coloured leaf
+        points, no axes chrome. Coordinates come from `layout`, not
+        recomputed here.
+
+        Args:
+            kind: Layout to draw, as `layout`'s ``kind``. ``"angle"``
+                (equal-angle radial) is the default, matching the comparison
+                figures; ``"daylight"`` and ``"dendrogram"`` are the other
+                choices `layout` accepts.
+            colours: One value per leaf, in leaf order. Numeric arrays are
+                mapped through a colormap; anything else is treated as
+                categorical labels and given a discrete palette. ``None``
+                draws every leaf the same colour.
+            ax: Axes to draw into. ``None`` creates a new figure and axes.
+            figsize: Figure size in inches. Ignored if ``ax`` is given.
+
+        Returns:
+            The ``Figure`` and ``Axes`` drawn into.
+
+        Raises:
+            ImportError: If matplotlib is not installed.
+            ValueError: If ``colours`` is not one value per leaf.
+        """
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.collections import LineCollection
+        except ImportError as e:
+            raise ImportError(
+                "BonsaiResult.plot needs matplotlib; install the `plot` extra, "
+                "e.g. `pip install bonsai-rs[plot]`"
+            ) from e
+
+        from .tree import layout
+
+        n_leaves = self.tree.n_leaves
+        coords = layout(self.tree, kind=kind)
+
+        non_root = np.flatnonzero(self.tree.parent >= 0)
+        edges = np.stack([coords[self.tree.parent[non_root]], coords[non_root]], axis=1)
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
+
+        edge_width = 0.5 if n_leaves <= 1000 else 0.2
+        ax.add_collection(
+            LineCollection(
+                edges, colors="0.6", linewidths=edge_width, alpha=0.6, zorder=1
+            )
+        )
+
+        marker_size = 10 if n_leaves <= 1000 else (3 if n_leaves <= 6000 else 1.5)
+        leaf_xy = coords[:n_leaves]
+        scatter_kwargs = {"s": marker_size, "linewidths": 0, "zorder": 2}
+        if colours is None:
+            ax.scatter(leaf_xy[:, 0], leaf_xy[:, 1], **scatter_kwargs)
+        else:
+            values = np.asarray(colours)
+            if values.ndim != 1 or len(values) != n_leaves:
+                raise ValueError(
+                    f"colours must be 1-D of length {n_leaves}, got shape "
+                    f"{values.shape}"
+                )
+            if values.dtype.kind in "iuf":
+                ax.scatter(
+                    leaf_xy[:, 0],
+                    leaf_xy[:, 1],
+                    c=values,
+                    cmap="viridis",
+                    **scatter_kwargs,
+                )
+            else:
+                categories, codes = np.unique(values, return_inverse=True)
+                cmap = plt.get_cmap("tab10" if len(categories) <= 10 else "tab20")
+                palette = np.array([cmap(i % cmap.N) for i in range(len(categories))])
+                ax.scatter(
+                    leaf_xy[:, 0], leaf_xy[:, 1], c=palette[codes], **scatter_kwargs
+                )
+
+        if kind != "dendrogram":
+            ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        return fig, ax
 
 
 @dataclass(frozen=True, eq=False)

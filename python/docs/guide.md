@@ -74,3 +74,17 @@ build the best tree.
 Tell you your data isn't a tree. A cycle gets cut somewhere and drawn as two
 branches with confident lengths. Look at the data before you believe the
 picture.
+
+## Plotting
+
+`BonsaiResult.plot` draws the radial layout with matplotlib, needing the
+`plot` extra (`pip install bonsai-rs[plot]`):
+
+```python
+res = bs.bonsai(sim.means, sim.sds)
+fig, ax = res.plot(colours=cluster_labels)
+```
+
+`colours` is one value per leaf, in leaf order; numeric arrays go through a
+colormap, anything else gets a discrete palette. For a custom layout or
+figure, call `layout` directly and draw it yourself.

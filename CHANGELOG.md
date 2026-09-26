@@ -21,6 +21,10 @@
   regrafted trees, without building either: identical trees, step 5 from 395 s
   to 301 s at 25k.
 - Full search at 25k cells, 1,009 s to about 460 s, same tree.
+- Approximate SPR re-applies the rest of a chunk after an acceptance instead of
+  proposing it again (`SprApprox::recheck`, on by default): 6 to 22 per cent
+  faster, loglikelihood inside the run-to-run spread on five datasets. Not the
+  same tree as before; `SprApprox::new(radius, false)` restores it.
 
 ## 0.1.0
 

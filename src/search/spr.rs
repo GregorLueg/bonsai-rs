@@ -183,6 +183,27 @@ const PROPOSAL_CHUNK_MIN: usize = 8;
 /// candidate is a whole arena, so a chunk holds this many trees at once.
 const PROPOSAL_CHUNK_MAX: usize = 256;
 
+/// Default for [`SprApprox::recheck`].
+///
+/// Measured 2026-09-26. Without it, 47 to 48 per cent of all proposals at 10k
+/// and 25k cells were discarded after an earlier acceptance in their chunk and
+/// proposed again. Full search, off against on:
+///
+/// | data | loglik | Robinson-Foulds | recovery | seconds |
+/// |---|---|---|---|---|
+/// | synthetic 8k, noise 0.4 | identical | 0, 0 | 0.945, 0.945 | 7, 7 |
+/// | synthetic 8k, noise 1.6 | -8,766,997.2, -8,766,997.9 | 4,512, 4,538 | 0.831, 0.831 | 54, 42 |
+/// | Baron 5k | -5,557,978, -5,557,888 | 1,288, 1,301 | 0.666, 0.667 | 64, 52 |
+/// | Baron 10k | -11,252,721, -11,253,773 | 2,624, 2,612 | 0.476, 0.386 | 178, 140 |
+/// | Baron 25k | -28,630,458, -28,629,166 | 6,048, 6,061 | 0.539, 0.553 | 482, 453 |
+///
+/// Every loglikelihood inside the spread SPR's candidate order alone gives
+/// (`docs/PERFORMANCE.md`, "How much one real-data run says"). The 10k
+/// recovery is the lower of the two basins that section records for 10k, where
+/// random orders also land at 0.40; one run, so a coin flip rather than a
+/// measured cost.
+const DEFAULT_RECHECK: bool = true;
+
 /// Default for [`SprApprox::revisit_radius`].
 ///
 /// Measured 2026-09-24, steps 5 to 8 from the same step-4 tree, scored against
@@ -240,6 +261,15 @@ pub struct SprApprox {
     /// certainly, because every effective leaf depends on the whole tree. See
     /// [`DEFAULT_REVISIT_RADIUS`].
     pub revisit_radius: usize,
+    /// After a move is accepted, keep the rest of its chunk rather than
+    /// proposing it again: a proposal that moved something is re-applied to
+    /// the tree as it now stands, same subtree onto the same attachment point
+    /// with the same branch, and re-scored exactly there; one that moved
+    /// nothing stays a non-move. Every accepted move still improves the tree
+    /// it is applied to, so the sweep stays monotone. What it gives up is that
+    /// a re-applied move's attachment point was found on the tree before the
+    /// acceptance. See [`DEFAULT_RECHECK`].
+    pub recheck: bool,
 }
 
 impl SprApprox {
@@ -248,12 +278,16 @@ impl SprApprox {
     /// ### Params
     ///
     /// * `revisit_radius` - See [`SprApprox::revisit_radius`]; `0` is off
+    /// * `recheck` - See [`SprApprox::recheck`]
     ///
     /// ### Returns
     ///
     /// The knobs.
-    pub fn new(revisit_radius: usize) -> Self {
-        Self { revisit_radius }
+    pub fn new(revisit_radius: usize, recheck: bool) -> Self {
+        Self {
+            revisit_radius,
+            recheck,
+        }
     }
 }
 
@@ -266,6 +300,7 @@ impl Default for SprApprox {
     fn default() -> Self {
         Self {
             revisit_radius: DEFAULT_REVISIT_RADIUS,
+            recheck: DEFAULT_RECHECK,
         }
     }
 }
@@ -308,6 +343,18 @@ impl SprSearch {
         match self {
             Self::Exact => 0,
             Self::Approximate(a) => a.revisit_radius,
+        }
+    }
+
+    /// Whether a sweep keeps the rest of a chunk after an acceptance.
+    ///
+    /// ### Returns
+    ///
+    /// [`SprApprox::recheck`], false for the exact search.
+    fn recheck(&self) -> bool {
+        match self {
+            Self::Exact => false,
+            Self::Approximate(a) => a.recheck,
         }
     }
 }
@@ -1538,6 +1585,16 @@ struct Proposal {
     pruned: u32,
     /// Loglikelihood of `tree`, from [`LazyRows::loglik`].
     loglik: f64,
+    /// Where the subtree was attached, as a node of the tree the move started
+    /// from, and the new branch; with the two leaf words below, what
+    /// [`SprApprox::recheck`] re-applies.
+    target: u32,
+    /// Length of the new branch.
+    branch: f64,
+    /// Leaf word of the pruned subtree, set by the sweep.
+    pruned_word: u64,
+    /// Leaf word of the attachment point, set by the sweep.
+    target_word: u64,
 }
 
 /// Index a tree's [`leaf_words`] by word.
@@ -1644,6 +1701,13 @@ fn propose<T: BonsaiFloat>(
         placed_branch,
         tree.n_leaves(),
     )?;
+    // A placement carried over from an earlier tree (`SprApprox::recheck`)
+    // can name a node this cut removes: the pruned subtree's parent, now of
+    // degree two, or a root the cut replaced. The subtree then hangs off
+    // nothing and drops out of the arena, so the move does not apply here.
+    if centre == NO_NODE || attached.n_leaves() != tree.n_leaves() {
+        return Ok(None);
+    }
 
     // Settling the attached tree was the single most expensive thing a proposal
     // did, and the only thing it fed was this resolution. Neither is needed:
@@ -1733,6 +1797,10 @@ fn propose<T: BonsaiFloat>(
         to_old,
         pruned: x,
         loglik,
+        target,
+        branch: placed_branch,
+        pruned_word: 0,
+        target_word: 0,
     }))
 }
 
@@ -2151,14 +2219,48 @@ fn sweep<T: BonsaiFloat>(
                     }
                     Fast::Declined => propose(&tree, &down, x, &params, here, &by_word, None),
                 }
+                .map(|built| {
+                    built.map(|mut p| {
+                        p.pruned_word = word[p.pruned as usize];
+                        p.target_word = word[p.target as usize];
+                        p
+                    })
+                })
             })
             .collect::<Result<_, _>>()?;
 
+        let recheck = params.search.recheck();
         let mut accepted = None;
         for (k, proposal) in proposals.into_iter().enumerate() {
-            let Some(proposal) = proposal else {
+            let Some(mut proposal) = proposal else {
                 continue;
             };
+            if accepted.is_some() {
+                // Proposed against the tree before this chunk's acceptance:
+                // re-apply the same move to the tree as it stands and score it
+                // there, or drop it if either end no longer names a node.
+                let (Some(&x), Some(&target)) = (
+                    by_word.get(&proposal.pruned_word),
+                    by_word.get(&proposal.target_word),
+                ) else {
+                    continue;
+                };
+                let Some(again) = propose(
+                    &tree,
+                    &down,
+                    x,
+                    &params,
+                    here,
+                    &by_word,
+                    Some((target, proposal.branch)),
+                )?
+                else {
+                    continue;
+                };
+                proposal = again;
+                proposal.pruned_word = word[proposal.pruned as usize];
+                proposal.target_word = word[proposal.target as usize];
+            }
             if proposal.loglik <= best + acceptance_floor(&params, best) {
                 continue;
             }
@@ -2183,12 +2285,18 @@ fn sweep<T: BonsaiFloat>(
                 );
             }
             accepted = Some(k);
-            break;
+            if !recheck {
+                break;
+            }
         }
 
         // The rest of a chunk that accepted was proposed against the tree
         // before the move, so it is proposed again against the tree after it.
         match accepted {
+            Some(_) if recheck => {
+                next = end;
+                chunk = (chunk / 2).max(PROPOSAL_CHUNK_MIN);
+            }
             Some(k) => {
                 next += k + 1;
                 chunk = (chunk / 2).max(PROPOSAL_CHUNK_MIN);
@@ -3383,7 +3491,7 @@ mod tests {
         // A radius of zero switches the restriction off, which is the exact
         // search whatever else the approximate arm carries.
         for radius in [0, 4 * n] {
-            let got = with(SprSearch::Approximate(SprApprox::new(radius)));
+            let got = with(SprSearch::Approximate(SprApprox::new(radius, false)));
             assert_eq!(got.rounds, all.rounds, "radius {radius}");
             assert_eq!(
                 got.loglik.to_bits(),
@@ -3414,7 +3522,7 @@ mod tests {
                 &start,
                 leaves,
                 Some(SprParams {
-                    search: SprSearch::Approximate(SprApprox::new(radius)),
+                    search: SprSearch::Approximate(SprApprox::new(radius, false)),
                     ..SprParams::default()
                 }),
             )

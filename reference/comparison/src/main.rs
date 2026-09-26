@@ -42,7 +42,7 @@ use bonsai_rs::search::bounds::EllipsoidBounds;
 use bonsai_rs::search::candidates::KnnCandidates;
 use bonsai_rs::search::nni::nni;
 use bonsai_rs::search::polytomy::resolve_polytomies;
-use bonsai_rs::search::spr::spr;
+use bonsai_rs::search::spr::{SprSearch, spr};
 use bonsai_rs::search::star::{Star, star_tree_with};
 use bonsai_rs::tree::distance::{MAX_PAIRS, distance_recovery};
 use bonsai_rs::tree::export::layout_csv;
@@ -646,6 +646,7 @@ fn ours(dir: &Path) -> Fallible<()> {
     if let Some(v) = env_f64("SPR_MIN_GAIN")? {
         params.spr.star.min_gain = v;
     }
+    spr_recheck_from_env(&mut params);
     let tag = env::var("OURS_TAG").ok().filter(|t| !t.is_empty());
     let named = |base: &str, ext: &str| match &tag {
         Some(t) => format!("{base}_{t}.{ext}"),
@@ -872,6 +873,15 @@ fn refine_steps(
     })
 }
 
+/// `SPR_RECHECK=0` or `1` switches `SprApprox::recheck` for the approximate
+/// SPR; unset leaves the default.
+fn spr_recheck_from_env(params: &mut BonsaiParams) {
+    if let (Ok(v), SprSearch::Approximate(mut a)) = (env::var("SPR_RECHECK"), params.spr.search) {
+        a.recheck = v != "0";
+        params.spr.search = SprSearch::Approximate(a);
+    }
+}
+
 /// Run steps 3 to 8 over a Newick tree and print each step's timing. What the
 /// refinement costs from a given start, for instance one already converged.
 fn refine_tree(dir: &Path, nwk: &Path) -> Fallible<()> {
@@ -895,7 +905,9 @@ fn refine_tree(dir: &Path, nwk: &Path) -> Fallible<()> {
         total += secs;
         println!("refine: {step:<10} {secs:>9.2} s   loglik {loglik:>16.2}");
     };
-    let r = refine_steps(tree, leaves, &BonsaiParams::default(), &mut record)?;
+    let mut params = BonsaiParams::default();
+    spr_recheck_from_env(&mut params);
+    let r = refine_steps(tree, leaves, &params, &mut record)?;
     println!(
         "refine: {total:.2} s, spr moves {} rounds {}, nni moves {}",
         r.spr_moves, r.spr_rounds, r.nni_moves

@@ -40,6 +40,8 @@ use crate::model::global::{GlobalBranchParams, collapse_onto_every_node, optimis
 use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
 use crate::model::place::{Placement, PlacementParams, place_from};
+use crate::search::Leaves;
+use crate::search::polytomy::resolve_centres;
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::{BonsaiFloat, narrow};
@@ -72,6 +74,11 @@ pub const DEFAULT_BACKBONE_CELLS: usize = 4096;
 /// 2048-cell backbone: 0.05 grew a tree 16k nats better than 0.25 for 7 s more
 /// placement, and a single round was 43k worse than 0.25.
 pub const DEFAULT_REGROW_FRACTION: f64 = 0.05;
+
+/// Passes of [`Growing::resolve_new`] per round. Each pass resolves every
+/// centre whose parent is not also a centre, so nested centres need a second;
+/// a runaway guard beyond that, not a tuned value.
+const MAX_RESOLVE_PASSES: usize = 4;
 
 /// Metric for [`Growing::nearest_leaves`], as `ann_search_rs` spells it.
 const NEAREST_METRIC: &str = "euclidean";
@@ -108,6 +115,15 @@ pub struct BackboneParams {
     /// the beam search as extra start points for each cell. Zero for the
     /// beam's own spread starts only.
     pub leaf_starts: usize,
+    /// Resolve the polytomy at every node that received cells, after each
+    /// round (SI.B.4.2: a cell attachment is always followed by resolving the
+    /// polytomy it made). One settle per round serves every centre; see
+    /// `search::polytomy::resolve_centres` for the approximation.
+    pub resolve_attachments: bool,
+    /// Run the full refinement over the cells placed so far each time the tree
+    /// has grown by this factor since the last one, and grow on from the
+    /// result (the Methods' multi-round growth). `f64::INFINITY` never does.
+    pub stage_growth: f64,
     /// Placement search knobs for the growth phase.
     pub placement: PlacementParams,
     /// Stopping rule for reoptimising the branch lengths between rounds, which
@@ -130,6 +146,8 @@ impl Default for BackboneParams {
             regrow_fraction: DEFAULT_REGROW_FRACTION,
             seed: 0,
             leaf_starts: DEFAULT_LEAF_STARTS,
+            resolve_attachments: false,
+            stage_growth: f64::INFINITY,
             placement: PlacementParams::default(),
             growth_branch: GlobalBranchParams {
                 max_iter: 0,
@@ -162,6 +180,10 @@ pub struct BackboneReport {
     pub place_seconds: f64,
     /// Wall time of the growth-phase branch-length reoptimisations.
     pub reoptimise_seconds: f64,
+    /// Wall time of resolving the attachment polytomies between rounds.
+    pub resolve_seconds: f64,
+    /// Wall time of the intermediate refinements of multi-round growth.
+    pub stage_seconds: f64,
     /// Wall time of the final refinement over every cell. Zero from [`grow`],
     /// which stops before it.
     pub refine_seconds: f64,
@@ -186,6 +208,8 @@ impl BackboneReport {
             seed_seconds: 0.0,
             place_seconds: 0.0,
             reoptimise_seconds: 0.0,
+            resolve_seconds: 0.0,
+            stage_seconds: 0.0,
             refine_seconds: 0.0,
         }
     }
@@ -273,6 +297,7 @@ pub fn grow<T: BonsaiFloat>(
     // rounds. Not after the last: the final refinement's step 4 does that.
     let mut scored_total = 0usize;
     let mut next = n_backbone;
+    let mut last_stage = n_backbone;
     while next < n_cells {
         let size = ((grown.n_leaves as f64 * params.regrow_fraction).ceil() as usize).max(1);
         let end = (next + size).min(n_cells);
@@ -280,8 +305,23 @@ pub fn grow<T: BonsaiFloat>(
         let t0 = Instant::now();
         scored_total += grown.place_round(data, &order[next..end], &params)?;
         report.place_seconds += t0.elapsed().as_secs_f64();
-        report.placed += end - next;
+        let k = end - next;
+        report.placed += k;
         next = end;
+
+        if params.resolve_attachments {
+            let t0 = Instant::now();
+            grown.resolve_new(k, &params)?;
+            report.resolve_seconds += t0.elapsed().as_secs_f64();
+        }
+        if next < n_cells && grown.n_leaves as f64 >= last_stage as f64 * params.stage_growth {
+            let t0 = Instant::now();
+            let sub = grown.subset()?;
+            let refined = refine(&grown.tree()?, &sub, Some(params.bonsai))?.tree;
+            grown.adopt(refined);
+            report.stage_seconds += t0.elapsed().as_secs_f64();
+            last_stage = grown.n_leaves;
+        }
 
         if next < n_cells && params.growth_branch.max_iter > 0 {
             let t0 = Instant::now();
@@ -489,6 +529,37 @@ impl<T: BonsaiFloat> Growing<T> {
 
         self.attach(data, cells, &placements);
         Ok(placements.iter().map(|x| x.scored).sum())
+    }
+
+    /// Resolve the polytomies at the parents of the newest leaves.
+    ///
+    /// Up to [`MAX_RESOLVE_PASSES`] passes, because a centre whose parent is
+    /// also a centre waits for the next pass.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - How many of the most recent leaves were just attached
+    /// * `params` - Backbone knobs, for the star primitive
+    fn resolve_new(&mut self, k: usize, params: &BackboneParams) -> Result<(), BonsaiErrors> {
+        let leaves = Leaves {
+            means: &self.means,
+            precisions: &self.precisions,
+            n_features: self.p,
+        };
+        let mut tree = self.tree()?;
+        for _ in 0..MAX_RESOLVE_PASSES {
+            let centres: Vec<u32> = (self.n_leaves - k..self.n_leaves)
+                .filter_map(|leaf| tree.parent(leaf as u32))
+                .collect();
+            let (resolved, _, skipped) =
+                resolve_centres(&tree, leaves, &centres, Some(params.bonsai.star))?;
+            tree = resolved;
+            if skipped == 0 {
+                break;
+            }
+        }
+        self.adopt(tree);
+        Ok(())
     }
 
     /// The `k` current leaves nearest each cell, as start points for its beam

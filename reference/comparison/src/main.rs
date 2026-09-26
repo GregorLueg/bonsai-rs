@@ -35,7 +35,7 @@ use std::time::Instant;
 
 use bonsai_rs::backbone::BackboneParams;
 use bonsai_rs::bonsai::BonsaiParams;
-use bonsai_rs::ingest::{IngestParams, PreparedData, from_sanity, prepare};
+use bonsai_rs::ingest::{IngestParams, PreparedData, from_sanity, from_sanity_output, prepare};
 use bonsai_rs::model::global::optimise_branch_lengths;
 use bonsai_rs::model::likelihood::NodeState;
 use bonsai_rs::search::Leaves;
@@ -51,6 +51,8 @@ use bonsai_rs::tree::layout::equal_angle;
 use bonsai_rs::tree::newick::{parse_newick, write_newick};
 use bonsai_rs::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
 use bonsai_rs::tree::{NO_NODE, Tree};
+use sanity_sc_rs::input::CountMatrix;
+use sanity_sc_rs::sanity;
 
 /// Seed for the leaf-pair sample inside distance recovery. Fixed so that the
 /// two implementations are scored on exactly the same pairs.
@@ -93,6 +95,12 @@ fn run() -> Fallible<()> {
                 args[5].parse()?,
                 args[6].parse()?,
             )
+        }
+        Some("sanity-rs") => {
+            if args.len() != 4 {
+                return Err("usage: harness sanity-rs <sim_dir> <out_dir>".into());
+            }
+            sanity_rs(Path::new(&args[2]), Path::new(&args[3]))
         }
         Some("prep") => {
             if args.len() != 3 {
@@ -333,6 +341,138 @@ fn read_vector(path: &Path) -> Fallible<Vec<f64>> {
                 .map_err(|_| format!("{}: {l:?} is not a number", path.display()).into())
         })
         .collect()
+}
+
+/// Counts to `out/ours/{means,sds}.csv` through `sanity-sc-rs`, for when the
+/// original Sanity binary is not to hand.
+///
+/// Reads `sim/counts.mtx` (genes by cells, 1-based), runs Sanity in `f32` on
+/// the CPU, converts with `from_sanity_output`, and selects features in
+/// `prepare` at the default signal-to-noise threshold. Writes the kept gene
+/// indices (0-based, into the simulation's gene axis) to `out/features.txt` and
+/// their Sanity variances to `out/variances.txt`, which is what the truth
+/// matrix needs, plus `prep.tsv` and a copy of `truth.nwk`. `ours/truth.csv` is
+/// left to numpy, which reads `truth_ltq.npy`.
+fn sanity_rs(sim: &Path, out: &Path) -> Fallible<()> {
+    let t0 = Instant::now();
+    let text = fs::read_to_string(sim.join("counts.mtx"))?;
+    let mut lines = text.lines().filter(|l| !l.starts_with('%'));
+    let header: Vec<usize> = lines
+        .next()
+        .ok_or("counts.mtx is empty")?
+        .split_whitespace()
+        .map(|x| x.parse())
+        .collect::<Result<_, _>>()?;
+    let (n_genes, n_cells, nnz) = (header[0], header[1], header[2]);
+    let mut entries: Vec<(u32, u32, u32)> = Vec::with_capacity(nnz);
+    for line in lines {
+        let mut f = line.split_whitespace();
+        let g: u32 = f.next().ok_or("short line")?.parse()?;
+        let c: u32 = f.next().ok_or("short line")?.parse()?;
+        let v: u32 = f.next().ok_or("short line")?.parse()?;
+        entries.push((g - 1, c - 1, v));
+    }
+    entries.sort_unstable();
+    let mut indptr = vec![0usize; n_genes + 1];
+    let mut cell_totals = vec![0.0f64; n_cells];
+    for &(g, c, v) in &entries {
+        indptr[g as usize + 1] += 1;
+        cell_totals[c as usize] += v as f64;
+    }
+    // Sanity refuses a gene with no counts, so those are dropped here and
+    // `present` maps Sanity's gene axis back to the simulation's.
+    let present: Vec<usize> = (0..n_genes).filter(|&g| indptr[g + 1] > 0).collect();
+    let mut indptr: Vec<usize> = std::iter::once(0)
+        .chain(present.iter().map(|&g| indptr[g + 1]))
+        .collect();
+    for g in 0..present.len() {
+        indptr[g + 1] += indptr[g];
+    }
+    let indices: Vec<u32> = entries.iter().map(|e| e.1).collect();
+    let values: Vec<u32> = entries.iter().map(|e| e.2).collect();
+    drop(entries);
+    drop(text);
+    let counts = CountMatrix::new(indices, values, indptr, n_cells)?;
+    let read_secs = t0.elapsed().as_secs_f64();
+    println!(
+        "sanity-rs: read {n_genes} genes by {n_cells} cells, {nnz} counts in {read_secs:.1} s"
+    );
+
+    let t0 = Instant::now();
+    let post = sanity::<f32>(&counts, &cell_totals, None)?;
+    let sanity_secs = t0.elapsed().as_secs_f64();
+    println!("sanity-rs: Sanity in {sanity_secs:.1} s");
+
+    let t0 = Instant::now();
+    let loose = IngestParams {
+        min_signal_to_noise: f64::NEG_INFINITY,
+        ..Default::default()
+    };
+    let lik = from_sanity_output(&post, Some(loose))?;
+    drop(post);
+    let k_all = lik.features.len();
+    let prepared: PreparedData<f32> = prepare(
+        &lik.means,
+        &lik.sds,
+        n_cells,
+        k_all,
+        Some(&lik.variances),
+        None,
+    )?;
+    let k = prepared.n_features();
+    let features: Vec<usize> = prepared
+        .features
+        .iter()
+        .map(|&i| present[lik.features[i]])
+        .collect();
+    let variances: Vec<f64> = prepared
+        .features
+        .iter()
+        .map(|&i| lik.variances[i])
+        .collect();
+    let ingest_secs = t0.elapsed().as_secs_f64();
+
+    let our_dir = out.join("ours");
+    fs::create_dir_all(&our_dir)?;
+    let means: Vec<f64> = prepared
+        .transformed_means
+        .iter()
+        .map(|&x| x as f64)
+        .collect();
+    let sds: Vec<f64> = prepared
+        .transformed_precisions
+        .iter()
+        .map(|&w| 1.0 / (w as f64).sqrt())
+        .collect();
+    fs::write(
+        our_dir.join("means.csv"),
+        matrix_text(&means, n_cells, k, ','),
+    )?;
+    fs::write(our_dir.join("sds.csv"), matrix_text(&sds, n_cells, k, ','))?;
+    let join = |v: Vec<String>| v.join("\n") + "\n";
+    fs::write(
+        out.join("features.txt"),
+        join(features.iter().map(|x| x.to_string()).collect()),
+    )?;
+    fs::write(
+        out.join("variances.txt"),
+        join(variances.iter().map(|x| format!("{x:e}")).collect()),
+    )?;
+    fs::copy(sim.join("truth.nwk"), out.join("truth.nwk"))?;
+    fs::write(
+        out.join("prep.tsv"),
+        format!(
+            "n_cells\t{n_cells}\nn_genes_in\t{n_genes}\nn_features_ours\t{k}\n\
+             dropped_ill_conditioned\t{}\nsanity\tsanity-sc-rs f32 cpu\nread_seconds\t{read_secs:.2}\n\
+             sanity_seconds\t{sanity_secs:.2}\ningest_seconds\t{ingest_secs:.2}\n",
+            lik.dropped.len()
+        ),
+    )?;
+    println!(
+        "sanity-rs: {k} of {n_genes} genes kept ({} ill-conditioned dropped), ingest {ingest_secs:.1} s",
+        lik.dropped.len()
+    );
+    Ok(())
 }
 
 /// Convert `dir/sanity_sel` into `dir/ours/means.csv` and `dir/ours/sds.csv`,
@@ -770,6 +910,14 @@ fn backbone(dir: &Path, backbone_cells: Option<usize>) -> Fallible<()> {
     {
         params.regrow_fraction = v;
     }
+    params.resolve_attachments = env::var("RESOLVE_ATTACH").is_ok();
+    if let Some(v) = env::var("STAGE_GROWTH")
+        .ok()
+        .map(|v| v.parse::<f64>())
+        .transpose()?
+    {
+        params.stage_growth = v;
+    }
     if let Some(v) = env::var("GROW_ITER")
         .ok()
         .map(|v| v.parse::<usize>())
@@ -832,6 +980,8 @@ fn backbone(dir: &Path, backbone_cells: Option<usize>) -> Fallible<()> {
         ("seed", report.seed_seconds),
         ("place", report.place_seconds),
         ("reoptimise", report.reoptimise_seconds),
+        ("resolve", report.resolve_seconds),
+        ("stages", report.stage_seconds),
     ] {
         println!("backbone: {step:<10} {secs:>9.2} s");
     }

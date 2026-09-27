@@ -429,7 +429,7 @@ fn build_start(start: Start, data: &PreparedData<f64>, seed: u64) -> (Tree, f64)
             .expect("state");
             optimise_branch_lengths(&mut star, &mut state, None).expect("step 1");
 
-            let mut candidates = EllipsoidBounds::new(KnnCandidates::new(None), None);
+            let mut candidates = EllipsoidBounds::new(KnnCandidates::new(None));
             star_tree_with(
                 Star {
                     means: &data.transformed_means,

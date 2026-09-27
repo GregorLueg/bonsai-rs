@@ -116,7 +116,7 @@ fn main() {
 
         // Step 2.
         let t0 = Instant::now();
-        let mut candidates = EllipsoidBounds::new(KnnCandidates::new(None), None);
+        let mut candidates = EllipsoidBounds::new(KnnCandidates::new(None));
         let (mut tree, _) = star_tree_with(
             Star {
                 means: leaves.means,

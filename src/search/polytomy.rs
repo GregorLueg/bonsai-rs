@@ -154,8 +154,6 @@ pub struct Splice {
 pub struct PolytomyResult {
     /// The tree with every polytomy resolved as far as it will go.
     pub tree: Tree,
-    /// Total loglikelihood gain over the input tree, in nats.
-    pub gain: f64,
     /// Number of polytomies the input tree had, once its zero-length internal
     /// edges were collapsed into their parents.
     pub n_polytomies: usize,
@@ -761,7 +759,6 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
         None => tree.clone(),
     };
     let n_polytomies = count_polytomies(&tree);
-    let mut gain = 0.0f64;
     let mut n_resolved = 0usize;
     let mut sweeps = 0usize;
 
@@ -785,7 +782,7 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
         let identity: Vec<u32> = (0..tree.n_nodes() as u32).collect();
         let rows = LazyRows::new(&tree, &identity, &tree, &store)?;
 
-        let mut accepted: Option<(f64, Tree, Vec<u32>)> = None;
+        let mut accepted: Option<(Tree, Vec<u32>)> = None;
         for node in tree.internal_postorder() {
             // The degree test first, off the tree, and the star only for a node
             // that passes it. `CentreStar::is_polytomy` reads nothing the tree
@@ -803,16 +800,15 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
             let result = resolve_star(star.view(), params)?;
             if !result.merges.is_empty() {
                 let (next, to_old) = splice_result_mapped(&tree, &star, &result)?;
-                accepted = Some((result.merges.iter().map(|x| x.gain).sum(), next, to_old));
+                accepted = Some((next, to_old));
                 break;
             }
         }
         drop(rows);
         match accepted {
             None => break,
-            Some((merged, next, to_old)) => {
+            Some((next, to_old)) => {
                 store.accept(&next, &to_old, &tree)?;
-                gain += merged;
                 n_resolved += 1;
                 tree = next;
             }
@@ -824,7 +820,6 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
 
     Ok(PolytomyResult {
         tree,
-        gain,
         n_polytomies,
         n_resolved,
         sweeps,
@@ -1196,7 +1191,6 @@ mod tests {
                 after >= before - 1e-9,
                 "seed {seed}: {before} fell to {after}"
             );
-            assert_relative_eq!(out.gain, after - before, max_relative = 1e-7);
         }
     }
 
@@ -1246,7 +1240,7 @@ mod tests {
         let start = star_shaped(n, 0.5);
         let out = resolve_polytomies(&start, leaves, None).expect("resolve");
 
-        assert!(out.gain > 0.0);
+        assert!(loglik(&out.tree, leaves) > loglik(&start, leaves));
         assert_eq!(out.n_polytomies, 1);
         assert_eq!(count_polytomies(&out.tree), 0);
         assert!(loglik(&out.tree, leaves) > loglik(&start, leaves));
@@ -1265,7 +1259,6 @@ mod tests {
         assert_eq!(out.n_polytomies, 0);
         assert_eq!(out.n_resolved, 0);
         assert_eq!(out.sweeps, 1);
-        assert_eq!(out.gain, 0.0);
         assert_eq!(splits(&out.tree), splits(&tree));
     }
 
@@ -1356,7 +1349,7 @@ mod tests {
             "step 3 saw no polytomy in a tree with {zeros} zero-length internal edges"
         );
         assert!(
-            out.n_resolved > 0 && out.gain > 0.0,
+            out.n_resolved > 0 && loglik(&out.tree, leaves) > loglik(&merged, leaves),
             "step 3 gained nothing"
         );
         assert!(loglik(&out.tree, leaves) > loglik(&merged, leaves));
@@ -1382,7 +1375,6 @@ mod tests {
         let once = resolve_polytomies(&start, leaves, None).expect("resolve");
         let twice = resolve_polytomies(&once.tree, leaves, None).expect("resolve");
         assert_eq!(twice.n_resolved, 0);
-        assert_eq!(twice.gain, 0.0);
         assert_eq!(splits(&twice.tree), splits(&once.tree));
     }
 

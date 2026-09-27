@@ -29,7 +29,7 @@ use crate::errors::BonsaiErrors;
 use crate::ingest::{IngestParams, PreparedData, prepare};
 use crate::model::global::{GlobalBranchParams, collapse_onto_every_node, optimise_branch_lengths};
 use crate::model::likelihood::NodeState;
-use crate::search::bounds::{EllipsoidBounds, EllipsoidBoundsParams};
+use crate::search::bounds::EllipsoidBounds;
 use crate::search::candidates::{KnnCandidates, KnnCandidatesParams};
 use crate::search::nni::{NniParams, nni};
 use crate::search::polytomy::resolve_polytomies;
@@ -80,10 +80,8 @@ pub struct BonsaiParams {
     ///
     /// Not optional in practice. Scanning every pair makes step 2 `O(n^3 p)`
     /// and 94 per cent of the runtime; measured, it scales as `n^2.9` without
-    /// this and the ellipsoid bounds below.
+    /// this and the ellipsoid bounds of section 10, which always run.
     pub knn: KnnCandidatesParams,
-    /// Upper bounds on merge scores (section 10).
-    pub bounds: EllipsoidBoundsParams,
     /// Global branch-length optimisation (section 6), steps 1, 4 and 7.
     pub branch: GlobalBranchParams,
     /// Subtree pruning and regrafting (section 9.3), step 5.
@@ -374,7 +372,7 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
             // which pairs exist, the bounds decide which of those need
             // rescoring this round.
             let mut candidates =
-                EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)), Some(params.bounds));
+                EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)));
             let (tree, _) = star_tree_with(
                 Star {
                     means: leaves.means,

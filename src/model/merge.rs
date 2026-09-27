@@ -528,9 +528,8 @@ pub fn score_merge<T: BonsaiFloat>(
 ///
 /// The score as a function of where the ancestor sits rather than at its
 /// optimum, which is what a central difference against
-/// [`MergeScratch::gain_and_gradient`] needs. Both this module's gradient tests
-/// and `search::bounds`'s use it for exactly that; nothing in the pipeline
-/// calls it.
+/// [`MergeScratch::gain_and_gradient`] needs. Test-only: this module's
+/// gradient tests and `search::bounds`'s use it for exactly that.
 ///
 /// ### Params
 ///
@@ -542,7 +541,8 @@ pub fn score_merge<T: BonsaiFloat>(
 /// ### Returns
 ///
 /// The loglikelihood gain.
-pub fn gain_at(total: f64, u: f64, t_ar: f64, scratch: &MergeScratch) -> f64 {
+#[cfg(test)]
+pub(crate) fn gain_at(total: f64, u: f64, t_ar: f64, scratch: &MergeScratch) -> f64 {
     scratch.gain_and_gradient(total, u, t_ar).0
 }
 

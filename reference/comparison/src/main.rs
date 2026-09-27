@@ -719,8 +719,7 @@ fn ours(dir: &Path) -> Fallible<()> {
         // Step 2: greedy merging under the kNN restriction and ellipsoid
         // bounds, the same composition `bonsai_prepared` uses.
         let t0 = Instant::now();
-        let mut candidates =
-            EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)), Some(params.bounds));
+        let mut candidates = EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)));
         let (tree, _) = star_tree_with(
             Star {
                 means: leaves.means,

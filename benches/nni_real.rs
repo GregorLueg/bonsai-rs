@@ -16,7 +16,7 @@
 //! `<dir>` holds `ours/means.csv`, `ours/sds.csv` (transformed units) and
 //! `truth.nwk` with leaves labelled `cell<i>`. Variants:
 //!
-//! * `base` - step 6 at the defaults, then step 7; prints the per-round trace
+//! * `base` - step 6 at the defaults, then step 7
 //! * `random <n> [seed]` - `NniParams::n_random` set
 //! * `mingain <g>` - `StarParams::min_gain` on the interchange star
 //! * `reopt` - step 4 again between steps 5 and 6
@@ -297,8 +297,7 @@ fn through_step_five(fx: &Fixture, params: &BonsaiParams) -> (Tree, Tree) {
             let mut state = NodeState::new(star.n_nodes(), fx.p, leaves.means, leaves.precisions)
                 .expect("state");
             optimise_branch_lengths(&mut star, &mut state, Some(params.branch)).expect("branch");
-            let mut candidates =
-                EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)), Some(params.bounds));
+            let mut candidates = EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)));
             star_tree_with(
                 Star {
                     means: leaves.means,
@@ -350,37 +349,8 @@ fn through_step_five(fx: &Fixture, params: &BonsaiParams) -> (Tree, Tree) {
     (t4, out.tree)
 }
 
-fn print_trace(out: &NniResult) {
-    let t = &out.trace;
-    let sum =
-        |f: fn(&bonsai_rs::search::nni::NniRound) -> usize| -> usize { t.iter().map(f).sum() };
-    println!(
-        "nni: {} moves over {} rounds; totals eligible {} proposed {} changed {} improving {}",
-        out.n_moves,
-        out.rounds,
-        sum(|r| r.eligible),
-        sum(|r| r.proposed),
-        sum(|r| r.changed),
-        sum(|r| r.improving)
-    );
-    let show: Vec<usize> = if t.len() <= 12 {
-        (0..t.len()).collect()
-    } else {
-        (0..6).chain(t.len() - 6..t.len()).collect()
-    };
-    println!("round  eligible  proposed  changed  improving  best_gain");
-    for i in show {
-        let r = &t[i];
-        println!(
-            "{:>5}  {:>8}  {:>8}  {:>7}  {:>9}  {:>10.3}",
-            i + 1,
-            r.eligible,
-            r.proposed,
-            r.changed,
-            r.improving,
-            r.best_gain
-        );
-    }
+fn print_moves(out: &NniResult) {
+    println!("nni: {} moves over {} rounds", out.n_moves, out.rounds);
 }
 
 fn finish(label: &str, mut tree: Tree, fx: &Fixture, params: &BonsaiParams, secs: f64) {
@@ -477,7 +447,7 @@ fn main() {
             let t0 = Instant::now();
             let out = nni(&start, leaves, Some(params.nni)).expect("nni");
             let secs = t0.elapsed().as_secs_f64();
-            print_trace(&out);
+            print_moves(&out);
             println!(
                 "nni: loglik {:.3} rf {}  ({:.1} s)",
                 out.loglik,
@@ -590,7 +560,7 @@ fn main() {
             let l = optimise(&mut tree, leaves, &params);
             println!("foreign after step 7: loglik {l:.3}");
             let out = nni(&tree, leaves, Some(params.nni)).expect("nni");
-            print_trace(&out);
+            print_moves(&out);
             println!(
                 "foreign after our nni: loglik {:.3} rf {}",
                 out.loglik,

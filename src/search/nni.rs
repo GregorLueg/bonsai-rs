@@ -165,21 +165,6 @@ pub struct NniApprox {
     pub rescore_radius: usize,
 }
 
-impl NniApprox {
-    /// Build the knobs explicitly.
-    ///
-    /// ### Params
-    ///
-    /// * `rescore_radius` - See [`NniApprox::rescore_radius`]
-    ///
-    /// ### Returns
-    ///
-    /// The knobs.
-    pub fn new(rescore_radius: usize) -> Self {
-        Self { rescore_radius }
-    }
-}
-
 impl Default for NniApprox {
     /// Every approximation at its default.
     ///
@@ -283,36 +268,11 @@ pub struct NniResult {
     /// Number of greedy rounds, the last of which found no improving move.
     /// Zero for a run of the random phase alone.
     pub rounds: usize,
-    /// What every greedy round saw, in order. Empty for the random phase.
-    pub trace: Vec<NniRound>,
 }
 
-/// What scanning one edge produced: that edge's contribution to the round's
-/// tallies, and the proposal itself when it yielded one worth taking.
-type ScannedEdge<T> = (NniRound, Option<(f64, u32, CentreStar<T>)>);
-
-/// Where one greedy round's candidates fell out.
-///
-/// The counts nest: every edge is either eligible or not, every eligible edge
-/// either produced a proposal or the primitive merged nothing, every proposal
-/// either changed a split or rebuilt the tree it came from, and every changed
-/// proposal either cleared [`StarParams::min_gain`] or did not. Kept because
-/// "the phase found nothing" and "the phase rejected everything it found" look
-/// identical from outside and call for opposite fixes.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NniRound {
-    /// Edges whose collapse leaves a star of at least four members.
-    pub eligible: usize,
-    /// Of those, edges where the primitive merged at least one pair.
-    pub proposed: usize,
-    /// Of those, proposals whose splits differ from the current tree's.
-    pub changed: usize,
-    /// Of those, proposals whose exact gain clears the floor.
-    pub improving: usize,
-    /// The best exact gain among the changed proposals, whether or not it
-    /// cleared the floor; `NEG_INFINITY` when nothing changed a split.
-    pub best_gain: f64,
-}
+/// What scanning one edge produced: its exact gain when it changes a split,
+/// minus infinity otherwise, and the proposal when that gain clears the floor.
+type ScannedEdge<T> = (f64, Option<(f64, u32, CentreStar<T>)>);
 
 //////////
 // Rows //
@@ -740,9 +700,7 @@ fn rebuilds_the_same_splits<T>(
 ///
 /// ### Returns
 ///
-/// The edge's tallies, whose `best_gain` is its exact gain when it changes a
-/// split, and the proposal when that gain clears the floor; or the error the
-/// primitive failed with.
+/// See [`ScannedEdge`]; or the error the primitive failed with.
 fn scan_edge<T: BonsaiFloat>(
     tree: &impl Topology,
     rows: &impl EdgeRows<T>,
@@ -751,23 +709,18 @@ fn scan_edge<T: BonsaiFloat>(
     star_params: StarParams,
     scratch: &mut PeelScratch<T>,
 ) -> Result<ScannedEdge<T>, BonsaiErrors> {
-    let mut seen = NniRound {
-        best_gain: f64::NEG_INFINITY,
-        ..NniRound::default()
-    };
+    let nothing = (f64::NEG_INFINITY, None);
     let Some(l) = tree.parent(k) else {
-        return Ok((seen, None));
+        return Ok(nothing);
     };
     let Some(star) = collapsed_star(tree, rows, k) else {
-        return Ok((seen, None));
+        return Ok(nothing);
     };
-    seen.eligible = 1;
     let n_leaves = tree.n_leaves();
     let result = resolve_star(star.view(), Some(star_params))?;
     if result.merges.is_empty() {
-        return Ok((seen, None));
+        return Ok(nothing);
     }
-    seen.proposed = 1;
     // A proposal that puts the same subtrees back where they were is not an
     // interchange: it is a reoptimisation of the three branches the star
     // primitive creates at `l`. Those nearly always gain a little, and taking
@@ -792,18 +745,15 @@ fn scan_edge<T: BonsaiFloat>(
         })
         .collect();
     if rebuilds_the_same_splits(&result, k_lo, k_hi, &member_leaves, n_leaves) {
-        return Ok((seen, None));
+        return Ok(nothing);
     }
-    seen.changed = 1;
 
     let gain: f64 = result.merges.iter().map(|x| x.gain).sum::<f64>()
         + collapse_delta(tree, rows, k, l, &star, scratch);
-    seen.best_gain = gain;
     if gain > star_params.min_gain {
-        seen.improving = 1;
-        Ok((seen, Some((gain, k, star))))
+        Ok((gain, Some((gain, k, star))))
     } else {
-        Ok((seen, None))
+        Ok((gain, None))
     }
 }
 
@@ -920,7 +870,6 @@ pub fn nni_random<T: BonsaiFloat>(
         loglik,
         n_moves,
         rounds: 0,
-        trace: Vec::new(),
     })
 }
 
@@ -987,7 +936,6 @@ pub fn nni_greedy<T: BonsaiFloat>(
     let mut best: Option<f64> = None;
     let mut n_moves = 0usize;
     let mut rounds = 0usize;
-    let mut trace: Vec<NniRound> = Vec::new();
 
     while rounds < params.max_rounds {
         rounds += 1;
@@ -1006,11 +954,8 @@ pub fn nni_greedy<T: BonsaiFloat>(
         // order, so the reduction breaks ties on the lower node id and the
         // winner is the same at any thread count. No float is summed across
         // candidates, so there is nothing else for the order to change.
-        //
-        // The counts ride along with the winner. They are integers and a max,
-        // so the split order cannot change them.
         let edges: Vec<u32> = tree.internal_postorder().collect();
-        let (round, winner) = edges
+        let winner = edges
             .par_iter()
             .map_init(
                 || PeelScratch::<T>::new(leaves.n_features),
@@ -1019,28 +964,13 @@ pub fn nni_greedy<T: BonsaiFloat>(
                         down: &down,
                         up: &up,
                     };
-                    scan_edge(&tree, &rows, &below, k, params.star, scratch)
+                    scan_edge(&tree, &rows, &below, k, params.star, scratch).map(|(_, p)| p)
                 },
             )
             .try_reduce(
-                || {
-                    (
-                        NniRound {
-                            best_gain: f64::NEG_INFINITY,
-                            ..NniRound::default()
-                        },
-                        None,
-                    )
-                },
-                |(ra, a), (rb, b)| {
-                    let round = NniRound {
-                        eligible: ra.eligible + rb.eligible,
-                        proposed: ra.proposed + rb.proposed,
-                        changed: ra.changed + rb.changed,
-                        improving: ra.improving + rb.improving,
-                        best_gain: ra.best_gain.max(rb.best_gain),
-                    };
-                    let winner = match (a, b) {
+                || None,
+                |a, b| {
+                    Ok(match (a, b) {
                         (None, other) | (other, None) => other,
                         (Some(x), Some(y)) => {
                             if y.0 > x.0 || (y.0 == x.0 && y.1 < x.1) {
@@ -1049,11 +979,9 @@ pub fn nni_greedy<T: BonsaiFloat>(
                                 Some(x)
                             }
                         }
-                    };
-                    Ok((round, winner))
+                    })
                 },
             )?;
-        trace.push(round);
 
         match winner {
             None => break,
@@ -1075,7 +1003,6 @@ pub fn nni_greedy<T: BonsaiFloat>(
         loglik,
         n_moves,
         rounds,
-        trace,
     })
 }
 
@@ -1546,8 +1473,7 @@ impl<T: BonsaiFloat> Lazy<T> {
 ///
 /// ### Returns
 ///
-/// As [`nni_greedy`]. `trace` has one entry per round, counting only the edges
-/// that round actually scored.
+/// As [`nni_greedy`].
 fn nni_lazy<T: BonsaiFloat>(
     tree: &Tree,
     leaves: Leaves<'_, T>,
@@ -1557,7 +1483,6 @@ fn nni_lazy<T: BonsaiFloat>(
     let min_gain = params.star.min_gain;
     let mut n_moves = 0usize;
     let mut rounds = 0usize;
-    let mut trace: Vec<NniRound> = Vec::new();
     let mut cache: FxHashMap<u64, f64> = FxHashMap::default();
     let mut leaders = Leaders::default();
     let mut full = true;
@@ -1614,7 +1539,7 @@ fn nni_lazy<T: BonsaiFloat>(
             up
         };
 
-        let scanned: Vec<(u32, NniRound)> = {
+        let scanned: Vec<(u32, f64)> = {
             let rows = LiveRows {
                 store: &lazy.store,
                 up: &up,
@@ -1625,25 +1550,15 @@ fn nni_lazy<T: BonsaiFloat>(
                     || PeelScratch::<T>::new(leaves.n_features),
                     |scratch, &k| {
                         scan_edge(live, &rows, &lazy.below, k, params.star, scratch)
-                            .map(|(seen, _)| (k, seen))
+                            .map(|(gain, _)| (k, gain))
                     },
                 )
                 .collect::<Result<_, _>>()?
         };
-        let mut round = NniRound {
-            best_gain: f64::NEG_INFINITY,
-            ..NniRound::default()
-        };
-        for &(k, seen) in &scanned {
-            round.eligible += seen.eligible;
-            round.proposed += seen.proposed;
-            round.changed += seen.changed;
-            round.improving += seen.improving;
-            round.best_gain = round.best_gain.max(seen.best_gain);
-            cache.insert(lazy.word[k as usize], seen.best_gain);
-            leaders.set(k, seen.best_gain);
+        for &(k, gain) in &scanned {
+            cache.insert(lazy.word[k as usize], gain);
+            leaders.set(k, gain);
         }
-        trace.push(round);
 
         let mut scratch = PeelScratch::<T>::new(leaves.n_features);
         let winner = loop {
@@ -1655,10 +1570,10 @@ fn nni_lazy<T: BonsaiFloat>(
                 store: &lazy.store,
                 up: &up,
             };
-            let (seen, proposal) =
+            let (gain, proposal) =
                 scan_edge(live, &rows, &lazy.below, k, params.star, &mut scratch)?;
-            cache.insert(lazy.word[k as usize], seen.best_gain);
-            leaders.set(k, seen.best_gain);
+            cache.insert(lazy.word[k as usize], gain);
+            leaders.set(k, gain);
             if let Some(found) = proposal.filter(|p| p.0 >= second) {
                 break Some(found);
             }
@@ -1706,7 +1621,6 @@ fn nni_lazy<T: BonsaiFloat>(
         loglik,
         n_moves,
         rounds,
-        trace,
     })
 }
 
@@ -2496,7 +2410,9 @@ mod tests {
         let wide = nni_greedy(
             &start,
             leaves,
-            with(NniSearch::Approximate(NniApprox::new(4 * n))),
+            with(NniSearch::Approximate(NniApprox {
+                rescore_radius: 4 * n,
+            })),
         )
         .expect("lazy");
         assert!(exact.n_moves > 0);
@@ -2524,7 +2440,9 @@ mod tests {
             let lazy = nni_greedy(
                 &start,
                 leaves,
-                with(NniSearch::Approximate(NniApprox::new(radius))),
+                with(NniSearch::Approximate(NniApprox {
+                    rescore_radius: radius,
+                })),
             )
             .expect("lazy");
             assert!(lazy.loglik > before, "radius {radius}");

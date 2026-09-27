@@ -283,25 +283,6 @@ pub struct SprApprox {
     pub recheck: bool,
 }
 
-impl SprApprox {
-    /// Build the knobs explicitly.
-    ///
-    /// ### Params
-    ///
-    /// * `revisit_radius` - See [`SprApprox::revisit_radius`]; `0` is off
-    /// * `recheck` - See [`SprApprox::recheck`]
-    ///
-    /// ### Returns
-    ///
-    /// The knobs.
-    pub fn new(revisit_radius: usize, recheck: bool) -> Self {
-        Self {
-            revisit_radius,
-            recheck,
-        }
-    }
-}
-
 impl Default for SprApprox {
     /// Every approximation at its measured default.
     ///
@@ -515,18 +496,6 @@ pub struct SprResult {
     pub gains: Vec<SprGain>,
     /// Number of sweeps over the tree, the last of which found nothing.
     pub rounds: usize,
-}
-
-impl SprResult {
-    /// Number of moves performed.
-    ///
-    /// ### Returns
-    ///
-    /// The move count.
-    #[inline]
-    pub fn n_moves(&self) -> usize {
-        self.gains.len()
-    }
 }
 
 ///////////////////////
@@ -3318,7 +3287,7 @@ mod tests {
         let mut state =
             NodeState::new(star.n_nodes(), p, leaves.means, leaves.precisions).expect("state");
         optimise_branch_lengths(&mut star, &mut state, None).expect("step 1");
-        let mut candidates = EllipsoidBounds::new(KnnCandidates::new(None), None);
+        let mut candidates = EllipsoidBounds::new(KnnCandidates::new(None));
         let (tree, _) = star_tree_with(
             Star {
                 means: leaves.means,
@@ -4059,7 +4028,7 @@ mod tests {
             .expect("spr");
             assert_eq!(robinson_foulds(&ordered.tree, &data.tree).expect("rf"), 0);
             assert_eq!(robinson_foulds(&random.tree, &data.tree).expect("rf"), 0);
-            assert!(ordered.n_moves() <= random.n_moves());
+            assert!(ordered.gains.len() <= random.gains.len());
         }
     }
 
@@ -4081,7 +4050,7 @@ mod tests {
             assert!(prune_subtree(&tree, x).expect("prune").is_none());
         }
         let out = spr(&tree, leaves, None).expect("spr");
-        assert_eq!(out.n_moves(), 0);
+        assert_eq!(out.gains.len(), 0);
         assert_eq!(out.rounds, 1);
         assert_eq!(splits(&out.tree), splits(&tree));
     }
@@ -4253,7 +4222,10 @@ mod tests {
         // A radius of zero switches the restriction off, which is the exact
         // search whatever else the approximate arm carries.
         for radius in [0, 4 * n] {
-            let got = with(SprSearch::Approximate(SprApprox::new(radius, false)));
+            let got = with(SprSearch::Approximate(SprApprox {
+                revisit_radius: radius,
+                recheck: false,
+            }));
             assert_eq!(got.rounds, all.rounds, "radius {radius}");
             assert_eq!(
                 got.loglik.to_bits(),
@@ -4284,7 +4256,10 @@ mod tests {
                 &start,
                 leaves,
                 Some(SprParams {
-                    search: SprSearch::Approximate(SprApprox::new(radius, false)),
+                    search: SprSearch::Approximate(SprApprox {
+                        revisit_radius: radius,
+                        recheck: false,
+                    }),
                     ..SprParams::default()
                 }),
             )
@@ -4362,9 +4337,9 @@ mod tests {
         // Some sixty candidates and a chunk of thirty-two, so this many moves
         // cannot all fall on chunk boundaries.
         assert!(
-            reference.n_moves() >= 8,
+            reference.gains.len() >= 8,
             "the fixture has to accept inside chunks, got {} moves",
-            reference.n_moves()
+            reference.gains.len()
         );
 
         for threads in [1usize, 3, 8] {
@@ -4380,7 +4355,7 @@ mod tests {
             );
             assert_eq!(got.tree.branches(), reference.tree.branches());
             assert_eq!(got.loglik.to_bits(), reference.loglik.to_bits());
-            assert_eq!(got.n_moves(), reference.n_moves());
+            assert_eq!(got.gains.len(), reference.gains.len());
             for (a, b) in got.gains.iter().zip(&reference.gains) {
                 assert_eq!(a.pruned, b.pruned);
                 assert_eq!(a.gain.to_bits(), b.gain.to_bits());
@@ -4404,7 +4379,7 @@ mod tests {
             };
             let start = optimised(&data.tree, leaves);
             let out = spr_round(&start, leaves, None).expect("round");
-            assert_eq!(out.n_moves(), 0, "seed {seed} moved a tree it should not");
+            assert_eq!(out.gains.len(), 0, "seed {seed} moved a tree it should not");
             assert_eq!(splits(&out.tree), splits(&start));
         }
     }
@@ -4440,7 +4415,7 @@ mod tests {
             assert_eq!(run.tree.branches(), runs[0].tree.branches());
             assert_eq!(splits(&run.tree), splits(&runs[0].tree));
             assert_eq!(run.loglik.to_bits(), runs[0].loglik.to_bits());
-            assert_eq!(run.n_moves(), runs[0].n_moves());
+            assert_eq!(run.gains.len(), runs[0].gains.len());
         }
     }
 
@@ -4581,7 +4556,7 @@ mod tests {
             );
             let again = spr(&first.tree, leaves, Some(params)).expect("spr");
             assert_eq!(
-                again.n_moves(),
+                again.gains.len(),
                 0,
                 "{n} by {p} kept moving after it stopped"
             );

@@ -1487,7 +1487,7 @@ pub fn star_tree<T: BonsaiFloat>(
 /// The two compose, bounds outermost:
 ///
 /// ```ignore
-/// let mut provider = EllipsoidBounds::new(KnnCandidates::new(None), None);
+/// let mut provider = EllipsoidBounds::new(KnnCandidates::new(None));
 /// let (tree, gain) = star_tree_with(star, None, &mut provider)?;
 /// ```
 ///

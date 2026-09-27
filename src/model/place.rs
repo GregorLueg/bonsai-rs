@@ -77,27 +77,6 @@ pub struct PlacementParams {
     pub n_starts: usize,
 }
 
-impl PlacementParams {
-    /// Build parameters explicitly.
-    ///
-    /// ### Params
-    ///
-    /// * `tolerance` - Beam tolerance in nats; `0.0` for greedy hill-climbing,
-    ///   `f64::INFINITY` for an exhaustive scan
-    /// * `n_starts` - Number of start points; clamped into `1..=n_nodes` by
-    ///   [`start_points`]
-    ///
-    /// ### Returns
-    ///
-    /// The parameters.
-    pub fn new(tolerance: f64, n_starts: usize) -> Self {
-        Self {
-            tolerance,
-            n_starts,
-        }
-    }
-}
-
 impl Default for PlacementParams {
     /// The shipped defaults: a tolerance of four nats and eight start points.
     ///
@@ -687,7 +666,10 @@ mod tests {
                     &fix.tree,
                     q,
                     |a| fix.eff(a),
-                    Some(PlacementParams::new(f64::INFINITY, 3)),
+                    Some(PlacementParams {
+                        tolerance: f64::INFINITY,
+                        n_starts: 3,
+                    }),
                 )
                 .expect("placement");
                 assert_eq!(got.node, node);
@@ -732,14 +714,20 @@ mod tests {
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(0.0, 1)),
+                Some(PlacementParams {
+                    tolerance: 0.0,
+                    n_starts: 1,
+                }),
             )
             .expect("placement");
             let many = place(
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(0.0, 8)),
+                Some(PlacementParams {
+                    tolerance: 0.0,
+                    n_starts: 8,
+                }),
             )
             .expect("placement");
             assert!(
@@ -813,7 +801,10 @@ mod tests {
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(tolerance, 4)),
+                Some(PlacementParams {
+                    tolerance,
+                    n_starts: 4,
+                }),
             )
             .expect("placement");
             if let Some(prev) = previous {
@@ -851,7 +842,10 @@ mod tests {
             &fix.tree,
             q,
             |a| fix.eff(a),
-            Some(PlacementParams::new(0.0, 1)),
+            Some(PlacementParams {
+                tolerance: 0.0,
+                n_starts: 1,
+            }),
         )
         .expect("placement");
         assert!(greedy.scored < fix.tree.n_nodes());
@@ -884,7 +878,10 @@ mod tests {
             &fix.tree,
             q,
             |a| fix.eff(a),
-            Some(PlacementParams::new(f64::INFINITY, 2)),
+            Some(PlacementParams {
+                tolerance: f64::INFINITY,
+                n_starts: 2,
+            }),
         )
         .expect("placement");
         assert_eq!(exhaustive.scored, 3);
@@ -908,7 +905,10 @@ mod tests {
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(f64::INFINITY, 1)),
+                Some(PlacementParams {
+                    tolerance: f64::INFINITY,
+                    n_starts: 1,
+                }),
             )
             .expect("placement");
             assert_eq!(got.scored, 7);
@@ -961,7 +961,10 @@ mod tests {
             &fix.tree,
             q,
             |a| fix.eff(a),
-            Some(PlacementParams::new(f64::INFINITY, 1)),
+            Some(PlacementParams {
+                tolerance: f64::INFINITY,
+                n_starts: 1,
+            }),
         )
         .expect("placement");
         for n_starts in [2usize, 5, 31, 1000] {
@@ -969,7 +972,10 @@ mod tests {
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(f64::INFINITY, n_starts)),
+                Some(PlacementParams {
+                    tolerance: f64::INFINITY,
+                    n_starts,
+                }),
             )
             .expect("placement");
             assert_eq!(got.node, reference.node);

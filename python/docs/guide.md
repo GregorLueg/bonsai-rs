@@ -58,8 +58,10 @@ first call to cap it; after that it's fixed.
 
 ## Large datasets
 
-The largest run measured is 10,000 cells by 2,767 genes of Sanity-preprocessed
-Baron pancreas in 144 seconds on a ten-core laptop; see the [comparison](https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md).
+On a ten-core laptop the search takes 72 seconds on 10,000 cells by 2,767 genes
+of Sanity-preprocessed Baron pancreas and 208 seconds on 25,000 by 2,846; a
+synthetic 65,536 cells by 1,000 features takes 226 seconds. See the
+[comparison](https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md).
 
 
 ## The start tree

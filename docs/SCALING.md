@@ -1,9 +1,29 @@
 # Scaling to a million cells
 
-A proposal, 2026-09-26. Nothing here has been built or run. Every number is
-either measured elsewhere in this repository (and cited), taken from the paper,
-or arithmetic flagged as such. The effect of every proposed change is
-**unmeasured**; section 8 lists the experiments that would settle each one.
+A proposal, 2026-09-26. Every number is either measured elsewhere in this
+repository (and cited), taken from the paper, or arithmetic flagged as such.
+The effect of every proposed change is **unmeasured** unless the status below
+says otherwise; section 8 lists the experiments that would settle each one.
+
+## Status, 2026-09-27
+
+- **E0 is done, and section 1's diagnosis was half right.** SPR's per-move
+  bookkeeping was `O(n)` and grew as `n^1.96` from 8k to 32k cells. But the
+  accept path was 5 per cent of SPR at 25k. The cost was building three trees
+  for every proposal that moved something, and re-proposing rechecked moves one
+  at a time.
+- **The incremental arena is built**, for SPR and NNI's lazy phase
+  ([design](DESIGN.md#search-topology)). SPR scores moves on views without
+  building anything and applies an accepted one to the changed paths only. SPR
+  grows about `n^1.08` from 65,536 to 131,072 cells on synthetic balanced data,
+  so section 1's quadratic SPR is gone. NNI's per-round settle is gone too.
+- **What still walls a million cells:** memory (section 1, unchanged), and step
+  8's polytomy loop, which rescans and rebuilds the arena after every
+  resolution and is capped at 64 sweeps for that reason. NNI grows about
+  `n^1.4` from 65k to 131k; its full edge scans are the untimed suspect.
+- **Partitioned refinement** (sections 3 to 5) is still unbuilt. With SPR near
+  linear, its case now rests on memory and on coarse-grained parallelism rather
+  than on SPR's work.
 
 ## The short version
 
@@ -196,20 +216,23 @@ it. `f32` storage should hold it, but that's one of the open items in SPEC 16
 
 ### Cost, extrapolated
 
-Steps 3 to 8 of the current pipeline took 68.7 s at 5,000 cells and 204 s at
-10,000 on ten cores ([performance](PERFORMANCE.md#now)). Two points, one gene
-panel.
+Steps 3 to 8 took 30.1 s at 5,000 cells and 66.5 s at 10,000 on ten cores in
+0.2.0 ([performance](PERFORMANCE.md#now)). Two points, one gene panel.
 
 | `B` | pieces at 1M | one pass, pieces at those times |
 |---|---|---|
-| 5,000 | 200 | about 3.8 h |
-| 10,000 | 100 | about 5.7 h |
+| 5,000 | 200 | about 1.7 h |
+| 10,000 | 100 | about 1.8 h |
 
 Per pass, and with the per-piece times measured with ten threads per piece.
-Running ten pieces single-threaded side by side could do better, because a third
-of SPR's thread time is idle ([performance](PERFORMANCE.md#now)), but that's
-unmeasured. Smaller `B` is cheaper per pass (`n * B^0.6`) and leaves more
-boundary, so it needs more passes. The optimum is an experiment.
+Running ten pieces single-threaded side by side might do better if SPR's
+threads still idle at the chunk barrier, but that's unmeasured. With steps 3 to
+8 now growing about `n^1.15`, smaller `B` barely lowers the cost of a pass and
+leaves more boundary, so it needs more passes.
+
+The same arithmetic for the monolithic run, 208 s at 25,000 cells extrapolated
+at `n^1.15`, gives about 4 h at 1M. Also a prediction, and one that ignores
+memory, which is the wall the monolithic run hits first.
 
 Two or three passes would put a 1M-cell run at hours rather than the paper's
 week. **That's a prediction from extrapolated per-piece times, not a result.**
@@ -317,7 +340,7 @@ that's where Ward is used.
 Each one either kills the proposal or earns the next. Nothing past E1 should
 start until the machine is idle, per rule 12.
 
-1. **E0, confirm the diagnosis.** Profile SPR at 10,000 and 40,000 synthetic
+1. **E0, confirm the diagnosis.** Done 2026-09-27; see the status at the top. Profile SPR at 10,000 and 40,000 synthetic
    cells (the simulator already exists). Split each proposal's time into arena
    passes and scoring. Expected: scoring dominates at 10k, bookkeeping at 40k. If
    bookkeeping doesn't grow, section 1 is wrong and the case for decomposition
@@ -338,7 +361,7 @@ start until the machine is idle, per rule 12.
    Exponent of the whole run in `n`, and peak memory. Here the monolithic run
    stops being a reference and the loglikelihood is all there is.
 
-Separately, and worth doing regardless: an incremental arena for SPR, so a
+Separately, and worth doing regardless (built 2026-09-27, see the status at the top): an incremental arena for SPR, so a
 proposal touches the nodes it changes and not every node. Link-cut or Euler-tour
 trees are the textbook answer; a lighter one is to stop relabelling on proposal
 and relabel once on acceptance. It helps every route above, the backbone

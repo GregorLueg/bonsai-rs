@@ -25,14 +25,46 @@ things fail silently:
 `Tree::from_parents` relabels internal nodes to enforce it. Free for callers:
 internal rows are computed, never supplied.
 
+## Search topology
+
+The arena renumbers on every topology change, and so does everything keyed by
+node index: `O(n)` a move, with a number of moves that grows with `n`. SPR and
+NNI's lazy phase therefore run on `search::live::LiveTree` instead, built from
+the arena at the start of the step and turned back into one at the end.
+
+- **Stable ids.** A node keeps its id while it exists; rows, leaf words and the
+  word index are keyed by it. An accepted move touches only the paths above
+  the cut and the attachment.
+- **Arena order kept per level.** The beam search's start points are ranks in
+  arena order, and a row's bits depend on the order its children are summed
+  in, so the live tree reproduces the order the arena would have. A level is a
+  slot array with room at both ends and a Fenwick tree for rank and select.
+- **Numbering by assembly.** Nodes a move creates are numbered as the arena
+  assembly numbers them: a level keeps its previous order, a node whose height
+  changed joins its new level at the front or the back, new nodes go last. Before
+  2026-09-27 a star resolution renumbered in traversal order, which no local
+  update can reproduce. The change moved trees within the seed spread at 5,000
+  cells ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)), so it
+  was judged by a quality sweep, not a tree diff.
+- **Moves scored without building anything.** `search::masked` views the pruned
+  and regrafted trees as overrides along those two paths. SPR accepts on a
+  fixed-point loglikelihood total, so a move's score is the current total less
+  the terms it removes plus the terms it forms, whatever order they are summed
+  in. A cut the views can't reproduce cheaply (a degree-two root, a binary
+  root) falls back to the built path. Debug builds check every proposal and
+  every accepted move against that path.
+
 ## State layout
 
 `NodeState`, row-major `[node][feature]`, sequential. Every prune goes through
 it. A second, feature-blocked parallel layout was faster on the kernel, only
 ever called by a benchmark, and deleted; [performance](PERFORMANCE.md) has the story.
 
-Where there's parallelism over a sweep it's over features, since the model
-factorises there. A ladder costs what a balanced tree costs.
+The prune and the up sweep are parallel over the nodes of a level: a level's
+rows are contiguous, and each reads only rows below it. A ladder has one node
+per level and so runs on one core. Search trees are shallow (mean leaf depth
+near `log2 n` after the linkage start), and the unbalanced synthetic set gained
+as much as the balanced ones; a pure ladder is unmeasured.
 
 ## Numerics
 
@@ -66,9 +98,11 @@ halve anything transcribed.
 ## Determinism
 
 Same input, same tree, any thread count. Parallel reductions collect per-unit
-contributions and sum in a fixed order. The NNI scan keeps a running best with
-ties to the lower node id, which is what a sequential scan does anyway. Tests
-pin this at 1, 3 and 8 threads. No `.sum()` on a `ParallelIterator`.
+contributions and sum in a fixed order: the prune per level in ascending node
+index, SPR in fixed-point integers, which are associative. The NNI scan keeps a
+running best with ties to the lower node id, which is what a sequential scan
+does anyway; the lazy phase's gain index breaks ties by arena rank. Tests pin
+this at 1, 3 and 8 threads. No `.sum()` on a `ParallelIterator`.
 
 ## Pipeline
 
@@ -117,8 +151,9 @@ scan.
 
 Every threshold is a named `const` citing an SI equation or our measurement.
 Nothing comes from the published source (see [provenance](../PROVENANCE.md)). Ours: neighbour
-count `k`, kNN rebuild cadence, placement tolerance, ellipsoid `nsteps`
-schedule, SPR revisit radius, NNI rescore radius.
+count `k`, kNN rebuild cadence, placement tolerance, the ellipsoid `nsteps`
+start and online schedule (constants, no knob), SPR revisit radius, NNI rescore
+radius.
 
 `SprSearch` and `NniSearch` follow `StartTree`: `Exact` is SPEC 9.3 and 9.4,
 `Approximate` is the default with our shortcuts, each measured across shapes and

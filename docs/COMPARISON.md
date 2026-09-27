@@ -20,24 +20,24 @@ both. `512 s32` is the same 512 cells at another seed with a harder gene panel.
 
 | cells | genes | method | seconds | Robinson-Foulds | distance recovery | loglikelihood, as given | loglikelihood, refit |
 |---|---|---|---|---|---|---|---|
-| 512 | 2,382 | bonsai-rs | 3.5 | 136 | 0.652 | -527,187 | -527,187 |
+| 512 | 2,382 | bonsai-rs | 2.9 | 136 | 0.652 | -527,187 | -527,187 |
 | 512 | 2,382 | published | 386 | 146 | 0.633 | -527,255 | -527,248 |
 | 512 | 2,382 | truth | | 0 | 0.733 | | -528,223 |
-| 512 s32 | 2,302 | bonsai-rs | 4.5 | 221 | 0.317 | -513,570 | -513,570 |
+| 512 s32 | 2,302 | bonsai-rs | 3.4 | 222 | 0.319 | -513,568 | -513,568 |
 | 512 s32 | 2,302 | published | 368 | 240 | 0.303 | -513,553 | -513,536 |
 | 512 s32 | 2,302 | truth | | 0 | 0.500 | | -515,853 |
-| 5,000 | 2,701 | bonsai-rs | 53 | 1,301 | 0.667 | -5,557,888 | -5,557,888 |
+| 5,000 | 2,701 | bonsai-rs | 32 | 1,287 | 0.666 | -5,557,911 | -5,557,911 |
 | 5,000 | 2,701 | published | 4,868 | 1,937 | 0.496 | -5,563,770 | -5,561,535 |
 | 5,000 | 2,701 | published, backbone 2,048 | 2,514 | 1,899 | 0.578 | -5,571,002 | -5,565,342 |
 | 5,000 | 2,701 | published, backbone 1,000 | 1,794 | 1,959 | 0.569 | -5,572,684 | -5,566,018 |
 | 5,000 | 2,701 | truth | | 0 | 0.679 | | -5,571,449 |
-| 10,000 | 2,767 | bonsai-rs | 144 | 2,612 | 0.386 | -11,253,773 | -11,253,773 |
+| 10,000 | 2,767 | bonsai-rs | 72 | 2,619 | 0.409 | -11,253,736 | -11,253,736 |
 | 10,000 | 2,767 | published | 16,062 | 5,149 | 0.281 | -11,280,721 | -11,274,900 |
 | 10,000 | 2,767 | published, backbone 2,048 | 3,529 | 3,946 | 0.368 | -11,280,324 | -11,264,651 |
 | 10,000 | 2,767 | published, backbone 1,000 | 3,594 | 4,191 | 0.347 | -11,284,311 | -11,268,274 |
 | 10,000 | 2,767 | truth | | 0 | 0.461 | | -11,282,910 |
 
-bonsai-rs is `BonsaiParams::default()` in 0.2.0, 2026-09-26. Published is its
+bonsai-rs is `BonsaiParams::default()` in 0.2.0, 2026-09-27, ten threads. Published is its
 standard run on one core; the published backbone is its backbone-based mode
 with `n_initial_cells` 2,048 or 1,000 and `growth_factor_guide` 10, one
 process. Its default of 10,000 initial cells needs more cells than these sets
@@ -67,33 +67,35 @@ topology. The loglikelihood is what the search optimises; Robinson-Foulds and
 recovery are what it's for.
 
 - **512 is a tie.** 136 splits against 146, recovery 0.652 against 0.633, 61
-  nats ahead after the refit. The replicate flips it: 221 against 240 and 0.317
-  against 0.303, but 34 nats behind.
+  nats ahead after the refit. The replicate flips it: 222 against 240 and 0.319
+  against 0.303, but 32 nats behind.
 - **From 5,000 bonsai-rs pulls ahead**, and at 10,000 by a lot: 2,612 against
-  5,149 splits, 21,000 nats after the refit.
+  5,149 splits, 21,000 nats after the refit, and 220 times faster.
 - **The refit matters for the published trees.** It recovers 2,200 nats at 5,000
   and 5,800 at 10,000; 15,700 for the 10,000 backbone. The as-given column
-  overstates bonsai-rs's lead by 60 per cent at 5,000 and 28 at 10,000.
+  overstates bonsai-rs's lead by 62 per cent at 5,000 and 28 at 10,000.
 - **The published backbone pays off in the published implementation**: 2 to 4.5
   times faster than its standard run, and at 10,000 better on splits and on the
-  refit loglikelihood. It is still 25 times slower than bonsai-rs's standard run
-  at 10,000 and behind it on every column.
-- **The two trees differ from each other** by 26, 111, 1,472 and 4,285 splits.
+  refit loglikelihood. It is still 50 to 80 times slower than bonsai-rs's
+  standard run at 5,000 and 10,000, and behind it on every column.
+- **The two trees differ from each other** by 26, 110, 1,498 and 4,236 splits.
   Equal scores against the truth don't mean the same tree.
 - **The published implementation is deterministic.** A 2026-09-14 rerun gave
   byte-identical Newick at all four sizes. Wall times moved under half a per
   cent where the first run had an idle machine, 30 per cent at 512 and 8 at
   10,000 where it hadn't.
 - **Recovery at 10,000 depends on SPR's candidate order.** 0.2.0 re-applies the
-  rest of a chunk after an acceptance (`SprApprox::recheck`) and lands at 0.386;
-  with that off the same data gives 0.476, and random candidate orders alone
-  span 0.40 to 0.48 ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)).
+  rest of a chunk after an acceptance (`SprApprox::recheck`) and lands at 0.409;
+  0.1.1, which didn't, gives 0.476 on the same data, and random candidate orders
+  alone span 0.40 to 0.48 ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)).
   Recovery above the truth's 0.461 is possible because the truth's branch
   lengths are expected displacements and ours are fitted to what was realised.
 
 ## Counts to tree
 
-Raw UMIs to finished tree, 2026-09-25, on **one node**: ten-core M1 Max, 64 GB,
+Measured with 0.1.1 and not re-run since; 0.2.0's search is faster (see
+[speed and quality](#speed-and-quality) for the same data sets). Raw UMIs to
+finished tree, 2026-09-25, on **one node**: ten-core M1 Max, 64 GB,
 each run alone. The published implementation can run MPI across nodes; nothing
 here speaks to a cluster.
 
@@ -176,6 +178,9 @@ pairs for every tree.
 ![distance recovery at 10,000 cells, counts to tree](figures/n10000_e2e_distance_recovery.png)
 
 ## What the trees look like
+
+This section and the three after it were measured on the 0.1.0 trees of
+2026-09-14 and have not been regenerated for 0.2.0.
 
 ![radial layouts at 10,000 cells](figures/n10000_tree_layout.png)
 

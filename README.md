@@ -59,7 +59,7 @@ and adds `ingest::from_sanity_output`: transpose to `[cell][gene]`, undo the
 prior shrinkage (S5), drop and report ill-conditioned genes.
 
 ```toml
-bonsai-rs = { version = "0.1", features = ["sanity"] }
+bonsai-rs = { version = "0.2", features = ["sanity"] }
 ```
 
 ```rust
@@ -113,16 +113,23 @@ same input, same scorer:
 
 | cells | genes | | seconds | Robinson-Foulds | distance recovery |
 |---|---|---|---|---|---|
-| 512 | 2,382 | bonsai-rs | 3.5 | 147 | 0.591 |
+| 512 | 2,382 | bonsai-rs | 2.9 | 136 | 0.652 |
 | 512 | 2,382 | published | 386 | 146 | 0.633 |
-| 5,000 | 2,701 | bonsai-rs | 70 | 1288 | 0.666 |
-| 5,000 | 2,701 | published | 4,868 | 1937 | 0.496 |
-| 10,000 | 2,767 | bonsai-rs | 210 | 2624 | 0.476 |
-| 10,000 | 2,767 | published | 16,062 | 5149 | 0.281 |
+| 5,000 | 2,701 | bonsai-rs | 32 | 1,287 | 0.666 |
+| 5,000 | 2,701 | published | 4,868 | 1,937 | 0.496 |
+| 5,000 | 2,701 | published, backbone 2,048 | 2,514 | 1,899 | 0.578 |
+| 5,000 | 2,701 | published, backbone 1,000 | 1,794 | 1,959 | 0.569 |
+| 10,000 | 2,767 | bonsai-rs | 72 | 2,619 | 0.409 |
+| 10,000 | 2,767 | published | 16,062 | 5,149 | 0.281 |
+| 10,000 | 2,767 | published, backbone 2,048 | 3,529 | 3,946 | 0.368 |
+| 10,000 | 2,767 | published, backbone 1,000 | 3,594 | 4,191 | 0.347 |
 
-69x and 76x faster at the larger sizes and closer to the truth on both metrics.
-At 512 it's a tie on topology and the published one is ahead on recovery.
-Timings aren't like for like; [comparison](docs/COMPARISON.md) has the caveats.
+The published backbone mode is its fast route for large data: built on a
+subset of 2,048 or 1,000 cells, the rest placed onto it. bonsai-rs is 50 to 80
+times faster than that at 5,000 and 10,000 cells, 150 and 220 times faster than
+the published standard run, and closer to the truth on both metrics. At 512
+it's a tie. Timings aren't like for like (ten threads against one process);
+[comparison](docs/COMPARISON.md) has the caveats and the loglikelihoods.
 
 ### Exact or approximate search
 
@@ -131,20 +138,24 @@ the run. As the paper specifies them, every sweep revisits every subtree and
 every edge. The default skips that:
 
 - **SPR** re-proposes only subtrees within five edges of what the last sweep
-  changed. Within a few nats of exact on every dataset measured.
+  changed, and after an acceptance re-applies the rest of its chunk instead of
+  proposing it again.
 - **NNI** caches each edge's gain and rescores only near the last move. Same
   finished tree as exact on all thirteen datasets measured.
 
-Search time on the same input (counts to tree, see
-[comparison](docs/COMPARISON.md)):
+Full search on the headline data above, 2026-09-27:
 
-| cells | exact | approximate | Robinson-Foulds, exact / approximate |
-|---|---|---|---|
-| 512 | 4.2 s | 3.5 s | 136 / 137 |
-| 5,000 | 117.2 s | 60.4 s | 1,285 / 1,277 |
-| 10,000 | 631.0 s | 177.1 s | 2,607 / 2,627 |
+| cells | exact | approximate | loglikelihood, exact / approximate | Robinson-Foulds | recovery |
+|---|---|---|---|---|---|
+| 512 | 4.9 s | 2.9 s | -527,187 / -527,187 | 136 / 136 | 0.656 / 0.652 |
+| 5,000 | 107 s | 32 s | -5,558,395 / -5,557,911 | 1,324 / 1,287 | 0.538 / 0.666 |
+| 10,000 | 533 s | 72 s | -11,252,144 / -11,253,736 | 2,623 / 2,619 | 0.480 / 0.409 |
 
-The quality differences are inside the run-to-run spread on real data.
+One run each. At 10,000 the approximate search is 1,600 nats and 0.07
+recovery behind, inside the spread SPR's candidate order alone produces there
+([performance](docs/PERFORMANCE.md#how-much-one-real-data-run-says)). At 5,000
+the exact search is 480 nats and 0.13 recovery behind, slightly outside that
+spread.
 
 Want the search exactly as the paper specifies it? It's one setting away:
 

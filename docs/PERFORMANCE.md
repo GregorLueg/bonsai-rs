@@ -6,33 +6,36 @@ this file started 2026-09-12, so rows dated then were measured on or before it.
 
 ## Now
 
-`BonsaiParams::default()` on Sanity-preprocessed Baron, 2026-09-25, load average
-6 to 7:
+`BonsaiParams::default()` in 0.2.0 on Sanity-preprocessed Baron, 2026-09-27:
 
-| step | 512 | 5,000 | 10,000 | share at 10,000 |
-|---|---|---|---|---|
-| 1-2 linkage | 0.04 s | 1.7 s | 5.9 s | 3% |
-| 3 polytomy | 0.01 s | 0.1 s | 0.3 s | 0% |
-| 4 branch | 0.7 s | 8.9 s | 26.1 s | 12% |
-| 5 SPR | 1.9 s | 42.1 s | 128.0 s | 61% |
-| 6 NNI | 0.1 s | 5.9 s | 17.0 s | 8% |
-| 7 branch | 0.7 s | 7.2 s | 20.3 s | 10% |
-| 8 collapse | 0.05 s | 4.5 s | 12.6 s | 6% |
-| total | 3.5 s | 70.4 s | 210.2 s | |
+| step | 512 | 5,000 | 10,000 | 25,000 | share at 25,000 |
+|---|---|---|---|---|---|
+| 1-2 linkage | 0.06 s | 1.6 s | 5.9 s | 26.1 s | 13% |
+| 3 polytomy | 0.01 s | 0.05 s | 0.1 s | 0.3 s | 0% |
+| 4 branch | 0.3 s | 2.9 s | 7.3 s | 15.7 s | 8% |
+| 5 SPR | 1.9 s | 20.0 s | 45.8 s | 125.0 s | 60% |
+| 6 NNI | 0.2 s | 2.2 s | 4.7 s | 19.3 s | 9% |
+| 7 branch | 0.3 s | 3.3 s | 5.9 s | 9.6 s | 5% |
+| 8 collapse | 0.02 s | 1.7 s | 2.7 s | 12.2 s | 6% |
+| total | 2.9 s | 31.7 s | 72.4 s | 208.3 s | |
 
-On 2026-09-13 the same runs took 4.7 s, 166 s and 611 s. From 5,000 to 10,000
-cells: total `n^1.58`, SPR `n^1.60`, NNI `n^1.53`. Two points over two gene
-panels, so a slope, not a law.
+0.1.1 took 203 s at 10,000 and 1,029 s at 25,000 on the same data and the same
+day. From 10,000 to 25,000 cells: total `n^1.15`, SPR `n^1.10`, NNI `n^1.54`,
+linkage `n^1.63`, step 8 `n^1.64`. Two points over two gene panels, so a slope,
+not a law. On the synthetic 65,536 by 1,000 set the full search takes 226 s,
+SPR 148 s of it.
 
-- SPR is three fifths of the run, branch optimisation (4, 7, 8) over a quarter.
-  Neither has a safe approximation left; the log has the ones that failed.
-- Full-tree sweeps are small: prune plus up-sweep is 2.8 per cent of busy thread
-  time at 5,000.
-- A third of SPR's thread time is idle. Round one accepts a move every few
-  candidates, so chunks sit at the floor of eight proposals on ten threads; a
-  bigger floor was slower.
-- Hottest code by self time: `edge_newton_simd`, `split_derivative`, `log`,
-  all in the branch solve inside merges and placements.
+- SPR is still three fifths of the run, but close to linear: it runs on a live
+  tree with stable ids and builds nothing to score a move
+  ([design](DESIGN.md#search-topology)).
+- The steepest steps are now the linkage, NNI and step 8. NNI's per-move
+  bookkeeping is gone and its full edge scans are the untimed suspect; step 8's
+  polytomy loop still rebuilds the arena per resolution.
+- The branch solves (4, 7 and 8) are under a fifth of the run since the
+  prune and up sweep went level-parallel.
+- SPR's thread utilisation has not been re-measured since the live tree; before
+  it, a sampled profile at 25,000 showed about half the thread time idle at the
+  chunk barrier.
 
 Counts to tree end to end is in [comparison](COMPARISON.md).
 
@@ -98,6 +101,10 @@ Counts to tree end to end is in [comparison](COMPARISON.md).
 | 2026-09-24 | SPR revisit radius 5, the default `SprSearch::Approximate` | steps 5 to 8 132.7 s to 84.8 s at 5,000 and 461.0 s to 257.8 s at 10,000, within a few nats everywhere; see [Revisit radius](#revisit-radius) |
 | 2026-09-25 | Lazy NNI greedy phase, radius 5, the default `NniSearch::Approximate` | step 6 29.6 s to 5.9 s at 5,000 and 99.4 s to 16.5 s at 10,000, finished tree identical to the exact phase on all thirteen datasets; see [Lazy NNI](#lazy-nni) |
 | 2026-09-25 | SPR arenas built by `Tree::from_level_ordered`, skipping the relabel `from_parents` does | step 5 42.3 s to 41.4 s at 5,000 and 125.3 s to 121.3 s at 10,000, byte-identical tree |
+| 2026-09-27 | SPR scores moves on masked views with a fixed-point total, reruns a chunk's rechecks in parallel, reuses the accepted move's views | step 5 81.7 s to 56.0 s at 10,000, 256.3 s to 148.1 s at 25,000, 1,014.6 s to 320.1 s at 65,536; SPR 32k to 65k `n^1.94` to `n^1.59`; identical trees on eleven sets |
+| 2026-09-27 | Prune and up sweep parallel over the nodes of a level | steps 4 and 7 3.4 to 4.1x on five sets (25.5 s to 7.3 s and 19.1 s to 5.9 s at 10,000), identical trees |
+| 2026-09-27 | SPR on a live tree with stable ids, accepted moves applied to the changed paths only | step 5 384.0 s to 151.8 s at 65,536 and 1,244.5 s to 321.7 s at 131,072; SPR 65k to 131k `n^1.08`; identical trees |
+| 2026-09-27 | NNI lazy phase on the live tree, with a gain index and per-round up rows | step 6 69.1 s to 41.2 s at 131,072, flat below 25,000 where the edge scans dominate; identical trees on twelve sets |
 
 The big wins all stop materialising things: lazy rows form only what a proposal
 reads, the NNI filter tests the star result instead of building a tree, the slot
@@ -134,6 +141,7 @@ slot per node, the NNI scan breaks ties on the lower node id.
 | 2026-09-25 | SPR proposal chunk floor other than 8 | 2 to 6 flat, 10 to 32 slower (46.8 s to 70.4 s against 42.1 s at 5,000); the tree is identical at every floor, so the existing 8 stands |
 | 2026-09-25 | Branch tolerance 1e-8 or 1e-7 on steps 4 and 7 instead of 1e-10 | saves 5 to 25 s; at 1e-8 landed in the worse basin at both 5,000 and 10,000, recovery 0.67 to 0.54 and 0.48 to 0.38; one draw each, see [How much one real-data run says](#how-much-one-real-data-run-says) |
 | 2026-09-25 | Repeating a discarded SPR proposal from its previous target alone | step 5 43.3 s to 37.1 s at 5,000, 490 nats worse after step 5; one draw, inside the spread, so not proven harmful but not worth 14 per cent |
+| 2026-09-27 | Writing rows element by element in the up and effective-leaf steps to skip zero-filling | slower; the loops stopped vectorising |
 
 ## Notes
 
@@ -148,6 +156,11 @@ slot per node, the NNI scan breaks ties on the lower node id.
   over a sixteenfold growth in `n`.
 - **SPR leaving work for NNI at 5k to 10k.** SPR was accepting rounding noise and
   cycling.
+- **SPR's accept bookkeeping behind its `n^1.6`.** Timed 2026-09-26: 5 per cent
+  of SPR at 25,000 cells. The cost was building three trees for every proposal
+  that moved something (`O(n)` each, growing `n^1.96` from 8k to 32k) and
+  re-proposing rechecked moves one at a time, 31 per cent of SPR's wall time.
+  The accept path only mattered once those were gone.
 
 The acceptance path did come back later. Once proposals were cheap, the
 `O(n p)` state copy per accepted move was 23 of 42 s in SPR's first round at
@@ -178,8 +191,9 @@ improves, a full scan runs, so it stops exactly where the exact phase does.
 2026-09-25, same thirteen datasets, steps 5 to 8: identical finished tree on
 all, to the last printed digit. On step 6 alone, radius 2 and 3 drifted 0.01 and
 7.5 nats at 5,000; radius 5 was identical at both sizes. What's left is the
-per-round settle, about 0.28 s at 10,000, which a lazy row provider like SPR's
-could remove.
+per-round settle, about 0.28 s at 10,000. Since 2026-09-27 the phase runs on
+the live tree and forms up rows per round only where it rescores, which is what
+took step 6 from 69 s to 41 s at 131,072 cells.
 
 ### How much one real-data run says
 
@@ -344,9 +358,11 @@ Pruning at 8192 cells by 2000 features:
 | Rust, `f32` storage | 40 ms |
 
 Loglikelihoods match `reference/bonsai_ref.py` to twelve significant figures
-(pruning only, not merge or branch solve). Parallel over features, so a ladder
-runs in 9.0 ms where level-parallelism takes 67.7 ms. Kernel only; [Now](#now)
-is the end-to-end number.
+(pruning only, not merge or branch solve). Measured while `NodeState::prune`
+ran sequentially. Since 2026-09-27 it prunes the nodes of a level in parallel,
+which took steps 4 and 7 down 3.4 to 4.1x on every search tree measured; the
+table above has not been re-run, and a pure ladder, one node per level, is
+unmeasured. Kernel only; [Now](#now) is the end-to-end number.
 
 ### Reproducing
 

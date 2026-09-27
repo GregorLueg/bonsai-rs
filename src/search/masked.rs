@@ -36,11 +36,9 @@
 use crate::errors::BonsaiErrors;
 use crate::model::merge::EffLeaf;
 use crate::model::place::Walk;
-use crate::search::polytomy::{CentreStar, splice_edits};
+use crate::search::polytomy::{CentreStar, RESOLVED_STAR_MEMBERS, splice_edits};
 use crate::search::split_hash;
-use crate::search::spr::{
-    Fresh, Row, RowStore, UpSide, eff_step, fixed, resolution_splits, root_up, up_step,
-};
+use crate::search::spr::{Fresh, Row, RowStore, UpSide, eff_step, fixed, root_up, up_step};
 use crate::search::star::StarResult;
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
@@ -760,7 +758,23 @@ pub(crate) struct Attached<'a, T> {
     pub(crate) print: u64,
 }
 
+/// What [`attach`] made of a regraft.
+pub(crate) enum Regraft<'a, T> {
+    /// The views decline it; the built path decides.
+    Declined,
+    /// It changes no split and its star is too small to need a resolution,
+    /// which the fingerprint settles before any row is formed.
+    Unchanged,
+    /// The regraft, its rows and its star.
+    Attached(Box<Attached<'a, T>>),
+}
+
 /// Build the regrafted tree's star and fingerprint without building the tree.
+///
+/// Most proposals put the subtree back where it came from, onto a star of
+/// three members that needs no resolution, and the fingerprint alone says so.
+/// With `stop_if_unchanged` those return before the path's rows and the
+/// centre's up row are formed.
 ///
 /// ### Params
 ///
@@ -770,12 +784,14 @@ pub(crate) struct Attached<'a, T> {
 /// * `word` - The current tree's leaf words
 /// * `below` - The current tree's leaf counts
 /// * `here` - The current tree's split fingerprint
+/// * `stop_if_unchanged` - Return [`Regraft::Unchanged`] where it applies
+///   rather than forming the rows
 ///
 /// ### Returns
 ///
-/// The star and the fingerprint terms, or `None` if the current tree's root is
-/// binary, whose duplicate edge the fingerprint treats specially and which is
-/// left to the built path.
+/// The star and the fingerprint terms; [`Regraft::Declined`] if the current
+/// tree's root is binary, whose duplicate edge the fingerprint treats
+/// specially and which is left to the built path.
 pub(crate) fn attach<'a, T: BonsaiFloat>(
     rows: &PrunedRows<'_, 'a, T>,
     target: u32,
@@ -783,16 +799,17 @@ pub(crate) fn attach<'a, T: BonsaiFloat>(
     word: &[u64],
     below: &[usize],
     here: u64,
-) -> Option<Attached<'a, T>> {
+    stop_if_unchanged: bool,
+) -> Regraft<'a, T> {
     let view = rows.view;
     let tree = view.shape.tree;
     if tree.children(tree.root()).len() == 2 {
-        return None;
+        return Regraft::Declined;
     }
     // A placement carried over from an earlier tree can name the parent this
     // cut suppresses, which is not in the remaining tree.
     if Some(target) == view.suppressed {
-        return None;
+        return Regraft::Declined;
     }
     let x = view.x;
     let joint = tree.n_nodes() as u32;
@@ -825,20 +842,6 @@ pub(crate) fn attach<'a, T: BonsaiFloat>(
     };
     let path = shape.path_up(centre);
     shape.settle(&path);
-
-    let mut down = Down {
-        store: rows.down.store,
-        lower: vec![&rows.down.dirty],
-        dirty: FxHashMap::default(),
-    };
-    down.settle(&shape, &path);
-
-    // The centre's up row, top-down along its path.
-    let p = rows.down.store.n_features();
-    let mut up = root_up(p);
-    for &v in path.iter().rev().skip(1) {
-        up = down.up_from(&shape, v, (&up.0, &up.1));
-    }
 
     // Leaf words and counts of the regrafted tree, where they differ.
     let old_path: FxHashSet<u32> =
@@ -906,6 +909,23 @@ pub(crate) fn attach<'a, T: BonsaiFloat>(
     let kids = shape.children(centre);
     let upstream = shape.parent(centre);
     let n = kids.len() + usize::from(upstream.is_some());
+    if stop_if_unchanged && n <= RESOLVED_STAR_MEMBERS && print == here {
+        return Regraft::Unchanged;
+    }
+
+    let mut down = Down {
+        store: rows.down.store,
+        lower: vec![&rows.down.dirty],
+        dirty: FxHashMap::default(),
+    };
+    down.settle(&shape, &path);
+
+    // The centre's up row, top-down along its path.
+    let p = rows.down.store.n_features();
+    let mut up = root_up(p);
+    for &v in path.iter().rev().skip(1) {
+        up = down.up_from(&shape, v, (&up.0, &up.1));
+    }
     let mut star = CentreStar {
         centre,
         member_nodes: Vec::with_capacity(n),
@@ -936,14 +956,38 @@ pub(crate) fn attach<'a, T: BonsaiFloat>(
         member_count.push(n_leaves - count_now(centre));
     }
     let dirty = down.dirty;
-    Some(Attached {
+    Regraft::Attached(Box::new(Attached {
         shape,
         dirty,
         star,
         member_word,
         member_count,
         print,
-    })
+    }))
+}
+
+/// A scored move's views, owned, so that accepting it recomputes nothing.
+pub(crate) struct MoveData<T> {
+    /// Parents the tree the move produces overrides, [`NO_NODE`] for a root.
+    parent: FxHashMap<u32, u32>,
+    /// Child lists it overrides, in its arena order.
+    children: FxHashMap<u32, Vec<u32>>,
+    /// Branches it overrides.
+    branch: FxHashMap<u32, f64>,
+    /// Heights it overrides.
+    height: FxHashMap<u32, u32>,
+    /// Heights the regrafted tree overrides, before any splice: the splice's
+    /// rebuild walks children in the regrafted arena's order.
+    before_height: FxHashMap<u32, u32>,
+    /// Rows the views recomputed, nearest first: the splice's, the regraft's,
+    /// the cut's.
+    layers: [FxHashMap<u32, Settled<T>>; 3],
+    /// The parent the cut suppressed, if any.
+    suppressed: Option<u32>,
+    /// Split fingerprint of the tree the move produces.
+    print: u64,
+    /// Ancestors the splice made, `None` when there was no splice.
+    n_made: Option<usize>,
 }
 
 /// The loglikelihood of the tree a move produces, as a [`fixed`] total,
@@ -965,23 +1009,40 @@ pub(crate) fn attach<'a, T: BonsaiFloat>(
 /// * `result` - The resolution of the regraft's star, `None` when the star was
 ///   too small to need one
 /// * `base` - The current tree's [`fixed`] total
+/// * `print` - Split fingerprint of the tree the move produces
 ///
 /// ### Returns
 ///
-/// The total of the tree the move produces.
+/// The total of the tree the move produces, and the views, for
+/// [`apply_move`].
 pub(crate) fn score_move<T: BonsaiFloat>(
-    rows: &PrunedRows<'_, '_, T>,
-    attached: &Attached<'_, T>,
+    rows: PrunedRows<'_, '_, T>,
+    attached: Attached<'_, T>,
     result: Option<&StarResult<T>>,
     base: i128,
-) -> i128 {
+    print: u64,
+) -> (i128, MoveData<T>) {
     let view = rows.view;
     let tree = view.shape.tree;
     let store = rows.down.store;
-    let mut spliced: FxHashMap<u32, Settled<T>> = FxHashMap::default();
-    if let Some(result) = result {
-        spliced = splice_rows(rows, attached, result).1;
-    }
+    let (shape, spliced, before_height, n_made) = match result {
+        Some(result) => {
+            let (shape, spliced) = splice_rows(&rows, &attached, result);
+            let before = attached.shape.height.clone();
+            (
+                shape,
+                spliced,
+                before,
+                Some(result.parent.len() - result.n_members),
+            )
+        }
+        None => (
+            attached.shape.clone(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+            None,
+        ),
+    };
 
     let mut total = base;
     let mut seen: FxHashSet<u32> = FxHashSet::default();
@@ -998,7 +1059,26 @@ pub(crate) fn score_move<T: BonsaiFloat>(
     if let Some(sp) = view.suppressed {
         total -= fixed(store.contribution(sp));
     }
-    total
+    let suppressed = view.suppressed;
+    let Shape {
+        parent,
+        children,
+        branch,
+        height,
+        ..
+    } = shape;
+    let data = MoveData {
+        parent,
+        children,
+        branch,
+        height,
+        before_height,
+        layers: [spliced, attached.dirty, rows.down.dirty],
+        suppressed,
+        print,
+        n_made,
+    };
+    (total, data)
 }
 
 /// Apply a star resolution to the regrafted view and settle what it changed.
@@ -1153,60 +1233,50 @@ pub(crate) struct Applied<T> {
 ///
 /// * `tree` - The current tree
 /// * `store` - Its rows
-/// * `x` - The subtree to prune
-/// * `target` - Where to attach it, in the current tree's ids
-/// * `branch` - The new branch
-/// * `result` - The resolution of the regraft's star, `None` when it was too
-///   small to need one
+/// * `data` - The views [`score_move`] scored the move on, against `tree`
 /// * `word` - The current tree's leaf words
 /// * `below` - Its leaf counts
-/// * `here` - Its split fingerprint
 ///
 /// ### Returns
 ///
-/// The applied move, `None` where the views decline it, or `MalformedTree` if
-/// the arena rejected the result.
-#[allow(clippy::too_many_arguments)]
+/// The applied move, or `MalformedTree` if the arena rejected the result.
 pub(crate) fn apply_move<T: BonsaiFloat>(
     tree: &Tree,
     store: &RowStore<T>,
-    x: u32,
-    target: u32,
-    branch: f64,
-    result: Option<&StarResult<T>>,
+    data: MoveData<T>,
     word: &[u64],
     below: &[usize],
-    here: u64,
-) -> Result<Option<Applied<T>>, BonsaiErrors> {
-    let Some(view) = Pruned::new(tree, x) else {
-        return Ok(None);
+) -> Result<Applied<T>, BonsaiErrors> {
+    let MoveData {
+        parent: over_parent,
+        children: over_children,
+        branch: over_branch,
+        height: over_height,
+        before_height,
+        layers,
+        suppressed,
+        print,
+        n_made,
+    } = data;
+    let shape = Shape {
+        tree,
+        parent: over_parent,
+        children: over_children,
+        branch: over_branch,
+        height: over_height,
     };
-    let cache = ViewCache::new(0);
-    let rows = PrunedRows::new(&view, store, &cache);
-    let Some(attached) = attach(&rows, target, branch, word, below, here) else {
-        return Ok(None);
-    };
-    let (shape, spliced) = match result {
-        Some(result) => splice_rows(&rows, &attached, result),
-        None => (attached.shape.clone(), FxHashMap::default()),
-    };
-    let print = match result {
-        None => attached.print,
-        Some(result) => attached.print.wrapping_add(resolution_splits(
-            &attached.member_word,
-            &attached.member_count,
-            tree.n_leaves(),
-            word[tree.root() as usize],
-            result,
-        )),
+    let before = |v: u32| {
+        before_height
+            .get(&v)
+            .copied()
+            .unwrap_or_else(|| tree_height(tree, v))
     };
 
     let n0 = tree.n_nodes();
     let n_leaves = tree.n_leaves();
     let first_new = n0 as u32 + 1;
-    let n_made = result.map_or(0, |r| r.parent.len() - r.n_members);
-    let space = n0 + 1 + n_made;
-    let layers = [&spliced, &attached.dirty, &rows.down.dirty];
+    let space = n0 + 1 + n_made.unwrap_or(0);
+    let layers = [&layers[0], &layers[1], &layers[2]];
 
     // The new tree over the id space, dense: the current arrays, then the
     // views' overrides. Nothing below touches a hash map per node.
@@ -1248,10 +1318,9 @@ pub(crate) fn apply_move<T: BonsaiFloat>(
     // rebuild), which walks children in the regrafted arena's order with the
     // made ancestors last.
     let mut order: Vec<u32> = Vec::with_capacity(space - n_leaves);
-    match result {
+    match n_made {
         None => {
-            let alive =
-                |v: usize| Some(v as u32) != view.suppressed && (v < n0 || par[v] != NO_NODE);
+            let alive = |v: usize| Some(v as u32) != suppressed && (v < n0 || par[v] != NO_NODE);
             order.extend((n_leaves..space).filter(|&v| alive(v)).map(|v| v as u32));
         }
         Some(_) => {
@@ -1270,7 +1339,7 @@ pub(crate) fn apply_move<T: BonsaiFloat>(
                         if c >= first_new {
                             (1u32, 0u32, c)
                         } else {
-                            (0, attached.shape.height(c), c)
+                            (0, before(c), c)
                         }
                     });
                     stack.extend(
@@ -1363,7 +1432,7 @@ pub(crate) fn apply_move<T: BonsaiFloat>(
         .copied()
         .filter(|&v| (v as usize) < n0)
         .collect();
-    stale.extend(view.suppressed);
+    stale.extend(suppressed);
     let mut changed = Vec::with_capacity(changed_ids.len());
     for (nv, &v) in orig.iter().enumerate() {
         new_word[nv] = now_word[v as usize];
@@ -1381,7 +1450,7 @@ pub(crate) fn apply_move<T: BonsaiFloat>(
         }
     }
     let fresh = Fresh::new(inherited, slot, fresh_m, fresh_w, fresh_contrib);
-    Ok(Some(Applied {
+    Ok(Applied {
         tree: new_tree,
         fresh,
         to_old,
@@ -1391,5 +1460,5 @@ pub(crate) fn apply_move<T: BonsaiFloat>(
         new_id: new_id[..n0].to_vec(),
         changed,
         stale,
-    }))
+    })
 }

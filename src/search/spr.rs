@@ -97,15 +97,17 @@ use crate::search::masked::Applied;
 #[cfg(debug_assertions)]
 use crate::search::masked::Attached;
 use crate::search::masked::{
-    Pruned as PrunedView, PrunedRows, ViewCache, apply_move, attach, score_move,
+    MoveData, Pruned as PrunedView, PrunedRows, Regraft, ViewCache, apply_move, attach, score_move,
 };
 use crate::search::polytomy::{CentreStar, splice_result};
 #[cfg(any(test, debug_assertions))]
 use crate::search::split_fingerprint_with;
 use crate::search::star::{StarParams, StarResult, resolve_star};
+#[cfg(test)]
+use crate::search::tree_loglik;
 use crate::search::{
     Leaves, leaf_words, leaves_below, mark_near_new_clades, settled_down,
-    split_fingerprint_counted, split_hash, tree_loglik,
+    split_fingerprint_counted, split_hash,
 };
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
@@ -114,6 +116,7 @@ use crate::utils::simd::prune_binary;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 ////////////////
@@ -1764,7 +1767,8 @@ struct Proposal<T> {
 struct Candidate<T> {
     /// The subtree to prune, as a node of the tree it was scored on.
     pruned: u32,
-    /// Where to attach it, same ids.
+    /// Where to attach it, same ids; read by the debug cross-check only.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     target: u32,
     /// Length of the new branch.
     branch: f64,
@@ -1777,9 +1781,9 @@ struct Candidate<T> {
     target_word: u64,
     /// The built move, when the built path scored it.
     built: Option<Proposal<T>>,
-    /// The resolution of the regraft's star, when the views scored it and the
-    /// star needed one; [`apply_move`] reuses it.
-    star: Option<StarResult<T>>,
+    /// The views the move was scored on, kept for the candidate the sweep
+    /// will accept if it accepts any; [`apply_move`] consumes them.
+    data: Option<Box<MoveData<T>>>,
 }
 
 impl<T> Candidate<T> {
@@ -1802,7 +1806,7 @@ impl<T> Candidate<T> {
             pruned_word: word[built.pruned as usize],
             target_word: word[built.target as usize],
             built: Some(built),
-            star: None,
+            data: None,
         }
     }
 }
@@ -2035,7 +2039,7 @@ fn propose<T: BonsaiFloat>(
 /// ### Returns
 ///
 /// The wrapping sum of [`split_hash`] over the added non-trivial splits.
-pub(crate) fn resolution_splits<T: BonsaiFloat>(
+fn resolution_splits<T: BonsaiFloat>(
     member_word: &[u64],
     member_count: &[usize],
     n_leaves: usize,
@@ -2093,11 +2097,13 @@ struct Prints<'a> {
 /// * `placed` - The attachment node and branch when they are already known,
 ///   which [`SprApprox::recheck`] carries over from an earlier tree; `None`
 ///   runs the beam search
+/// * `keep` - Given the move's total, whether to keep its views
 /// * `cache` - Up-row cells for the pruned view, returned emptied
 ///
 /// ### Returns
 ///
 /// See [`Fast`]; or the error the placement or the primitive failed with.
+#[allow(clippy::too_many_arguments)]
 fn view_move<T: BonsaiFloat>(
     tree: &Tree,
     down: &RowStore<T>,
@@ -2105,6 +2111,7 @@ fn view_move<T: BonsaiFloat>(
     params: &SprParams,
     prints: &Prints<'_>,
     placed: Option<(u32, f64)>,
+    keep: &dyn Fn(i128) -> bool,
     cache: &mut ViewCache<T>,
 ) -> Result<Fast<T>, BonsaiErrors> {
     let Some(view) = PrunedView::new(tree, x) else {
@@ -2123,21 +2130,26 @@ fn view_move<T: BonsaiFloat>(
                 (best.node, best.branch)
             }
         };
-        let Some(attached) = attach(
+        let attached = match attach(
             &rows,
             target,
             branch,
             prints.word,
             prints.below,
             prints.here,
-        ) else {
+            !cfg!(debug_assertions),
+        ) {
+            Regraft::Attached(attached) => *attached,
+            Regraft::Unchanged => return Ok(Fast::NoMove),
             // A carried-over target the cut suppresses has nowhere to go, as
             // on the built path; anything else the views decline, it decides.
-            return Ok(if placed.is_some() && tree.parent(x) == Some(target) {
-                Fast::NoMove
-            } else {
-                Fast::Declined
-            });
+            Regraft::Declined => {
+                return Ok(if placed.is_some() && tree.parent(x) == Some(target) {
+                    Fast::NoMove
+                } else {
+                    Fast::Declined
+                });
+            }
         };
         #[cfg(debug_assertions)]
         if placed.is_none() {
@@ -2163,8 +2175,13 @@ fn view_move<T: BonsaiFloat>(
         if print == prints.here {
             return Ok(Fast::NoMove);
         }
-        let score = score_move(&rows, &attached, result.as_ref(), prints.score);
-        Ok(Fast::Move(target, branch, score, result))
+        let (score, data) = score_move(rows, attached, result.as_ref(), prints.score, print);
+        Ok(Fast::Move(
+            target,
+            branch,
+            score,
+            keep(score).then(|| Box::new(data)),
+        ))
     })();
     cache.reset();
     fast
@@ -2176,9 +2193,8 @@ enum Fast<T> {
     NoMove,
     /// It does: the attachment node in the current tree's ids, its branch,
     /// the [`fixed`] total of the tree the move produces, the same bits the
-    /// built path finds, and the resolution of the regraft's star if it
-    /// needed one.
-    Move(u32, f64, i128, Option<StarResult<T>>),
+    /// built path finds, and the views it was scored on if they were kept.
+    Move(u32, f64, i128, Option<Box<MoveData<T>>>),
     /// The views declined; the built path decides.
     Declined,
 }
@@ -2382,7 +2398,7 @@ fn candidate<T: BonsaiFloat>(
             );
             Ok(None)
         }
-        Fast::Move(target, branch, score, star) => {
+        Fast::Move(target, branch, score, data) => {
             #[cfg(debug_assertions)]
             {
                 let built = propose(
@@ -2408,7 +2424,7 @@ fn candidate<T: BonsaiFloat>(
                 pruned_word: prints.word[x as usize],
                 target_word: prints.word[target as usize],
                 built: None,
-                star,
+                data,
             }))
         }
         Fast::Declined => Ok(
@@ -2456,9 +2472,15 @@ fn score_chunk<T: BonsaiFloat>(
     caches: &[Mutex<ViewCache<T>>],
     wants: &[Option<Want>],
 ) -> Result<Vec<Option<Candidate<T>>>, BonsaiErrors> {
+    // The sweep accepts the first candidate that clears the floor, so only its
+    // views are needed: a candidate keeps its views if it clears the floor and
+    // no earlier one has been seen to.
+    let floor = acceptance_floor(params, unfixed(prints.score));
+    let first = AtomicUsize::new(usize::MAX);
     wants
         .par_iter()
-        .map(|want| -> Result<Option<Candidate<T>>, BonsaiErrors> {
+        .enumerate()
+        .map(|(i, want)| -> Result<Option<Candidate<T>>, BonsaiErrors> {
             let Some(want) = want else {
                 return Ok(None);
             };
@@ -2478,7 +2500,11 @@ fn score_chunk<T: BonsaiFloat>(
                     if cache.len() < tree.n_nodes() + 1 {
                         *cache = ViewCache::new(tree.n_nodes() + 1);
                     }
-                    view_move(tree, down, x, params, prints, placed, &mut cache)?
+                    let keep = |score: i128| {
+                        unfixed(score - prints.score) > floor
+                            && first.fetch_min(i, Ordering::Relaxed) >= i
+                    };
+                    view_move(tree, down, x, params, prints, placed, &keep, &mut cache)?
                 }
                 Err(_) => Fast::Declined,
             };
@@ -2569,7 +2595,8 @@ pub fn spr_round<T: BonsaiFloat>(
     leaves: Leaves<'_, T>,
     params: Option<SprParams>,
 ) -> Result<SprResult, BonsaiErrors> {
-    Ok(sweep(tree, leaves, params.unwrap_or_default(), None)?.0)
+    let start = settled_down(tree, leaves)?;
+    Ok(sweep(tree, leaves, params.unwrap_or_default(), None, start)?.0)
 }
 
 /// One sweep, optionally restricted to the subtrees a previous sweep touched.
@@ -2581,18 +2608,23 @@ pub fn spr_round<T: BonsaiFloat>(
 /// * `params` - Knobs
 /// * `look` - [`leaf_words`] of the subtrees to propose, or `None` for all of
 ///   them
+/// * `start` - Down rows settled against `tree` and its loglikelihood, as
+///   [`settled_down`] returns them
 ///
 /// ### Returns
 ///
-/// The round's result and the words [`mark_near_new_clades`] collected from its
-/// accepted moves, empty when the search revisits everything, or the
-/// error the placement, the primitive or the arena failed with.
+/// The round's result, the words [`mark_near_new_clades`] collected from its
+/// accepted moves, empty when the search revisits everything, and the settled
+/// rows of the tree it finished on, `None` if it moved nothing; or the error
+/// the placement, the primitive or the arena failed with.
+#[allow(clippy::type_complexity)]
 fn sweep<T: BonsaiFloat>(
     tree: &Tree,
     leaves: Leaves<'_, T>,
     params: SprParams,
     look: Option<&FxHashSet<u64>>,
-) -> Result<(SprResult, FxHashSet<u64>), BonsaiErrors> {
+    start: (NodeState<T>, f64),
+) -> Result<(SprResult, FxHashSet<u64>, Option<NodeState<T>>), BonsaiErrors> {
     let mut rng = SplitMix64::new(params.seed);
     let mut tree = tree.clone();
     let mut gains = Vec::new();
@@ -2600,7 +2632,7 @@ fn sweep<T: BonsaiFloat>(
     // All of these describe the tree as it stands, and a rejected candidate
     // leaves it exactly as it stands, so they are settled once and again only
     // when a move is accepted.
-    let (settled, _) = settled_down(&tree, leaves)?;
+    let (settled, loglik_in) = start;
     let mut down = RowStore::from_state(&settled, tree.n_nodes());
     drop(settled);
     let mut best = down.score(&tree);
@@ -2658,7 +2690,7 @@ fn sweep<T: BonsaiFloat>(
         loop {
             let mut hit = None;
             for (k, cand) in batch.iter_mut().enumerate() {
-                let Some(cand) = cand.take() else {
+                let Some(mut cand) = cand.take() else {
                     continue;
                 };
                 if unfixed(cand.score - best) <= acceptance_floor(&params, unfixed(best)) {
@@ -2690,22 +2722,13 @@ fn sweep<T: BonsaiFloat>(
                         }
                     }
                     None => {
-                        let Some(mut applied) = apply_move(
-                            &tree,
-                            &down,
-                            cand.pruned,
-                            cand.target,
-                            cand.branch,
-                            cand.star.as_ref(),
-                            &word,
-                            &below,
-                            here,
-                        )?
-                        else {
-                            // The views scored it, so they do not decline it.
-                            debug_assert!(false, "the views declined a move they scored");
+                        let Some(data) = cand.data.take() else {
+                            // The first candidate over the floor always kept
+                            // its views; see `score_chunk`.
+                            debug_assert!(false, "the accepted candidate kept no views");
                             continue;
                         };
+                        let mut applied = apply_move(&tree, &down, *data, &word, &below)?;
                         for &v in &applied.changed {
                             applied.to_old[v as usize] = by_word
                                 .get(&applied.word[v as usize])
@@ -2806,7 +2829,13 @@ fn sweep<T: BonsaiFloat>(
         }
     }
 
-    let loglik = tree_loglik(&tree, leaves)?;
+    // The fresh prune the result reports is also the next sweep's start.
+    let (loglik, settled) = if gains.is_empty() {
+        (loglik_in, None)
+    } else {
+        let (settled, loglik) = settled_down(&tree, leaves)?;
+        (loglik, Some(settled))
+    };
     Ok((
         SprResult {
             tree,
@@ -2815,6 +2844,7 @@ fn sweep<T: BonsaiFloat>(
             rounds: 1,
         },
         revisit,
+        settled,
     ))
 }
 
@@ -2836,9 +2866,10 @@ pub fn spr<T: BonsaiFloat>(
     params: Option<SprParams>,
 ) -> Result<SprResult, BonsaiErrors> {
     let params = params.unwrap_or_default();
+    let (mut settled, loglik) = settled_down(tree, leaves)?;
     let mut out = SprResult {
         tree: tree.clone(),
-        loglik: tree_loglik(tree, leaves)?,
+        loglik,
         gains: Vec::new(),
         rounds: 0,
     };
@@ -2847,7 +2878,7 @@ pub fn spr<T: BonsaiFloat>(
     while out.rounds < params.max_rounds {
         // The random order has to differ between rounds, or the second round
         // retries the first round's order on a tree that has moved under it.
-        let (round, revisit) = sweep(
+        let (round, revisit, next) = sweep(
             &out.tree,
             leaves,
             SprParams {
@@ -2855,14 +2886,16 @@ pub fn spr<T: BonsaiFloat>(
                 ..params
             },
             look.as_ref(),
+            (settled, out.loglik),
         )?;
         if params.search.revisit_radius() > 0 {
             look = Some(revisit);
         }
         out.rounds += 1;
-        if round.gains.is_empty() {
+        let Some(next) = next else {
             break;
-        }
+        };
+        settled = next;
         out.gains.extend_from_slice(&round.gains);
         out.loglik = round.loglik;
         out.tree = round.tree;

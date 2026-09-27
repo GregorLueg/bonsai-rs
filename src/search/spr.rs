@@ -1869,7 +1869,7 @@ fn word_index(word: &[u64]) -> FxHashMap<u64, u32> {
 /// and the ancestors a resolution creates are binary, so the attachment point
 /// is the only node whose degree the move raised. That resolution reads six
 /// rows and used to be handed them by settling the whole attached tree; see
-/// [`attachment_star`] for where they come from instead.
+/// [`lazy_centre_star`] for where they come from instead.
 ///
 /// ### Params
 ///

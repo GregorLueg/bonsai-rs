@@ -92,12 +92,10 @@ use crate::model::global::{LOGLIK_SCALE_FLOOR, up_part};
 use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place, place_walk};
-#[cfg(debug_assertions)]
-use crate::search::masked::Applied;
-#[cfg(debug_assertions)]
-use crate::search::masked::Attached;
+use crate::search::live::LiveTree;
 use crate::search::masked::{
-    MoveData, Pruned as PrunedView, PrunedRows, Regraft, ViewCache, apply_move, attach, score_move,
+    Attached, MoveData, Pruned as PrunedView, PrunedRows, Regraft, ViewCache, apply_move, attach,
+    score_move,
 };
 #[cfg(debug_assertions)]
 use crate::search::polytomy::splice_result;
@@ -919,6 +917,59 @@ impl<T: BonsaiFloat> RowStore<T> {
             .sum()
     }
 
+    /// Write one node's row, in its own slot or a new one.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - Node id, possibly past every id the store has seen
+    /// * `m` - Its down means
+    /// * `w` - Its down precisions
+    /// * `contrib` - Its loglikelihood term
+    pub(crate) fn write_row(&mut self, node: u32, m: &[T], w: &[T], contrib: f64) {
+        let p = self.p;
+        if node as usize >= self.slot.len() {
+            self.slot.resize(node as usize + 1, NO_NODE);
+        }
+        let s = match self.slot[node as usize] {
+            NO_NODE => {
+                let s = self.contrib.len();
+                self.m.resize((s + 1) * p, T::zero());
+                self.w.resize((s + 1) * p, T::zero());
+                self.contrib.push(0.0);
+                self.slot[node as usize] = s as u32;
+                s
+            }
+            s => s as usize,
+        };
+        self.m[s * p..(s + 1) * p].copy_from_slice(m);
+        self.w[s * p..(s + 1) * p].copy_from_slice(w);
+        self.contrib[s] = contrib;
+    }
+
+    /// Key the store by another numbering of the same nodes.
+    ///
+    /// ### Params
+    ///
+    /// * `id_of` - Per new key, the node it names under the current keys
+    ///
+    /// ### Returns
+    ///
+    /// The slot map before, for [`RowStore::restore`].
+    pub(crate) fn remap(&mut self, id_of: &[u32]) -> Vec<u32> {
+        let old = std::mem::take(&mut self.slot);
+        self.slot = id_of.iter().map(|&v| old[v as usize]).collect();
+        old
+    }
+
+    /// Undo a [`RowStore::remap`].
+    ///
+    /// ### Params
+    ///
+    /// * `slot` - What the remap returned
+    pub(crate) fn restore(&mut self, slot: Vec<u32>) {
+        self.slot = slot;
+    }
+
     /// Make the store describe the tree an accepted move produced.
     ///
     /// Row for row what [`NodeState::prune`] would produce on `tree`, because
@@ -1016,38 +1067,6 @@ pub(crate) struct Fresh<T> {
     fresh_w: Vec<T>,
     /// Loglikelihood term of each formed row, `[slot]`.
     fresh_contrib: Vec<f64>,
-}
-
-impl<T> Fresh<T> {
-    /// Rows formed somewhere other than [`LazyRows`].
-    ///
-    /// ### Params
-    ///
-    /// * `inherited` - Per node of the new tree, the current node whose row it
-    ///   keeps, or [`NO_NODE`]
-    /// * `slot` - Per node, its row in the next three, or [`NO_NODE`]
-    /// * `fresh_m` - Formed means, `[slot][feature]`
-    /// * `fresh_w` - Formed precisions, same layout
-    /// * `fresh_contrib` - Formed terms, `[slot]`
-    ///
-    /// ### Returns
-    ///
-    /// The rows.
-    pub(crate) fn new(
-        inherited: Vec<u32>,
-        slot: Vec<u32>,
-        fresh_m: Vec<T>,
-        fresh_w: Vec<T>,
-        fresh_contrib: Vec<f64>,
-    ) -> Self {
-        Self {
-            inherited,
-            slot,
-            fresh_m,
-            fresh_w,
-            fresh_contrib,
-        }
-    }
 }
 
 /// One node's settled row, means and precisions.
@@ -1673,7 +1692,6 @@ fn read_down<'r, T: BonsaiFloat>(rows: &'r LazyRows<'_, T>, node: u32) -> (&'r [
 /// The fresh node an attachment below a leaf creates has no original index and
 /// is [`NO_NODE`] in the map, which is what [`LazyRows`] reads as a node the
 /// move made and has to settle.
-#[cfg(any(test, debug_assertions))]
 fn regraft(
     pruned: &Pruned,
     x: u32,
@@ -1781,7 +1799,7 @@ struct Candidate<T> {
     pruned_word: u64,
     /// Leaf word of the attachment point.
     target_word: u64,
-    /// The built move, when the built path scored it.
+    /// The built move, in the arena's ids, when the built path scored it.
     built: Option<Proposal<T>>,
     /// The views the move was scored on, kept for the candidate the sweep
     /// will accept if it accepts any; [`apply_move`] consumes them.
@@ -2123,10 +2141,9 @@ struct Prints<'a> {
 ///
 /// The pruned and the regrafted trees are views of the current one
 /// ([`crate::search::masked`]), so a proposal costs its beam search and a few
-/// `O(depth p)` paths instead of arena assemblies and their row maps. Most
-/// proposals put the subtree back where it came from and change no split;
-/// the rest are scored by [`score_move`], and the tree is built only if the
-/// sweep accepts the move.
+/// `O(depth p)` paths. Most proposals put the subtree back where it came from
+/// and change no split; the rest are scored by [`score_move`], and applied
+/// only if the sweep accepts them.
 ///
 /// ### Params
 ///
@@ -2140,13 +2157,15 @@ struct Prints<'a> {
 ///   runs the beam search
 /// * `keep` - Given the move's total, whether to keep its views
 /// * `cache` - Up-row cells for the pruned view, returned emptied
+/// * `mirror` - The tree as an arena, to check the views against the built
+///   path; debug builds only
 ///
 /// ### Returns
 ///
 /// See [`Fast`]; or the error the placement or the primitive failed with.
 #[allow(clippy::too_many_arguments)]
 fn view_move<T: BonsaiFloat>(
-    tree: &Tree,
+    tree: &LiveTree,
     down: &RowStore<T>,
     x: u32,
     params: &SprParams,
@@ -2154,6 +2173,7 @@ fn view_move<T: BonsaiFloat>(
     placed: Option<(u32, f64)>,
     keep: &dyn Fn(i128) -> bool,
     cache: &mut ViewCache<T>,
+    mirror: Option<&Mirror<T>>,
 ) -> Result<Fast<T>, BonsaiErrors> {
     let Some(view) = PrunedView::new(tree, x) else {
         return Ok(Fast::Declined);
@@ -2178,7 +2198,7 @@ fn view_move<T: BonsaiFloat>(
             prints.word,
             prints.below,
             prints.here,
-            !cfg!(debug_assertions),
+            mirror.is_none(),
         ) {
             Regraft::Attached(attached) => *attached,
             Regraft::Unchanged => return Ok(Fast::NoMove),
@@ -2192,9 +2212,8 @@ fn view_move<T: BonsaiFloat>(
                 });
             }
         };
-        #[cfg(debug_assertions)]
-        if placed.is_none() {
-            check_against_built(tree, down, x, params, (target, branch), &attached)?;
+        if let (Some(mirror), None) = (mirror, placed) {
+            check_against_built(mirror, x, params, (target, branch), &attached)?;
         }
         let small =
             attached.star.member_nodes.len() <= crate::search::polytomy::RESOLVED_STAR_MEMBERS;
@@ -2240,93 +2259,68 @@ enum Fast<T> {
     Declined,
 }
 
-/// Debug builds: an applied move against the built path's, field for field.
+/// The live tree numbered as an arena, with its rows and word index keyed
+/// the same way: what the built path runs on.
 ///
-/// ### Params
-///
-/// * `tree` - The current tree
-/// * `down` - Its rows
-/// * `params` - Knobs
-/// * `here` - Its split fingerprint
-/// * `by_word` - Its word index
-/// * `cand` - The move
-/// * `applied` - What [`apply_move`] made of it, `to_old` filled in
-///
-/// ### Returns
-///
-/// `Ok` if they agree; panics otherwise.
-#[cfg(debug_assertions)]
-fn check_applied<T: BonsaiFloat>(
-    tree: &Tree,
-    down: &RowStore<T>,
-    params: &SprParams,
+/// Debug builds keep one per state of the sweep and check the views against
+/// it; release builds never make one.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+struct Mirror<T> {
+    /// The arena tree.
+    tree: Tree,
+    /// Arena index of each live id, [`NO_NODE`] at a free id.
+    arena_of: Vec<u32>,
+    /// Rows keyed by arena index.
+    down: RowStore<T>,
+    /// Word index keyed by arena index.
+    by_word: FxHashMap<u64, u32>,
+    /// Split fingerprint.
     here: u64,
-    by_word: &FxHashMap<u64, u32>,
-    cand: &Candidate<T>,
-    applied: &Applied<T>,
-) -> Result<(), BonsaiErrors> {
-    let built = propose(
-        tree,
-        down,
-        cand.pruned,
-        params,
-        here,
-        by_word,
-        Some((cand.target, cand.branch)),
-    )?
-    .expect("the built path applies a move the views scored");
-    assert_eq!(built.score, cand.score, "score");
-    let (a, b) = (&applied.tree, &built.tree);
-    assert_eq!(a.n_nodes(), b.n_nodes(), "node count");
-    for v in 0..a.n_nodes() as u32 {
-        assert_eq!(a.parent(v), b.parent(v), "parent of {v}");
+}
+
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+impl<T: BonsaiFloat> Mirror<T> {
+    /// Number the live tree as an arena and key a copy of its rows to match.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - The live tree
+    /// * `down` - Its rows
+    /// * `word` - Its leaf words
+    /// * `below` - Its leaf counts
+    /// * `here` - Its split fingerprint
+    ///
+    /// ### Returns
+    ///
+    /// The mirror; panics if the live tree's words, counts or fingerprint are
+    /// not the arena's, which is what it is for.
+    fn new(
+        tree: &LiveTree,
+        down: &RowStore<T>,
+        word: &[u64],
+        below: &[usize],
+        here: u64,
+    ) -> Result<Self, BonsaiErrors> {
+        let (arena, id_of, arena_of) = tree.to_tree()?;
+        let mut rows = down.clone();
+        rows.remap(&id_of);
+        let word_a: Vec<u64> = id_of.iter().map(|&v| word[v as usize]).collect();
+        let below_a: Vec<usize> = id_of.iter().map(|&v| below[v as usize]).collect();
+        assert_eq!(word_a, leaf_words(&arena), "live words");
+        assert_eq!(below_a, leaves_below(&arena), "live counts");
         assert_eq!(
-            a.branch(v).to_bits(),
-            b.branch(v).to_bits(),
-            "branch of {v}"
+            here,
+            split_fingerprint_counted(&arena, &word_a, &below_a),
+            "live fingerprint"
         );
+        Ok(Self {
+            by_word: word_index(&word_a),
+            tree: arena,
+            arena_of,
+            down: rows,
+            here,
+        })
     }
-    assert_eq!(applied.to_old, built.to_old, "row map");
-    assert_eq!(applied.word, leaf_words(b), "words");
-    assert_eq!(applied.below, leaves_below(b), "counts");
-    let word = leaf_words(b);
-    assert_eq!(
-        applied.print,
-        split_fingerprint_counted(b, &word, &leaves_below(b)),
-        "fingerprint"
-    );
-    // Row by row, each side read through its own map onto the current store.
-    let row = |fresh: &Fresh<T>, v: usize| -> (Vec<u64>, Vec<u64>, u64) {
-        let bits = |xs: &[T]| -> Vec<u64> {
-            xs.iter()
-                .map(|x| x.to_f64().map_or(u64::MAX, f64::to_bits))
-                .collect()
-        };
-        let p = down.n_features();
-        match fresh.inherited[v] {
-            NO_NODE => {
-                let k = fresh.slot[v] as usize;
-                (
-                    bits(&fresh.fresh_m[k * p..(k + 1) * p]),
-                    bits(&fresh.fresh_w[k * p..(k + 1) * p]),
-                    fresh.fresh_contrib[k].to_bits(),
-                )
-            }
-            old => (
-                bits(down.means(old)),
-                bits(down.precisions(old)),
-                down.contribution(old).to_bits(),
-            ),
-        }
-    };
-    for v in 0..a.n_nodes() {
-        let (ours, theirs) = (applied.fresh.inherited[v], built.fresh.inherited[v]);
-        if ours != NO_NODE && ours == theirs {
-            continue;
-        }
-        assert_eq!(row(&applied.fresh, v), row(&built.fresh, v), "row of {v}");
-    }
-    Ok(())
 }
 
 /// Debug builds: the views' placement, star and fingerprint against the built
@@ -2334,25 +2328,24 @@ fn check_applied<T: BonsaiFloat>(
 ///
 /// ### Params
 ///
-/// * `tree` - The current tree
-/// * `down` - Its rows
-/// * `x` - The pruned node
+/// * `mirror` - The current tree as an arena
+/// * `x` - The pruned node, a live id
 /// * `params` - Knobs
-/// * `best` - The attachment node and branch the view found
+/// * `best` - The attachment node, a live id, and branch the view found
 /// * `attached` - The star and fingerprint the view built
 ///
 /// ### Returns
 ///
 /// `Ok` if they agree; panics otherwise, which is the point.
-#[cfg(debug_assertions)]
 fn check_against_built<T: BonsaiFloat>(
-    tree: &Tree,
-    down: &RowStore<T>,
+    mirror: &Mirror<T>,
     x: u32,
     params: &SprParams,
     best: (u32, f64),
     attached: &Attached<'_, T>,
 ) -> Result<(), BonsaiErrors> {
+    let (tree, down) = (&mirror.tree, &mirror.down);
+    let x = mirror.arena_of[x as usize];
     let pruned = prune_subtree(tree, x)?.expect("the view accepted the cut");
     let rows = LazyRows::new(&pruned.tree, &pruned.to_old, tree, down)?;
     let q = EffLeaf {
@@ -2365,7 +2358,10 @@ fn check_against_built<T: BonsaiFloat>(
         |node: u32| rows.eff_leaf(node),
         Some(params.placement),
     )?;
-    assert_eq!(pruned.to_old[built.node as usize], best.0, "placement node");
+    assert_eq!(
+        pruned.to_old[built.node as usize], mirror.arena_of[best.0 as usize],
+        "placement node"
+    );
     assert_eq!(built.branch.to_bits(), best.1.to_bits(), "placement branch");
 
     let target = pruned.to_old[built.node as usize];
@@ -2401,63 +2397,77 @@ fn check_against_built<T: BonsaiFloat>(
     Ok(())
 }
 
-/// Turn what the views decided into a candidate, falling back to the built
-/// path where they declined.
+/// Debug builds: the built path's version of a move, on the mirror.
 ///
 /// ### Params
 ///
-/// * `tree` - The current tree
-/// * `down` - Its rows
-/// * `x` - The pruned node
+/// * `mirror` - The current tree as an arena
+/// * `x` - The pruned node, a live id
 /// * `params` - Knobs
-/// * `prints` - What the views read off the current tree
-/// * `by_word` - [`word_index`] of `tree`
-/// * `placed` - The carried-over attachment, if any
-/// * `fast` - What the views decided
+/// * `placed` - The attachment node, a live id, and branch, if known
 ///
 /// ### Returns
 ///
-/// The candidate, `None` if the move changes nothing or does not apply, or the
-/// error the built path failed with.
-#[allow(clippy::too_many_arguments)]
+/// What [`propose`] makes of it.
+fn built_on_mirror<T: BonsaiFloat>(
+    mirror: &Mirror<T>,
+    x: u32,
+    params: &SprParams,
+    placed: Option<(u32, f64)>,
+) -> Result<Option<Proposal<T>>, BonsaiErrors> {
+    propose(
+        &mirror.tree,
+        &mirror.down,
+        mirror.arena_of[x as usize],
+        params,
+        mirror.here,
+        &mirror.by_word,
+        placed.map(|(t, b)| (mirror.arena_of[t as usize], b)),
+    )
+}
+
+/// Turn what the views decided into a candidate.
+///
+/// ### Params
+///
+/// * `x` - The pruned node
+/// * `params` - Knobs
+/// * `prints` - What the views read off the current tree
+/// * `placed` - The carried-over attachment, if any
+/// * `fast` - What the views decided
+/// * `mirror` - The tree as an arena, to check against; debug builds only
+///
+/// ### Returns
+///
+/// The candidate, `Ok(None)` if the move changes nothing or does not apply,
+/// or `Err(())` if the views declined and the built path has to decide.
 fn candidate<T: BonsaiFloat>(
-    tree: &Tree,
-    down: &RowStore<T>,
     x: u32,
     params: &SprParams,
     prints: &Prints<'_>,
-    by_word: &FxHashMap<u64, u32>,
     placed: Option<(u32, f64)>,
     fast: Fast<T>,
-) -> Result<Option<Candidate<T>>, BonsaiErrors> {
+    mirror: Option<&Mirror<T>>,
+) -> Result<Result<Option<Candidate<T>>, ()>, BonsaiErrors> {
     match fast {
         Fast::NoMove => {
-            #[cfg(debug_assertions)]
-            assert!(
-                propose(tree, down, x, params, prints.here, by_word, placed)?.is_none(),
-                "the views called a move no move"
-            );
-            Ok(None)
+            if let Some(mirror) = mirror {
+                assert!(
+                    built_on_mirror(mirror, x, params, placed)?.is_none(),
+                    "the views called a move no move"
+                );
+            }
+            Ok(Ok(None))
         }
         Fast::Move(target, branch, score, data) => {
-            #[cfg(debug_assertions)]
-            {
-                let built = propose(
-                    tree,
-                    down,
-                    x,
-                    params,
-                    prints.here,
-                    by_word,
-                    Some((target, branch)),
-                )?;
+            if let Some(mirror) = mirror {
                 assert_eq!(
-                    built.map(|b| b.score),
+                    built_on_mirror(mirror, x, params, Some((target, branch)))?.map(|b| b.score),
                     Some(score),
                     "the views scored a move differently from the built path"
                 );
             }
-            Ok(Some(Candidate {
+            Ok(Ok(Some(Candidate {
                 pruned: x,
                 target,
                 branch,
@@ -2466,12 +2476,9 @@ fn candidate<T: BonsaiFloat>(
                 target_word: prints.word[target as usize],
                 built: None,
                 data,
-            }))
+            })))
         }
-        Fast::Declined => Ok(
-            propose(tree, down, x, params, prints.here, by_word, placed)?
-                .map(|built| Candidate::from_built(built, prints.word)),
-        ),
+        Fast::Declined => Ok(Err(())),
     }
 }
 
@@ -2484,74 +2491,178 @@ struct Want {
     placed: Option<(u64, f64)>,
 }
 
-/// Score a chunk of moves against the tree as it stands, in parallel.
+/// Score a chunk of moves against the tree as it stands.
 ///
-/// Scored by the views where they can, by the built path where they decline.
+/// In parallel on the views; the few the views decline (a cut that leaves
+/// the root of degree two, a binary root) are then scored on the built path
+/// in one go, through an arena numbering of the tree, before anything is
+/// decided, so every candidate is scored against the same tree.
 ///
 /// ### Params
 ///
 /// * `tree` - The current tree
-/// * `down` - Its rows
+/// * `down` - Its rows; keyed by arena index while the built path runs, and
+///   restored
 /// * `params` - Knobs
 /// * `prints` - What the views read off the current tree
-/// * `by_word` - [`word_index`] of `tree`
-/// * `caches` - One view cache per worker and one spare
+/// * `by_word` - Word index of `tree`
+/// * `caches` - Spare view caches, taken and returned
 /// * `wants` - The moves, `None` for a slot with nothing to score
+/// * `mirror` - The tree as an arena, to check against; debug builds only
 ///
 /// ### Returns
 ///
 /// One candidate per slot, `None` where the move changes nothing, does not
 /// apply, or a leaf word no longer names a node; or the error the placement,
-/// the primitive or the arena failed with.
+/// the primitive or the arena failed with. A candidate the built path scored
+/// is in the arena's ids.
 #[allow(clippy::too_many_arguments)]
 fn score_chunk<T: BonsaiFloat>(
-    tree: &Tree,
-    down: &RowStore<T>,
+    tree: &LiveTree,
+    down: &mut RowStore<T>,
     params: &SprParams,
     prints: &Prints<'_>,
     by_word: &FxHashMap<u64, u32>,
-    caches: &[Mutex<ViewCache<T>>],
+    caches: &Mutex<Vec<ViewCache<T>>>,
     wants: &[Option<Want>],
+    mirror: Option<&Mirror<T>>,
 ) -> Result<Vec<Option<Candidate<T>>>, BonsaiErrors> {
     // The sweep accepts the first candidate that clears the floor, so only its
     // views are needed: a candidate keeps its views if it clears the floor and
     // no earlier one has been seen to.
     let floor = acceptance_floor(params, unfixed(prints.score));
     let first = AtomicUsize::new(usize::MAX);
-    wants
+    let space = tree.id_space();
+    let rows: &RowStore<T> = down;
+    type Scored<T> = Result<Option<Candidate<T>>, (u32, Option<(u32, f64)>)>;
+    let scored: Vec<Scored<T>> = wants
         .par_iter()
         .enumerate()
-        .map(|(i, want)| -> Result<Option<Candidate<T>>, BonsaiErrors> {
+        .map(|(i, want)| -> Result<Scored<T>, BonsaiErrors> {
             let Some(want) = want else {
-                return Ok(None);
+                return Ok(Ok(None));
             };
             let Some(&x) = by_word.get(&want.pruned_word) else {
-                return Ok(None);
+                return Ok(Ok(None));
             };
             let placed = match want.placed {
                 None => None,
                 Some((target_word, branch)) => match by_word.get(&target_word) {
                     Some(&target) => Some((target, branch)),
-                    None => return Ok(None),
+                    None => return Ok(Ok(None)),
                 },
             };
-            let slot = rayon::current_thread_index().unwrap_or(caches.len() - 1);
-            let fast = match caches[slot.min(caches.len() - 1)].try_lock() {
-                Ok(mut cache) => {
-                    if cache.len() < tree.n_nodes() + 1 {
-                        *cache = ViewCache::new(tree.n_nodes() + 1);
-                    }
-                    let keep = |score: i128| {
-                        unfixed(score - prints.score) > floor
-                            && first.fetch_min(i, Ordering::Relaxed) >= i
-                    };
-                    view_move(tree, down, x, params, prints, placed, &keep, &mut cache)?
-                }
-                Err(_) => Fast::Declined,
+            // A worker can pick up another proposal while it holds a cache,
+            // since the star primitive runs rayon work, so each proposal takes
+            // a cache of its own from the pool.
+            let taken = caches.lock().expect("cache pool").pop();
+            let mut cache = match taken {
+                Some(cache) if cache.len() >= space => cache,
+                _ => ViewCache::new(space),
             };
-            candidate(tree, down, x, params, prints, by_word, placed, fast)
+            let keep = |score: i128| {
+                unfixed(score - prints.score) > floor && first.fetch_min(i, Ordering::Relaxed) >= i
+            };
+            let fast = view_move(
+                tree, rows, x, params, prints, placed, &keep, &mut cache, mirror,
+            );
+            caches.lock().expect("cache pool").push(cache);
+            Ok(candidate(x, params, prints, placed, fast?, mirror)?.map_err(|()| (x, placed)))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+
+    let mut arena: Option<Arena> = None;
+    let mut out = Vec::with_capacity(scored.len());
+    for s in scored {
+        let (x, placed) = match s {
+            Ok(c) => {
+                out.push(c);
+                continue;
+            }
+            Err(declined) => declined,
+        };
+        if arena.is_none() {
+            let (t, id_of, arena_of) = tree.to_tree()?;
+            let word: Vec<u64> = id_of.iter().map(|&v| prints.word[v as usize]).collect();
+            arena = Some(Arena {
+                by_word: word_index(&word),
+                slot: down.remap(&id_of),
+                tree: t,
+                arena_of,
+                word,
+            });
+        }
+        let a = arena.as_ref().expect("made above");
+        let built = propose(
+            &a.tree,
+            down,
+            a.arena_of[x as usize],
+            params,
+            prints.here,
+            &a.by_word,
+            placed.map(|(g, b)| (a.arena_of[g as usize], b)),
+        )?;
+        out.push(built.map(|b| Candidate::from_built(b, &a.word)));
+    }
+    if let Some(a) = arena {
+        down.restore(a.slot);
+    }
+    Ok(out)
+}
+
+/// The live tree numbered as an arena, for the built path's few proposals.
+struct Arena {
+    /// The arena tree.
+    tree: Tree,
+    /// The store's slot map before it was keyed by arena index.
+    slot: Vec<u32>,
+    /// Leaf words by arena index.
+    word: Vec<u64>,
+    /// Word index by arena index.
+    by_word: FxHashMap<u64, u32>,
+    /// Arena index of each live id.
+    arena_of: Vec<u32>,
+}
+
+/// Words of every node within `radius` edges of a clade a move created.
+///
+/// [`mark_near_new_clades`] over the live tree, from the created clades
+/// alone, so it touches only the neighbourhood it marks.
+///
+/// ### Params
+///
+/// * `tree` - The tree the move produced
+/// * `word` - Its leaf words
+/// * `seeds` - The clades the move created
+/// * `radius` - How many edges out to mark
+/// * `out` - Set the words are added to
+fn mark_near_live(
+    tree: &LiveTree,
+    word: &[u64],
+    seeds: &[u32],
+    radius: usize,
+    out: &mut FxHashSet<u64>,
+) {
+    let mut dist: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut queue = std::collections::VecDeque::new();
+    for &v in seeds {
+        if dist.insert(v, 0).is_none() {
+            queue.push_back(v);
+        }
+    }
+    while let Some(v) = queue.pop_front() {
+        out.insert(word[v as usize]);
+        let d = dist[&v];
+        if d == radius {
+            continue;
+        }
+        for nb in tree.children(v).iter().copied().chain(tree.parent(v)) {
+            if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(nb) {
+                e.insert(d + 1);
+                queue.push_back(nb);
+            }
+        }
+    }
 }
 
 ////////////
@@ -2592,11 +2703,11 @@ fn candidate_order(tree: &Tree, params: &SprParams, rng: &mut SplitMix64) -> Vec
 /// One sweep over the candidate subtrees, performing every improving move.
 ///
 /// The order is fixed against the tree the sweep starts from, but the tree
-/// changes under it: an accepted move renumbers the arena, so each candidate is
-/// looked up by its [`leaf_words`] entry in the tree as it stands, and one
-/// whose word no longer names a node has been swallowed by an earlier move and
-/// is skipped. Everything the scan reads off the tree is settled once and
-/// resettled only where a move actually moved it.
+/// changes under it, so each candidate is looked up by its [`leaf_words`]
+/// entry in the tree as it stands, and one whose word no longer names a node
+/// has been swallowed by an earlier move and is skipped. The tree is a
+/// [`LiveTree`] for the length of the sweep: an accepted move changes the
+/// nodes and rows on the paths it touched and nothing else.
 ///
 /// A candidate is scored on the tree it would produce, as the current
 /// [`fixed`] total less the terms the move changes plus the ones it forms,
@@ -2667,29 +2778,30 @@ fn sweep<T: BonsaiFloat>(
     start: (NodeState<T>, f64),
 ) -> Result<(SprResult, FxHashSet<u64>, Option<NodeState<T>>), BonsaiErrors> {
     let mut rng = SplitMix64::new(params.seed);
-    let mut tree = tree.clone();
     let mut gains = Vec::new();
+    let radius = params.search.revisit_radius();
+    let recheck = params.search.recheck();
 
     // All of these describe the tree as it stands, and a rejected candidate
     // leaves it exactly as it stands, so they are settled once and again only
-    // when a move is accepted.
+    // where a move is accepted.
     let (settled, loglik_in) = start;
     let mut down = RowStore::from_state(&settled, tree.n_nodes());
     drop(settled);
-    let mut best = down.score(&tree);
-    let mut word = leaf_words(&tree);
-    let mut below = leaves_below(&tree);
-    let mut here = split_fingerprint_counted(&tree, &word, &below);
+    let mut best = down.score(tree);
+    let mut word = leaf_words(tree);
+    let mut below = leaves_below(tree);
+    let mut here = split_fingerprint_counted(tree, &word, &below);
     let mut by_word = word_index(&word);
-    // One up-row cache per worker, reused across proposals, and one for a
-    // caller outside the pool. Taken with `try_lock`: the star primitive runs
-    // rayon work, so a worker can pick up another proposal while it holds its
-    // own, and that one then falls back to the built path rather than wait.
-    let caches: Vec<Mutex<ViewCache<T>>> = (0..rayon::current_num_threads() + 1)
-        .map(|_| Mutex::new(ViewCache::new(tree.n_nodes() + 1)))
-        .collect();
+    let mut live = LiveTree::from_tree(tree);
+    let caches: Mutex<Vec<ViewCache<T>>> = Mutex::new(Vec::new());
+    let mut mirror = if cfg!(debug_assertions) {
+        Some(Mirror::new(&live, &down, &word, &below, here)?)
+    } else {
+        None
+    };
 
-    let mut order = candidate_order(&tree, &params, &mut rng);
+    let mut order = candidate_order(tree, &params, &mut rng);
     if let Some(look) = look {
         order.retain(|w| look.contains(w));
     }
@@ -2698,7 +2810,6 @@ fn sweep<T: BonsaiFloat>(
     let mut chunk = PROPOSAL_CHUNK_MIN;
     while next < order.len() {
         let end = (next + chunk).min(order.len());
-        let recheck = params.search.recheck();
         let wants: Vec<Option<Want>> = order[next..end]
             .iter()
             .map(|&w| {
@@ -2708,19 +2819,21 @@ fn sweep<T: BonsaiFloat>(
                 })
             })
             .collect();
+        let prints = Prints {
+            word: &word,
+            below: &below,
+            here,
+            score: best,
+        };
         let mut batch = score_chunk(
-            &tree,
-            &down,
+            &live,
+            &mut down,
             &params,
-            &Prints {
-                word: &word,
-                below: &below,
-                here,
-                score: best,
-            },
+            &prints,
             &by_word,
             &caches,
             &wants,
+            mirror.as_ref(),
         )?;
         // Decided in order. After an acceptance the rest of the chunk was
         // scored against the tree before it, so with the recheck it is scored
@@ -2737,24 +2850,26 @@ fn sweep<T: BonsaiFloat>(
                 if unfixed(cand.score - best) <= acceptance_floor(&params, unfixed(best)) {
                     continue;
                 }
-                let n_leaves = tree.n_leaves();
-                let radius = params.search.revisit_radius();
-                match cand.built {
+                gains.push(SprGain {
+                    pruned: cand.pruned,
+                    gain: unfixed(cand.score - best),
+                });
+                best = cand.score;
+                match cand.built.take() {
                     Some(proposal) => {
-                        gains.push(SprGain {
-                            pruned: proposal.pruned,
-                            gain: unfixed(proposal.score - best),
-                        });
-                        best = proposal.score;
+                        // Scored by the built path on the tree as the batch
+                        // found it, which no acceptance has changed since.
+                        let (_, id_of, _) = live.to_tree()?;
+                        down.remap(&id_of);
                         down.accept_fresh(proposal.fresh);
-                        tree = proposal.tree;
-                        word = leaf_words(&tree);
-                        below = leaves_below(&tree);
-                        here = split_fingerprint_counted(&tree, &word, &below);
+                        live = LiveTree::from_tree(&proposal.tree);
+                        word = leaf_words(&proposal.tree);
+                        below = leaves_below(&proposal.tree);
+                        here = split_fingerprint_counted(&proposal.tree, &word, &below);
                         by_word = word_index(&word);
                         if radius > 0 {
                             mark_near_new_clades(
-                                &tree,
+                                &proposal.tree,
                                 &word,
                                 |v| proposal.to_old[v] == NO_NODE,
                                 radius,
@@ -2763,53 +2878,51 @@ fn sweep<T: BonsaiFloat>(
                         }
                     }
                     None => {
-                        let Some(data) = cand.data.take() else {
-                            // The first candidate over the floor always kept
-                            // its views; see `score_chunk`.
-                            debug_assert!(false, "the accepted candidate kept no views");
-                            continue;
+                        let data = cand
+                            .data
+                            .take()
+                            .expect("the first candidate over the floor kept its views");
+                        let expected = match &mirror {
+                            Some(m) => built_on_mirror(
+                                m,
+                                cand.pruned,
+                                &params,
+                                Some((cand.target, cand.branch)),
+                            )?,
+                            None => None,
                         };
-                        let mut applied = apply_move(&tree, &down, *data, &word, &below)?;
-                        for &v in &applied.changed {
-                            applied.to_old[v as usize] = by_word
-                                .get(&applied.word[v as usize])
-                                .copied()
-                                .filter(|&old| old as usize >= n_leaves)
-                                .unwrap_or(NO_NODE);
-                        }
-                        #[cfg(debug_assertions)]
-                        check_applied(&tree, &down, &params, here, &by_word, &cand, &applied)?;
-                        gains.push(SprGain {
-                            pruned: cand.pruned,
-                            gain: unfixed(cand.score - best),
-                        });
-                        best = cand.score;
-                        down.accept_fresh(applied.fresh);
-                        for &old in &applied.stale {
-                            if by_word.get(&word[old as usize]) == Some(&old) {
-                                by_word.remove(&word[old as usize]);
+                        let applied =
+                            apply_move(&mut live, &mut down, *data, &mut word, &mut below);
+                        let n_leaves = live.n_leaves();
+                        let created: Vec<u32> = applied
+                            .changed
+                            .iter()
+                            .copied()
+                            .filter(|&v| {
+                                by_word
+                                    .get(&word[v as usize])
+                                    .is_none_or(|&old| (old as usize) < n_leaves)
+                            })
+                            .collect();
+                        for &(w, v) in &applied.stale {
+                            if by_word.get(&w) == Some(&v) {
+                                by_word.remove(&w);
                             }
                         }
-                        for v in by_word.values_mut() {
-                            *v = applied.new_id[*v as usize];
-                        }
                         for &v in &applied.changed {
-                            by_word.insert(applied.word[v as usize], v);
+                            by_word.insert(word[v as usize], v);
                         }
-                        tree = applied.tree;
-                        word = applied.word;
-                        below = applied.below;
                         here = applied.print;
+                        if let (Some(m), Some(built)) = (&mirror, expected) {
+                            check_applied(&live, &down, m, &built, &created)?;
+                        }
                         if radius > 0 {
-                            mark_near_new_clades(
-                                &tree,
-                                &word,
-                                |v| applied.to_old[v] == NO_NODE,
-                                radius,
-                                &mut revisit,
-                            );
+                            mark_near_live(&live, &word, &created, radius, &mut revisit);
                         }
                     }
+                }
+                if mirror.is_some() {
+                    mirror = Some(Mirror::new(&live, &down, &word, &below, here)?);
                 }
                 hit = Some(k);
                 break;
@@ -2836,19 +2949,21 @@ fn sweep<T: BonsaiFloat>(
                 break;
             }
             offset += k + 1;
+            let prints = Prints {
+                word: &word,
+                below: &below,
+                here,
+                score: best,
+            };
             batch = score_chunk(
-                &tree,
-                &down,
+                &live,
+                &mut down,
                 &params,
-                &Prints {
-                    word: &word,
-                    below: &below,
-                    here,
-                    score: best,
-                },
+                &prints,
                 &by_word,
                 &caches,
                 &rest,
+                mirror.as_ref(),
             )?;
         }
 
@@ -2870,6 +2985,7 @@ fn sweep<T: BonsaiFloat>(
         }
     }
 
+    let tree = live.to_tree()?.0;
     // The fresh prune the result reports is also the next sweep's start.
     let (loglik, settled) = if gains.is_empty() {
         (loglik_in, None)
@@ -2887,6 +3003,76 @@ fn sweep<T: BonsaiFloat>(
         revisit,
         settled,
     ))
+}
+
+/// Debug builds: a move applied to the live tree against the built path's.
+///
+/// ### Params
+///
+/// * `tree` - The live tree after the move
+/// * `down` - Its rows after the move
+/// * `mirror` - The arena before the move
+/// * `built` - The built path's move, on the mirror
+/// * `created` - The clades the live path marked as created
+///
+/// ### Returns
+///
+/// `Ok` if they agree; panics otherwise.
+fn check_applied<T: BonsaiFloat>(
+    tree: &LiveTree,
+    down: &RowStore<T>,
+    mirror: &Mirror<T>,
+    built: &Proposal<T>,
+    created: &[u32],
+) -> Result<(), BonsaiErrors> {
+    let (a, id_of, _) = tree.to_tree()?;
+    let b = &built.tree;
+    assert_eq!(a.n_nodes(), b.n_nodes(), "node count");
+    for v in 0..a.n_nodes() as u32 {
+        assert_eq!(a.parent(v), b.parent(v), "parent of {v}");
+        assert_eq!(
+            a.branch(v).to_bits(),
+            b.branch(v).to_bits(),
+            "branch of {v}"
+        );
+    }
+    let bits = |xs: &[T]| -> Vec<u64> {
+        xs.iter()
+            .map(|x| x.to_f64().map_or(u64::MAX, f64::to_bits))
+            .collect()
+    };
+    let p = down.n_features();
+    let fresh = &built.fresh;
+    for v in 0..a.n_nodes() {
+        let (m, w, c) = match fresh.inherited[v] {
+            NO_NODE => {
+                let k = fresh.slot[v] as usize;
+                (
+                    bits(&fresh.fresh_m[k * p..(k + 1) * p]),
+                    bits(&fresh.fresh_w[k * p..(k + 1) * p]),
+                    fresh.fresh_contrib[k].to_bits(),
+                )
+            }
+            old => (
+                bits(mirror.down.means(old)),
+                bits(mirror.down.precisions(old)),
+                mirror.down.contribution(old).to_bits(),
+            ),
+        };
+        let id = id_of[v];
+        assert_eq!(bits(down.means(id)), m, "means of {v}");
+        assert_eq!(bits(down.precisions(id)), w, "precisions of {v}");
+        assert_eq!(down.contribution(id).to_bits(), c, "term of {v}");
+    }
+    let mut want: Vec<u32> = (b.n_leaves()..b.n_nodes())
+        .filter(|&v| built.to_old[v] == NO_NODE)
+        .map(|v| id_of[v])
+        .collect();
+    let mut got = created.to_vec();
+    want.sort_unstable();
+    got.sort_unstable();
+    assert_eq!(got, want, "created clades");
+    Ok(())
 }
 
 /// Search step 5: sweep until a sweep finds nothing.

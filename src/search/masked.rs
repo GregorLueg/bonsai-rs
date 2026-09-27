@@ -34,14 +34,14 @@
 //! depend on it. Every assembly numbers a level by the order the nodes had
 //! before, so a move reorders only the nodes whose height it changed.
 
-use crate::errors::BonsaiErrors;
 use crate::model::merge::EffLeaf;
 use crate::model::place::Walk;
+use crate::search::live::{LiveTree, MoveEdit};
 use crate::search::polytomy::{CentreStar, RESOLVED_STAR_MEMBERS, splice_edits};
 use crate::search::split_hash;
-use crate::search::spr::{Fresh, Row, RowStore, UpSide, eff_step, fixed, root_up, up_step};
+use crate::search::spr::{Row, RowStore, UpSide, eff_step, fixed, root_up, up_step};
 use crate::search::star::StarResult;
-use crate::tree::{NO_NODE, Tree};
+use crate::tree::NO_NODE;
 use crate::utils::kernels::prune_general;
 use crate::utils::simd::prune_binary;
 use crate::utils::traits::BonsaiFloat;
@@ -53,35 +53,25 @@ use std::sync::OnceLock;
 // Shapes //
 ////////////
 
-/// Height of a node in a tree: zero for a leaf, one above its tallest child
-/// otherwise.
+/// Where a node sat in the arena order of the tree the views start from.
 ///
-/// The arena keeps internal nodes in contiguous levels by height, every height
-/// from one up occupied, so this is a binary search over the level starts.
+/// A node a view made, whose id lies past the tree's, sorts after every node
+/// the tree has, in id order, as the arena's assembly numbers it.
 ///
 /// ### Params
 ///
-/// * `tree` - The tree
+/// * `tree` - The tree the views start from
 /// * `v` - Node
 ///
 /// ### Returns
 ///
-/// The height.
-fn tree_height(tree: &Tree, v: u32) -> u32 {
-    let v = v as usize;
-    if v < tree.n_leaves() {
-        return 0;
+/// The sort key.
+fn old_order(tree: &LiveTree, v: u32) -> (u32, u32) {
+    if v as usize >= tree.id_space() {
+        (u32::MAX, v)
+    } else {
+        tree.order(v)
     }
-    let (mut lo, mut hi) = (0usize, tree.n_levels());
-    while hi - lo > 1 {
-        let mid = (lo + hi) / 2;
-        if tree.level(mid).0 <= v {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    lo as u32 + 1
 }
 
 /// A tree that differs from a base tree at a handful of nodes.
@@ -91,7 +81,7 @@ fn tree_height(tree: &Tree, v: u32) -> u32 {
 #[derive(Clone)]
 struct Shape<'a> {
     /// The base tree.
-    tree: &'a Tree,
+    tree: &'a LiveTree,
     /// Overridden parents, [`NO_NODE`] for a root.
     parent: FxHashMap<u32, u32>,
     /// Overridden child lists, in arena order.
@@ -112,7 +102,7 @@ impl<'a> Shape<'a> {
     /// ### Returns
     ///
     /// The view.
-    fn new(tree: &'a Tree) -> Self {
+    fn new(tree: &'a LiveTree) -> Self {
         Self {
             tree,
             parent: FxHashMap::default(),
@@ -182,15 +172,15 @@ impl<'a> Shape<'a> {
     fn height(&self, v: u32) -> u32 {
         match self.height.get(&v) {
             Some(&h) => h,
-            None => tree_height(self.tree, v),
+            None => self.tree.height(v),
         }
     }
 
     /// Recompute heights and child order along a path, bottom-up.
     ///
-    /// The arena orders children by height and then by id, leaves (height
-    /// zero) first; only nodes on a path whose subtrees changed can move in
-    /// that order, so only they are recomputed.
+    /// The arena orders children by height and then by their order before,
+    /// leaves (height zero) first; only nodes on a path whose subtrees changed
+    /// can move in that order, so only they are recomputed.
     ///
     /// ### Params
     ///
@@ -199,7 +189,7 @@ impl<'a> Shape<'a> {
         for &v in path {
             let mut kids = self.children(v).to_vec();
             let h = kids.iter().map(|&c| self.height(c)).max().unwrap_or(0) + 1;
-            kids.sort_by_key(|&c| (self.height(c), c));
+            kids.sort_by_key(|&c| (self.height(c), old_order(self.tree, c)));
             self.children.insert(v, kids);
             self.height.insert(v, h);
         }
@@ -418,10 +408,11 @@ pub(crate) struct Pruned<'a> {
     /// Leaves detached with the subtree, ascending.
     gone_leaves: Vec<u32>,
     /// Internal nodes absent from their original level, by that level's
-    /// height, ascending: the detached ones, the suppressed one, and path
+    /// height, in level order: the detached ones, the suppressed one, and path
     /// nodes whose height changed.
     gone: FxHashMap<u32, Vec<u32>>,
-    /// Path nodes whose height changed, by their new height, ascending.
+    /// Path nodes whose height changed, by their new height, in their order
+    /// before; the assembly puts them behind the level's own nodes.
     moved_in: FxHashMap<u32, Vec<u32>>,
     /// Tallest height in the view.
     max_height: u32,
@@ -440,7 +431,7 @@ impl<'a> Pruned<'a> {
     /// The view, or `None` where `x` may not be pruned or where the cut
     /// suppresses a degree-two root, which moves the root and is left to the
     /// built path.
-    pub(crate) fn new(tree: &'a Tree, x: u32) -> Option<Self> {
+    pub(crate) fn new(tree: &'a LiveTree, x: u32) -> Option<Self> {
         let par = tree.parent(x)?;
         if tree.parent(par).is_none() && tree.children(par).len() <= 3 {
             return None;
@@ -481,16 +472,16 @@ impl<'a> Pruned<'a> {
             if (v as usize) < tree.n_leaves() {
                 gone_leaves.push(v);
             } else {
-                gone.entry(tree_height(tree, v)).or_default().push(v);
+                gone.entry(tree.height(v)).or_default().push(v);
                 stack.extend_from_slice(tree.children(v));
             }
         }
         if let Some(sp) = suppressed {
-            gone.entry(tree_height(tree, sp)).or_default().push(sp);
+            gone.entry(tree.height(sp)).or_default().push(sp);
         }
         let mut moved_in: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         for &v in &path {
-            let (was, now) = (tree_height(tree, v), shape.height(v));
+            let (was, now) = (tree.height(v), shape.height(v));
             if was != now {
                 gone.entry(was).or_default().push(v);
                 moved_in.entry(now).or_default().push(v);
@@ -498,7 +489,7 @@ impl<'a> Pruned<'a> {
         }
         gone_leaves.sort_unstable();
         for list in gone.values_mut().chain(moved_in.values_mut()) {
-            list.sort_unstable();
+            list.sort_unstable_by_key(|&v| tree.order(v));
         }
         let max_height = moved_in
             .keys()
@@ -523,9 +514,9 @@ impl<'a> Pruned<'a> {
 
     /// The node at one position of the remaining tree's arena.
     ///
-    /// Leaves first by id, then internal nodes by height and then by id, as
-    /// the built arena numbers them; found by rank, not by materialising the
-    /// order.
+    /// Leaves first by id, then internal nodes by height and then by their
+    /// order before, as the built arena numbers them; found by rank, not by
+    /// materialising the order.
     ///
     /// ### Params
     ///
@@ -553,62 +544,51 @@ impl<'a> Pruned<'a> {
         let empty: Vec<u32> = Vec::new();
         let mut rank = pos - self.n_leaves;
         for h in 1..=self.max_height {
-            let (lo, hi) = if (h as usize) <= tree.n_levels() {
-                tree.level(h as usize - 1)
-            } else {
-                (0, 0)
-            };
             let gone = self.gone.get(&h).unwrap_or(&empty);
             let inn = self.moved_in.get(&h).unwrap_or(&empty);
-            let count = hi - lo - gone.len() + inn.len();
-            if rank < count {
-                return select(lo as u32, hi as u32, gone, inn, rank);
+            let stay = tree.level_len(h) - gone.len();
+            if rank < stay {
+                return select_skipping(tree, h, gone, rank);
             }
-            rank -= count;
+            if rank < stay + inn.len() {
+                return inn[rank - stay];
+            }
+            rank -= stay + inn.len();
         }
         unreachable!("an arena position past the remaining tree's node count")
     }
 }
 
-/// The `rank`-th id, ascending, of `[lo, hi)` without `gone` and with `inn`.
+/// The node at one rank of a level, not counting some of its nodes.
 ///
 /// ### Params
 ///
-/// * `lo`, `hi` - The level's id range
-/// * `gone` - Ids of the range that are absent, ascending
-/// * `inn` - Ids from elsewhere that are present, ascending, outside the range
-/// * `rank` - Position wanted, from zero
+/// * `tree` - The tree
+/// * `h` - The level's height
+/// * `gone` - Nodes of the level to skip, in level order
+/// * `rank` - Position wanted among the rest, from zero
 ///
 /// ### Returns
 ///
-/// The id.
-fn select(lo: u32, hi: u32, gone: &[u32], inn: &[u32], rank: usize) -> u32 {
-    let count = |v: u32| -> usize {
-        let in_range = if v < lo {
-            0
-        } else {
-            ((v - lo + 1) as usize).min((hi - lo) as usize)
-        };
-        in_range - gone.partition_point(|&g| g <= v) + inn.partition_point(|&i| i <= v)
-    };
-    let mut a = inn.first().map_or(lo, |&i| i.min(lo));
-    let mut b = inn
-        .last()
-        .map_or(hi.saturating_sub(1), |&i| i.max(hi.saturating_sub(1)));
-    while a < b {
-        let mid = a + (b - a) / 2;
-        if count(mid) > rank {
-            b = mid;
-        } else {
-            a = mid + 1;
+/// The node.
+fn select_skipping(tree: &LiveTree, h: u32, gone: &[u32], rank: usize) -> u32 {
+    // The least `t` with `t = rank + (skipped nodes at or before the t-th)`,
+    // reached from below; the node there is never a skipped one.
+    let mut t = rank;
+    loop {
+        let v = tree.level_select(h, t);
+        let at = tree.order(v).1;
+        let skipped = gone.partition_point(|&g| tree.order(g).1 <= at);
+        if t == rank + skipped {
+            return v;
         }
+        t = rank + skipped;
     }
-    a
 }
 
 impl Walk for Pruned<'_> {
     fn id_space(&self) -> usize {
-        self.shape.tree.n_nodes()
+        self.shape.tree.id_space()
     }
 
     fn spread_starts(&self, n_starts: usize) -> Vec<u32> {
@@ -813,7 +793,7 @@ pub(crate) fn attach<'a, T: BonsaiFloat>(
         return Regraft::Declined;
     }
     let x = view.x;
-    let joint = tree.n_nodes() as u32;
+    let joint = tree.id_space() as u32;
     let mut shape = view.shape.clone();
     let centre = if (target as usize) < tree.n_leaves() {
         let above = shape
@@ -1051,7 +1031,7 @@ pub(crate) fn score_move<T: BonsaiFloat>(
         for (&v, row) in layer {
             if seen.insert(v) {
                 total += fixed(row.2);
-                if (v as usize) < tree.n_nodes() {
+                if (v as usize) < tree.id_space() {
                     total -= fixed(store.contribution(v));
                 }
             }
@@ -1103,7 +1083,7 @@ fn splice_rows<'a, T: BonsaiFloat>(
     let before = &attached.shape;
     let mut shape = before.clone();
     // One past the regraft's own new node.
-    let first_new = tree.n_nodes() as u32 + 1;
+    let first_new = tree.id_space() as u32 + 1;
     let is_new = |v: u32| v >= first_new;
 
     let edits = splice_edits(&attached.star, result, first_new);
@@ -1172,9 +1152,9 @@ fn splice_rows<'a, T: BonsaiFloat>(
         let mut kids = shape.children(v).to_vec();
         kids.sort_by_key(|&c| {
             if is_new(c) {
-                (shape.height(c), 1u32, 0u32, c)
+                (shape.height(c), 1u32, 0u32, (0u32, c))
             } else {
-                (shape.height(c), 0, before.height(c), c)
+                (shape.height(c), 0, before.height(c), old_order(tree, c))
             }
         });
         shape.children.insert(v, kids);
@@ -1194,238 +1174,103 @@ fn splice_rows<'a, T: BonsaiFloat>(
 // Applying it //
 /////////////////
 
-/// The tree a move produces, and what the sweep keeps about it.
-pub(crate) struct Applied<T> {
-    /// The tree, numbered as the built path would number it.
-    pub(crate) tree: Tree,
-    /// Its rows that differ from the current tree's.
-    pub(crate) fresh: Fresh<T>,
-    /// Per node of `tree`, the current tree's internal node with the same
-    /// leaf set, or [`NO_NODE`]: what the built path's row map holds.
-    pub(crate) to_old: Vec<u32>,
-    /// [`crate::search::leaf_words`] of `tree`.
-    pub(crate) word: Vec<u64>,
-    /// [`crate::search::leaves_below`] of `tree`.
-    pub(crate) below: Vec<usize>,
-    /// Split fingerprint of `tree`.
-    pub(crate) print: u64,
-    /// Per current node, its index in `tree`, [`NO_NODE`] if it is gone.
-    pub(crate) new_id: Vec<u32>,
-    /// Nodes of `tree` whose rows the move changed or made; their `to_old`
-    /// entries are left for the caller, who holds the word index.
+/// What applying a move changed, for the sweep's word index and revisit set.
+pub(crate) struct Applied {
+    /// Nodes whose rows the move changed or made, by height.
     pub(crate) changed: Vec<u32>,
-    /// Current nodes whose word-index entry no longer holds: the ones whose
-    /// rows changed and the one the cut suppressed.
-    pub(crate) stale: Vec<u32>,
+    /// Word-index entries that no longer hold: the words the changed nodes
+    /// had, and the suppressed node's, with the node each named.
+    pub(crate) stale: Vec<(u64, u32)>,
+    /// Split fingerprint of the tree the move produced.
+    pub(crate) print: u64,
 }
 
-/// Apply a move the views scored, in one relabel of the arena.
+/// Apply a move the views scored, in place.
 ///
-/// The built path cuts, regrafts and splices through three arena assemblies
-/// and then maps rows, words and counts over the whole tree again. Here the
-/// views already hold everything that changed, so the arena is numbered once,
-/// in the order the built path's assemblies arrive at: internal nodes by
-/// height, then by their order in the regrafted arena, which is itself height
-/// then id, with the ancestors a splice made last. Rows, words, counts
-/// and the fingerprint are carried over for the nodes the move left alone and
-/// taken from the views for the rest.
+/// The tree takes the views' overrides ([`LiveTree::apply`]), the store takes
+/// their rows, and the words and counts are recomputed for the nodes whose
+/// rows changed, bottom-up. Nothing else is touched, so the cost is the
+/// changed paths' and not the tree's.
 ///
 /// ### Params
 ///
-/// * `tree` - The current tree
-/// * `store` - Its rows
+/// * `tree` - The current tree, updated
+/// * `store` - Its rows, updated
 /// * `data` - The views [`score_move`] scored the move on, against `tree`
-/// * `word` - The current tree's leaf words
-/// * `below` - Its leaf counts
+/// * `word` - Leaf words per id, updated
+/// * `below` - Leaf counts per id, updated
 ///
 /// ### Returns
 ///
-/// The applied move, or `MalformedTree` if the arena rejected the result.
+/// What changed.
 pub(crate) fn apply_move<T: BonsaiFloat>(
-    tree: &Tree,
-    store: &RowStore<T>,
+    tree: &mut LiveTree,
+    store: &mut RowStore<T>,
     data: MoveData<T>,
-    word: &[u64],
-    below: &[usize],
-) -> Result<Applied<T>, BonsaiErrors> {
+    word: &mut Vec<u64>,
+    below: &mut Vec<usize>,
+) -> Applied {
     let MoveData {
-        parent: over_parent,
-        children: over_children,
-        branch: over_branch,
-        height: over_height,
+        parent,
+        children,
+        branch,
+        height,
         before_height,
         layers,
         suppressed,
         print,
         n_made,
     } = data;
-    let shape = Shape {
-        tree,
-        parent: over_parent,
-        children: over_children,
-        branch: over_branch,
-        height: over_height,
-    };
-    let before = |v: u32| {
-        before_height
-            .get(&v)
-            .copied()
-            .unwrap_or_else(|| tree_height(tree, v))
-    };
-
-    let n0 = tree.n_nodes();
-    let n_leaves = tree.n_leaves();
-    let first_new = n0 as u32 + 1;
-    let space = n0 + 1 + n_made.unwrap_or(0);
-    let layers = [&layers[0], &layers[1], &layers[2]];
-
-    // The new tree over the id space, dense: the current arrays, then the
-    // views' overrides. Nothing below touches a hash map per node.
-    let mut par = vec![NO_NODE; space];
-    let mut len = vec![0.0f64; space];
-    let mut height = vec![0u32; space];
-    for v in 0..n0 {
-        par[v] = tree.parent(v as u32).unwrap_or(NO_NODE);
-    }
-    len[..n0].copy_from_slice(tree.branches());
-    for level in 0..tree.n_levels() {
-        let (lo, hi) = tree.level(level);
-        height[lo..hi].fill(level as u32 + 1);
-    }
-    for (&v, &a) in &shape.parent {
-        par[v as usize] = a;
-    }
-    for (&v, &t) in &shape.branch {
-        len[v as usize] = t;
-    }
-    for (&v, &h) in &shape.height {
-        height[v as usize] = h;
-    }
-    // Which view holds a node's row, nearest first; 0 where none does.
-    let mut layer_of = vec![0u8; space];
-    for (i, layer) in layers.iter().enumerate().rev() {
+    let space = tree.id_space() as u32;
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    let mut stale: Vec<(u64, u32)> = Vec::new();
+    for layer in &layers {
         for &v in layer.keys() {
-            layer_of[v as usize] = i as u8 + 1;
-        }
-    }
-    let row_of = |v: u32| &layers[layer_of[v as usize] as usize - 1][&v];
-
-    // Internal nodes in the arena's order: by height, then by their order in
-    // the regrafted arena, which is by its height and then by id, the
-    // ancestors a splice made last in the order they were made. Without a
-    // splice the regrafted arena is the new one and that is height, then id.
-    let alive = |v: usize| Some(v as u32) != suppressed && (v < n0 || par[v] != NO_NODE);
-    let mut order: Vec<u32> = (n_leaves..space)
-        .filter(|&v| alive(v))
-        .map(|v| v as u32)
-        .collect();
-    if n_made.is_some() {
-        order.sort_by_key(|&c| {
-            if c >= first_new {
-                (1u32, 0u32, c)
-            } else {
-                (0, before(c), c)
+            if v < space && seen.insert(v) {
+                stale.push((word[v as usize], v));
             }
-        });
+        }
     }
-    let max_h = order.iter().map(|&v| height[v as usize]).max().unwrap_or(0);
-    let mut start = vec![0u32; max_h as usize + 2];
-    for &v in &order {
-        start[height[v as usize] as usize + 1] += 1;
-    }
-    for h in 0..=max_h as usize {
-        start[h + 1] += start[h];
-    }
-    let mut new_id = vec![NO_NODE; space];
-    for (l, id) in new_id.iter_mut().enumerate().take(n_leaves) {
-        *id = l as u32;
-    }
-    for &v in &order {
-        let h = height[v as usize] as usize;
-        new_id[v as usize] = n_leaves as u32 + start[h];
-        start[h] += 1;
-    }
-    let n_new = n_leaves + order.len();
+    stale.extend(suppressed.map(|sp| (word[sp as usize], sp)));
+    stale.sort_unstable_by_key(|&(_, v)| v);
 
-    let mut parent = vec![NO_NODE; n_new];
-    let mut lengths = vec![0.0f64; n_new];
-    let mut orig = vec![NO_NODE; n_new];
-    for v in (0..n_leaves as u32).chain(order.iter().copied()) {
-        let nv = new_id[v as usize] as usize;
-        orig[nv] = v;
-        let a = par[v as usize];
-        parent[nv] = if a == NO_NODE {
-            NO_NODE
-        } else {
-            new_id[a as usize]
-        };
-        lengths[nv] = len[v as usize];
-    }
-    let new_tree = Tree::from_level_ordered(parent, lengths, n_leaves)?;
+    let real = tree.apply(MoveEdit {
+        parent: &parent,
+        children: &children,
+        branch: &branch,
+        height: &height,
+        before_height: &before_height,
+        suppressed,
+        n_made,
+    });
+    let r = |v: u32| real.get(&v).copied().unwrap_or(v);
+    word.resize(tree.id_space(), 0);
+    below.resize(tree.id_space(), 0);
 
-    // Words and counts of the nodes whose rows changed, bottom-up.
-    let mut changed_ids: Vec<u32> = layers
-        .iter()
-        .flat_map(|layer| layer.keys().copied())
-        .filter(|&v| layer_of[v as usize] != 0)
-        .collect();
-    changed_ids.sort_unstable_by_key(|&v| (height[v as usize], v));
-    changed_ids.dedup();
-    let mut now_word = word.to_vec();
-    now_word.resize(space, 0);
-    let mut now_below = below.to_vec();
-    now_below.resize(space, 0);
-    for &v in &changed_ids {
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    let mut changed: Vec<u32> = Vec::new();
+    for layer in &layers {
+        for (&v, row) in layer {
+            if seen.insert(v) {
+                let rv = r(v);
+                store.write_row(rv, &row.0, &row.1, row.2);
+                changed.push(rv);
+            }
+        }
+    }
+    changed.sort_unstable_by_key(|&v| (tree.height(v), v));
+    for &v in &changed {
         let (mut w, mut c) = (0u64, 0usize);
-        for &k in shape.children(v) {
-            w = w.wrapping_add(now_word[k as usize]);
-            c += now_below[k as usize];
+        for &k in tree.children(v) {
+            w = w.wrapping_add(word[k as usize]);
+            c += below[k as usize];
         }
-        now_word[v as usize] = w;
-        now_below[v as usize] = c;
+        word[v as usize] = w;
+        below[v as usize] = c;
     }
-
-    let p = store.n_features();
-    let mut inherited = vec![NO_NODE; n_new];
-    let mut slot = vec![NO_NODE; n_new];
-    let mut fresh_m: Vec<T> = Vec::with_capacity(changed_ids.len() * p);
-    let mut fresh_w: Vec<T> = Vec::with_capacity(changed_ids.len() * p);
-    let mut fresh_contrib: Vec<f64> = Vec::with_capacity(changed_ids.len());
-    let mut new_word = vec![0u64; n_new];
-    let mut new_below = vec![0usize; n_new];
-    let mut to_old = vec![NO_NODE; n_new];
-    let mut stale: Vec<u32> = changed_ids
-        .iter()
-        .copied()
-        .filter(|&v| (v as usize) < n0)
-        .collect();
-    stale.extend(suppressed);
-    let mut changed = Vec::with_capacity(changed_ids.len());
-    for (nv, &v) in orig.iter().enumerate() {
-        new_word[nv] = now_word[v as usize];
-        new_below[nv] = now_below[v as usize];
-        if layer_of[v as usize] == 0 {
-            inherited[nv] = v;
-            to_old[nv] = v;
-        } else {
-            let row = row_of(v);
-            slot[nv] = fresh_contrib.len() as u32;
-            fresh_m.extend_from_slice(&row.0);
-            fresh_w.extend_from_slice(&row.1);
-            fresh_contrib.push(row.2);
-            changed.push(nv as u32);
-        }
-    }
-    let fresh = Fresh::new(inherited, slot, fresh_m, fresh_w, fresh_contrib);
-    Ok(Applied {
-        tree: new_tree,
-        fresh,
-        to_old,
-        word: new_word,
-        below: new_below,
-        print,
-        new_id: new_id[..n0].to_vec(),
+    Applied {
         changed,
         stale,
-    })
+        print,
+    }
 }

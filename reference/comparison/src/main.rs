@@ -48,7 +48,10 @@ use bonsai_rs::tree::distance::{MAX_PAIRS, distance_recovery};
 use bonsai_rs::tree::export::layout_csv;
 use bonsai_rs::tree::layout::equal_angle;
 use bonsai_rs::tree::newick::{parse_newick, write_newick};
-use bonsai_rs::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
+use bonsai_rs::tree::simulate::{
+    SimulationParams, robinson_foulds, simulate_binary, simulate_binary_random_branches,
+    simulate_unbalanced,
+};
 use bonsai_rs::tree::{NO_NODE, Tree};
 use sanity_sc_rs::input::CountMatrix;
 use sanity_sc_rs::sanity;
@@ -82,10 +85,10 @@ fn run() -> Fallible<()> {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("gen") => {
-            if args.len() != 7 {
-                return Err(
-                    "usage: harness gen <dir> <n_leaves> <n_features> <noise_sd> <seed>".into(),
-                );
+            if args.len() != 7 && args.len() != 8 {
+                return Err("usage: harness gen <dir> <n_leaves> <n_features> <noise_sd> <seed> \
+                            [balanced|random|unbalanced]"
+                    .into());
             }
             generate(
                 Path::new(&args[2]),
@@ -93,6 +96,7 @@ fn run() -> Fallible<()> {
                 args[4].parse()?,
                 args[5].parse()?,
                 args[6].parse()?,
+                args.get(7).map_or("balanced", String::as_str),
             )
         }
         Some("sanity-rs") => {
@@ -236,7 +240,9 @@ fn cell_labels(n: usize) -> Vec<String> {
 
 /// Simulate one dataset and write it as CSV.
 ///
-/// Layout under `dir`:
+/// `shape` picks the generator: `balanced` ([`simulate_binary`]), `random`
+/// (balanced with random branch lengths) or `unbalanced` (random leaf
+/// splits). Layout under `dir`:
 ///
 /// * `ours/means.csv`, `ours/sds.csv`, `ours/truth.csv` - comma separated,
 ///   cells as rows and features as columns, no header
@@ -248,8 +254,9 @@ fn generate(
     n_features: usize,
     noise_sd: f64,
     seed: u64,
+    shape: &str,
 ) -> Fallible<()> {
-    let data = simulate_binary::<f64>(Some(SimulationParams {
+    let params = Some(SimulationParams {
         n_leaves,
         n_features,
         branch_length: BRANCH_LENGTH,
@@ -257,7 +264,13 @@ fn generate(
         noise_spread: NOISE_SPREAD,
         feature_mean_sd: 0.0,
         seed,
-    }))?;
+    });
+    let data = match shape {
+        "balanced" => simulate_binary::<f64>(params)?,
+        "random" => simulate_binary_random_branches::<f64>(params)?,
+        "unbalanced" => simulate_unbalanced::<f64>(params)?,
+        other => return Err(format!("unknown shape {other}").into()),
+    };
 
     let our_dir = dir.join("ours");
     fs::create_dir_all(&our_dir)?;
@@ -284,7 +297,8 @@ fn generate(
         dir.join("meta.tsv"),
         format!(
             "n_leaves\t{n_leaves}\nn_features\t{n_features}\nnoise_sd\t{noise_sd}\n\
-             noise_spread\t{NOISE_SPREAD}\nbranch_length\t{BRANCH_LENGTH}\nseed\t{seed}\n"
+             noise_spread\t{NOISE_SPREAD}\nbranch_length\t{BRANCH_LENGTH}\nseed\t{seed}\n\
+             shape\t{shape}\n"
         ),
     )?;
     println!(

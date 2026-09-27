@@ -556,7 +556,7 @@ impl SprResult {
 ///
 /// The tree and, per input index, its index in that tree or [`NO_NODE`] if it
 /// was dropped. `MalformedTree` if the arena rejected the result.
-fn assemble(
+pub(crate) fn assemble(
     parent: &[u32],
     branch: &[f64],
     root: u32,

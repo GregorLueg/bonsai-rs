@@ -63,13 +63,13 @@
 use crate::errors::BonsaiErrors;
 use crate::model::global::UpState;
 use crate::model::likelihood::NodeState;
-use crate::search::polytomy::{CentreStar, Splice, splice_star, splice_star_mapped};
-use crate::search::spr::{LazyRows, RowStore};
+use crate::search::polytomy::{CentreStar, Splice, splice_edits, splice_star};
+use crate::search::spr::{LazyRows, RowStore, assemble};
 use crate::search::star::{StarParams, StarResult, StarSelection, resolve_star};
 use crate::search::{
     Leaves, leaf_words, leaves_below, mark_near_new_clades, settle, settled_down, tree_loglik,
 };
-use crate::tree::Tree;
+use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::BonsaiFloat;
@@ -796,6 +796,55 @@ fn scan_edge<T: BonsaiFloat>(
     }
 }
 
+/// Perform an interchange: resolve its star and splice the result in.
+///
+/// Numbered by [`assemble`] rather than by
+/// [`crate::search::polytomy::splice_star`]'s post-order rebuild: a level keeps
+/// the order its nodes had, the ancestors the splice made last, so a move
+/// reorders only the nodes whose height it changed. That is what lets the lazy
+/// phase keep its tree up to date locally.
+///
+/// ### Params
+///
+/// * `tree` - The tree the star was built from
+/// * `star` - The collapsed star
+/// * `params` - Star primitive knobs
+///
+/// ### Returns
+///
+/// The spliced tree and, per node of it, its node in `tree` or [`NO_NODE`] for
+/// one the splice made; or the error the primitive or the arena failed with.
+fn perform<T: BonsaiFloat>(
+    tree: &Tree,
+    star: &CentreStar<T>,
+    params: StarParams,
+) -> Result<(Tree, Vec<u32>), BonsaiErrors> {
+    let result = resolve_star(star.view(), Some(params))?;
+    let n = tree.n_nodes();
+    let n_made = result.parent.len() - star.member_nodes.len();
+    let mut parent: Vec<u32> = (0..n as u32)
+        .map(|v| tree.parent(v).unwrap_or(NO_NODE))
+        .chain(std::iter::repeat_n(NO_NODE, n_made))
+        .collect();
+    let mut branch = tree.branches().to_vec();
+    branch.resize(n + n_made, 0.0);
+    for &k in &star.deleted {
+        parent[k as usize] = NO_NODE;
+    }
+    for (v, up, t) in splice_edits(star, &result, n as u32) {
+        parent[v as usize] = up;
+        branch[v as usize] = t;
+    }
+    let (next, map) = assemble(&parent, &branch, tree.root(), tree.n_leaves())?;
+    let mut to_old = vec![NO_NODE; next.n_nodes()];
+    for (old, &new) in map.iter().enumerate().take(n) {
+        if new != NO_NODE {
+            to_old[new as usize] = old as u32;
+        }
+    }
+    Ok((next, to_old))
+}
+
 /////////////
 // Phases //
 /////////////
@@ -998,7 +1047,7 @@ pub fn nni_greedy<T: BonsaiFloat>(
         match winner {
             None => break,
             Some((gain, _, star)) => {
-                tree = splice_star(&tree, &star, Some(params.star))?.tree;
+                tree = perform(&tree, &star, params.star)?.0;
                 best = Some(loglik + gain);
                 n_moves += 1;
             }
@@ -1149,7 +1198,7 @@ fn nni_lazy<T: BonsaiFloat>(
             None => full = true,
             Some((_, _, star)) => {
                 let before: FxHashSet<u64> = word.iter().copied().collect();
-                let (next, to_old) = splice_star_mapped(&tree, &star, Some(params.star))?;
+                let (next, to_old) = perform(&tree, &star, params.star)?;
                 store.accept(&next, &to_old, &tree)?;
                 tree = next;
                 n_moves += 1;

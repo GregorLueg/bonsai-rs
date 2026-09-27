@@ -271,34 +271,9 @@ pub fn splice_star<T: BonsaiFloat>(
     })
 }
 
-/// [`splice_star`], plus where every node of the new tree came from.
-///
-/// The same tree [`splice_star`] builds, node for node, so a caller that keeps
-/// rows across moves sees exactly the arena the plain splice would have given
-/// it. The map is recovered by walking up from each leaf in the spliced parent
-/// array and in the rebuilt tree in step, which pairs every reachable node once.
-///
-/// ### Params
-///
-/// * `tree` - The tree the star was built from
-/// * `star` - The star, from [`centre_star`] or from an interchange's collapse
-/// * `params` - Star primitive knobs, or `None` for the defaults
-///
-/// ### Returns
-///
-/// The new tree and, per node of it, its node in `tree` or [`NO_NODE`] for a
-/// node the splice created; or the error the primitive or the arena failed
-/// with.
-pub(crate) fn splice_star_mapped<T: BonsaiFloat>(
-    tree: &Tree,
-    star: &CentreStar<T>,
-    params: Option<StarParams>,
-) -> Result<(Tree, Vec<u32>), BonsaiErrors> {
-    let result = resolve_star(star.view(), params)?;
-    splice_result_mapped(tree, star, &result)
-}
-
-/// [`splice_result`], plus the node map of [`splice_star_mapped`].
+/// [`splice_result`], plus where every node of the new tree came from: per
+/// node, its node in the tree the star was built from, recovered by walking up
+/// from each leaf in the spliced parent array and in the rebuilt tree in step.
 ///
 /// ### Params
 ///

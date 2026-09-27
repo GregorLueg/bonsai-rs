@@ -99,7 +99,9 @@ use crate::search::masked::Attached;
 use crate::search::masked::{
     MoveData, Pruned as PrunedView, PrunedRows, Regraft, ViewCache, apply_move, attach, score_move,
 };
-use crate::search::polytomy::{CentreStar, splice_result};
+#[cfg(debug_assertions)]
+use crate::search::polytomy::splice_result;
+use crate::search::polytomy::{CentreStar, splice_edits};
 #[cfg(any(test, debug_assertions))]
 use crate::search::split_fingerprint_with;
 use crate::search::star::{StarParams, StarResult, resolve_star};
@@ -1985,7 +1987,7 @@ fn propose<T: BonsaiFloat>(
         if print == here {
             return Ok(None);
         }
-        let candidate = splice_result(&attached, &star, &result)?;
+        let candidate = splice_assembled(&attached, &star, &result)?;
         let word = leaf_words(&candidate);
         (candidate, word)
     };
@@ -2016,6 +2018,45 @@ fn propose<T: BonsaiFloat>(
         target,
         branch: placed_branch,
     }))
+}
+
+/// Splice a resolved star into a tree and number the result by [`assemble`].
+///
+/// Not [`crate::search::polytomy::splice_result`], whose rebuild numbers each
+/// level by a post-order walk: a move would then renumber nodes far from
+/// anything it touched. [`assemble`] numbers a level by the order the nodes
+/// already had, the made ancestors last, so a move reorders only the nodes
+/// whose height it changed, which is what lets the arena be kept up to date
+/// locally.
+///
+/// ### Params
+///
+/// * `tree` - The tree the star was built on
+/// * `star` - The star
+/// * `result` - Its resolution
+///
+/// ### Returns
+///
+/// The spliced tree, or the error the arena failed with.
+fn splice_assembled<T: BonsaiFloat>(
+    tree: &Tree,
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+) -> Result<Tree, BonsaiErrors> {
+    let n = tree.n_nodes();
+    let n_made = result.parent.len() - star.member_nodes.len();
+    let mut parent: Vec<u32> = (0..n)
+        .map(|v| tree.parent(v as u32).unwrap_or(NO_NODE))
+        .chain(std::iter::repeat_n(NO_NODE, n_made))
+        .collect();
+    let mut branch = tree.branches().to_vec();
+    branch.resize(n + n_made, 0.0);
+    debug_assert!(star.deleted.is_empty(), "an SPR star deletes nothing");
+    for (v, up, t) in splice_edits(star, result, n as u32) {
+        parent[v as usize] = up;
+        branch[v as usize] = t;
+    }
+    Ok(assemble(&parent, &branch, tree.root(), tree.n_leaves())?.0)
 }
 
 /// Fingerprint terms of the splits a star resolution adds.

@@ -31,7 +31,8 @@
 //! new terms. Only an accepted move is applied ([`apply_move`]), in one
 //! relabel of the arena that lands on the numbering the built path's three
 //! assemblies would, because the next proposal's beam starts and child orders
-//! depend on it.
+//! depend on it. Every assembly numbers a level by the order the nodes had
+//! before, so a move reorders only the nodes whose height it changed.
 
 use crate::errors::BonsaiErrors;
 use crate::model::merge::EffLeaf;
@@ -977,7 +978,7 @@ pub(crate) struct MoveData<T> {
     /// Heights it overrides.
     height: FxHashMap<u32, u32>,
     /// Heights the regrafted tree overrides, before any splice: the splice's
-    /// rebuild walks children in the regrafted arena's order.
+    /// assembly numbers a level in the regrafted arena's order.
     before_height: FxHashMap<u32, u32>,
     /// Rows the views recomputed, nearest first: the splice's, the regraft's,
     /// the cut's.
@@ -1224,8 +1225,8 @@ pub(crate) struct Applied<T> {
 /// and then maps rows, words and counts over the whole tree again. Here the
 /// views already hold everything that changed, so the arena is numbered once,
 /// in the order the built path's assemblies arrive at: internal nodes by
-/// height, then by id, or after a splice by their post-order in the regrafted
-/// arena, which is the order the splice's rebuild walks. Rows, words, counts
+/// height, then by their order in the regrafted arena, which is itself height
+/// then id, with the ancestors a splice made last. Rows, words, counts
 /// and the fingerprint are carried over for the nodes the move left alone and
 /// taken from the views for the rest.
 ///
@@ -1300,10 +1301,6 @@ pub(crate) fn apply_move<T: BonsaiFloat>(
     for (&v, &h) in &shape.height {
         height[v as usize] = h;
     }
-    let mut kids_over = vec![false; space];
-    for &v in shape.children.keys() {
-        kids_over[v as usize] = true;
-    }
     // Which view holds a node's row, nearest first; 0 where none does.
     let mut layer_of = vec![0u8; space];
     for (i, layer) in layers.iter().enumerate().rev() {
@@ -1313,53 +1310,23 @@ pub(crate) fn apply_move<T: BonsaiFloat>(
     }
     let row_of = |v: u32| &layers[layer_of[v as usize] as usize - 1][&v];
 
-    // Internal nodes in the arena's order: by height, then by id without a
-    // splice (the regraft's assembly), or by post-order with one (the splice's
-    // rebuild), which walks children in the regrafted arena's order with the
-    // made ancestors last.
-    let mut order: Vec<u32> = Vec::with_capacity(space - n_leaves);
-    match n_made {
-        None => {
-            let alive = |v: usize| Some(v as u32) != suppressed && (v < n0 || par[v] != NO_NODE);
-            order.extend((n_leaves..space).filter(|&v| alive(v)).map(|v| v as u32));
-        }
-        Some(_) => {
-            let mut stack: Vec<(u32, bool)> = vec![(tree.root(), false)];
-            let mut kids_buf: Vec<u32> = Vec::new();
-            while let Some((v, expanded)) = stack.pop() {
-                if expanded {
-                    order.push(v);
-                    continue;
-                }
-                stack.push((v, true));
-                if kids_over[v as usize] {
-                    kids_buf.clear();
-                    kids_buf.extend_from_slice(shape.children(v));
-                    kids_buf.sort_by_key(|&c| {
-                        if c >= first_new {
-                            (1u32, 0u32, c)
-                        } else {
-                            (0, before(c), c)
-                        }
-                    });
-                    stack.extend(
-                        kids_buf
-                            .iter()
-                            .rev()
-                            .filter(|&&c| c as usize >= n_leaves)
-                            .map(|&c| (c, false)),
-                    );
-                } else {
-                    stack.extend(
-                        tree.children(v)
-                            .iter()
-                            .rev()
-                            .filter(|&&c| c as usize >= n_leaves)
-                            .map(|&c| (c, false)),
-                    );
-                }
+    // Internal nodes in the arena's order: by height, then by their order in
+    // the regrafted arena, which is by its height and then by id, the
+    // ancestors a splice made last in the order they were made. Without a
+    // splice the regrafted arena is the new one and that is height, then id.
+    let alive = |v: usize| Some(v as u32) != suppressed && (v < n0 || par[v] != NO_NODE);
+    let mut order: Vec<u32> = (n_leaves..space)
+        .filter(|&v| alive(v))
+        .map(|v| v as u32)
+        .collect();
+    if n_made.is_some() {
+        order.sort_by_key(|&c| {
+            if c >= first_new {
+                (1u32, 0u32, c)
+            } else {
+                (0, before(c), c)
             }
-        }
+        });
     }
     let max_h = order.iter().map(|&v| height[v as usize]).max().unwrap_or(0);
     let mut start = vec![0u32; max_h as usize + 2];

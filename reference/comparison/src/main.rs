@@ -40,7 +40,7 @@ use bonsai_rs::model::likelihood::NodeState;
 use bonsai_rs::search::Leaves;
 use bonsai_rs::search::bounds::EllipsoidBounds;
 use bonsai_rs::search::candidates::KnnCandidates;
-use bonsai_rs::search::nni::nni;
+use bonsai_rs::search::nni::{NniSearch, nni};
 use bonsai_rs::search::polytomy::resolve_polytomies;
 use bonsai_rs::search::spr::{PruneOrder, SprSearch, spr};
 use bonsai_rs::search::star::{Star, star_tree_with};
@@ -904,6 +904,11 @@ fn spr_recheck_from_env(params: &mut BonsaiParams) {
     if let Some(seed) = env::var("SPR_SEED").ok().and_then(|v| v.parse().ok()) {
         params.spr.order = PruneOrder::Random;
         params.spr.seed = seed;
+    }
+    // SEARCH=exact runs SPR and NNI as SPEC 9.3 and 9.4 specify them.
+    if env::var("SEARCH").is_ok_and(|v| v == "exact") {
+        params.spr.search = SprSearch::Exact;
+        params.nni.search = NniSearch::Exact;
     }
 }
 

@@ -342,6 +342,20 @@ impl LiveTree {
         self.root
     }
 
+    /// Whether an id names a node of the tree.
+    ///
+    /// ### Params
+    ///
+    /// * `v` - Id
+    ///
+    /// ### Returns
+    ///
+    /// False for an id past the id space or one a move freed.
+    #[inline]
+    pub(crate) fn contains(&self, v: u32) -> bool {
+        (v as usize) < self.id_space() && (self.parent[v as usize] != NO_NODE || v == self.root)
+    }
+
     /// Parent of a node.
     ///
     /// ### Params
@@ -439,6 +453,21 @@ impl LiveTree {
     #[inline]
     pub(crate) fn level_len(&self, h: u32) -> usize {
         self.levels.get(h as usize - 1).map_or(0, |l| l.alive)
+    }
+
+    /// The nodes of one height, in arena order.
+    ///
+    /// ### Params
+    ///
+    /// * `h` - Height, at least one
+    ///
+    /// ### Returns
+    ///
+    /// The nodes, empty above the tallest level.
+    pub(crate) fn level_nodes(&self, h: u32) -> Vec<u32> {
+        self.levels
+            .get(h as usize - 1)
+            .map_or_else(Vec::new, Level::nodes)
     }
 
     /// The node at one rank of a level.
@@ -578,6 +607,90 @@ impl LiveTree {
         }
         debug_assert_eq!(self.parent[self.root as usize], NO_NODE);
         real
+    }
+}
+
+//////////////
+// Topology //
+//////////////
+
+/// What an edge scan reads off a tree, so that one scan serves the arena and
+/// the live tree alike.
+pub(crate) trait Topology {
+    /// Parent of a node, `None` at the root.
+    ///
+    /// ### Params
+    ///
+    /// * `v` - Node
+    ///
+    /// ### Returns
+    ///
+    /// The parent.
+    fn parent(&self, v: u32) -> Option<u32>;
+
+    /// Children of a node, in arena order.
+    ///
+    /// ### Params
+    ///
+    /// * `v` - Node
+    ///
+    /// ### Returns
+    ///
+    /// The children.
+    fn children(&self, v: u32) -> &[u32];
+
+    /// Branch above a node.
+    ///
+    /// ### Params
+    ///
+    /// * `v` - Node
+    ///
+    /// ### Returns
+    ///
+    /// The length.
+    fn branch(&self, v: u32) -> f64;
+
+    /// Number of leaves.
+    ///
+    /// ### Returns
+    ///
+    /// The count.
+    fn n_leaves(&self) -> usize;
+}
+
+impl Topology for Tree {
+    fn parent(&self, v: u32) -> Option<u32> {
+        Tree::parent(self, v)
+    }
+
+    fn children(&self, v: u32) -> &[u32] {
+        Tree::children(self, v)
+    }
+
+    fn branch(&self, v: u32) -> f64 {
+        Tree::branch(self, v)
+    }
+
+    fn n_leaves(&self) -> usize {
+        Tree::n_leaves(self)
+    }
+}
+
+impl Topology for LiveTree {
+    fn parent(&self, v: u32) -> Option<u32> {
+        LiveTree::parent(self, v)
+    }
+
+    fn children(&self, v: u32) -> &[u32] {
+        LiveTree::children(self, v)
+    }
+
+    fn branch(&self, v: u32) -> f64 {
+        LiveTree::branch(self, v)
+    }
+
+    fn n_leaves(&self) -> usize {
+        LiveTree::n_leaves(self)
     }
 }
 

@@ -63,18 +63,20 @@
 use crate::errors::BonsaiErrors;
 use crate::model::global::UpState;
 use crate::model::likelihood::NodeState;
+use crate::search::live::{LiveTree, MoveEdit, Topology};
 use crate::search::polytomy::{CentreStar, Splice, splice_edits, splice_star};
-use crate::search::spr::{LazyRows, RowStore, assemble};
+use crate::search::spr::{Row, RowStore, UpSide, assemble, root_up, up_step};
 use crate::search::star::{StarParams, StarResult, StarSelection, resolve_star};
-use crate::search::{
-    Leaves, leaf_words, leaves_below, mark_near_new_clades, settle, settled_down, tree_loglik,
-};
+use crate::search::{Leaves, leaf_words, leaves_below, settle, settled_down, tree_loglik};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
+use crate::utils::simd::prune_binary;
 use crate::utils::traits::BonsaiFloat;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 ////////////////
 // Parameters //
@@ -364,13 +366,22 @@ impl<T: BonsaiFloat> EdgeRows<T> for Settled<'_, T> {
     }
 }
 
-impl<T: BonsaiFloat> EdgeRows<T> for LazyRows<'_, T> {
+/// Down rows from a store kept current move by move, up rows formed for the
+/// round.
+struct LiveRows<'a, T> {
+    /// Down rows by node id.
+    store: &'a RowStore<T>,
+    /// Up rows of the nodes the round reads, by node id.
+    up: &'a FxHashMap<u32, Row<T>>,
+}
+
+impl<T: BonsaiFloat> EdgeRows<T> for LiveRows<'_, T> {
     fn down(&self, node: u32) -> (&[T], &[T]) {
-        self.down_row(node)
+        (self.store.means(node), self.store.precisions(node))
     }
 
     fn up(&self, node: u32) -> (&[T], &[T]) {
-        let row = self.up_row(node);
+        let row = &self.up[&node];
         (&row.0, &row.1)
     }
 }
@@ -390,7 +401,7 @@ impl<T: BonsaiFloat> EdgeRows<T> for LazyRows<'_, T> {
 ///
 /// The member count, or `None` if the edge is not eligible: `k` is the root or
 /// a leaf, or the collapse leaves too few members to merge.
-fn interchange_members(tree: &Tree, k: u32) -> Option<usize> {
+fn interchange_members(tree: &impl Topology, k: u32) -> Option<usize> {
     let l = tree.parent(k)?;
     if tree.children(k).is_empty() {
         return None;
@@ -417,7 +428,7 @@ fn interchange_members(tree: &Tree, k: u32) -> Option<usize> {
 ///
 /// The star, or `None` if the edge is not eligible.
 fn collapsed_star<T: BonsaiFloat>(
-    tree: &Tree,
+    tree: &impl Topology,
     rows: &impl EdgeRows<T>,
     k: u32,
 ) -> Option<CentreStar<T>> {
@@ -596,7 +607,7 @@ impl<T: BonsaiFloat> PeelScratch<T> {
 ///
 /// The loglikelihood of the collapsed tree less that of `tree`, in nats.
 fn collapse_delta<T: BonsaiFloat>(
-    tree: &Tree,
+    tree: &impl Topology,
     rows: &impl EdgeRows<T>,
     k: u32,
     l: u32,
@@ -733,7 +744,7 @@ fn rebuilds_the_same_splits<T>(
 /// split, and the proposal when that gain clears the floor; or the error the
 /// primitive failed with.
 fn scan_edge<T: BonsaiFloat>(
-    tree: &Tree,
+    tree: &impl Topology,
     rows: &impl EdgeRows<T>,
     below: &[usize],
     k: u32,
@@ -1068,6 +1079,442 @@ pub fn nni_greedy<T: BonsaiFloat>(
     })
 }
 
+/// A cached gain as a sort key, highest first.
+#[derive(Clone, Copy, Debug)]
+struct Desc(f64);
+
+impl PartialEq for Desc {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Desc {}
+
+impl PartialOrd for Desc {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Desc {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.0.total_cmp(&self.0)
+    }
+}
+
+/// The cached gains of the tree's edges, ordered so that the leader and the
+/// runner-up are read off the front rather than found by a pass over the tree.
+#[derive(Default)]
+struct Leaders {
+    /// Gain and lower end of every edge with a cached gain, highest first.
+    order: BTreeSet<(Desc, u32)>,
+    /// The gain each edge is filed under.
+    gain: FxHashMap<u32, f64>,
+}
+
+impl Leaders {
+    /// File an edge under a gain, replacing what it had.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Lower end of the edge
+    /// * `g` - Its gain
+    fn set(&mut self, k: u32, g: f64) {
+        if let Some(old) = self.gain.insert(k, g) {
+            self.order.remove(&(Desc(old), k));
+        }
+        self.order.insert((Desc(g), k));
+    }
+
+    /// Forget an edge.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Lower end of the edge
+    fn remove(&mut self, k: u32) {
+        if let Some(old) = self.gain.remove(&k) {
+            self.order.remove(&(Desc(old), k));
+        }
+    }
+
+    /// Forget every edge.
+    fn clear(&mut self) {
+        self.order.clear();
+        self.gain.clear();
+    }
+
+    /// The leading edge and the best gain of the rest.
+    ///
+    /// Ties on the leading gain go to the edge first in arena order, as a
+    /// pass over the arena would find it, and make the runner-up equal to the
+    /// leader. An edge with no cached gain counts as minus infinity.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - The tree, for arena order
+    ///
+    /// ### Returns
+    ///
+    /// The leader's gain, its lower end, and the runner-up's gain; `None` if
+    /// nothing is cached.
+    fn lead(&self, tree: &LiveTree) -> Option<(f64, u32, f64)> {
+        let mut it = self.order.iter();
+        let &(Desc(top), first) = it.next()?;
+        let (mut lead, mut second) = (first, f64::NEG_INFINITY);
+        for &(Desc(g), k) in it {
+            if g != top {
+                second = second.max(g);
+                break;
+            }
+            second = top;
+            if tree.order(k) < tree.order(lead) {
+                lead = k;
+            }
+        }
+        Some((top, lead, second))
+    }
+}
+
+/// One node's up row, from its parent's.
+///
+/// [`crate::search::spr::LazyRows`]'s expressions over the live tree, so the
+/// bits are the up sweep's.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `store` - Its down rows
+/// * `c` - The node
+/// * `above` - Its parent's up row, `None` at the root
+///
+/// ### Returns
+///
+/// The node's up row.
+fn up_row_of<T: BonsaiFloat>(
+    tree: &LiveTree,
+    store: &RowStore<T>,
+    c: u32,
+    above: Option<&Row<T>>,
+) -> Row<T> {
+    let Some(a) = tree.parent(c) else {
+        return root_up(store.n_features());
+    };
+    let above = above.expect("a parent's up row is formed before its children's");
+    let kids = tree.children(a);
+    let side = if kids.len() == 2 {
+        let o = if kids[0] == c { kids[1] } else { kids[0] };
+        UpSide::Sibling(tree.branch(o), store.means(o), store.precisions(o))
+    } else {
+        UpSide::Parent(
+            store.means(a),
+            store.precisions(a),
+            tree.branch(c),
+            store.means(c),
+            store.precisions(c),
+        )
+    };
+    up_step(
+        tree.parent(a).is_none(),
+        tree.branch(a),
+        (&above.0, &above.1),
+        side,
+    )
+}
+
+/// Form the up rows of some nodes and of every ancestor of them.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `store` - Its down rows
+/// * `nodes` - The nodes whose up rows are wanted
+/// * `up` - Rows formed so far this round, extended
+fn fill_up<T: BonsaiFloat>(
+    tree: &LiveTree,
+    store: &RowStore<T>,
+    nodes: impl Iterator<Item = u32>,
+    up: &mut FxHashMap<u32, Row<T>>,
+) {
+    let mut need: Vec<u32> = Vec::new();
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    for v in nodes {
+        let mut u = v;
+        while !up.contains_key(&u) && seen.insert(u) {
+            need.push(u);
+            match tree.parent(u) {
+                Some(a) => u = a,
+                None => break,
+            }
+        }
+    }
+    // A parent is taller than its children, so tallest first is top-down.
+    need.sort_unstable_by_key(|&u| std::cmp::Reverse(tree.height(u)));
+    for u in need {
+        let row = up_row_of(tree, store, u, tree.parent(u).map(|a| &up[&a]));
+        up.insert(u, row);
+    }
+}
+
+/// Form the up row of every internal node, a level at a time.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `store` - Its down rows
+///
+/// ### Returns
+///
+/// Up rows by node id.
+fn fill_up_all<T: BonsaiFloat>(tree: &LiveTree, store: &RowStore<T>) -> FxHashMap<u32, Row<T>> {
+    let mut up: FxHashMap<u32, Row<T>> = FxHashMap::default();
+    for h in (1..=tree.n_levels() as u32).rev() {
+        let nodes = tree.level_nodes(h);
+        let rows: Vec<(u32, Row<T>)> = nodes
+            .par_iter()
+            .map(|&c| {
+                (
+                    c,
+                    up_row_of(tree, store, c, tree.parent(c).map(|a| &up[&a])),
+                )
+            })
+            .collect();
+        up.extend(rows);
+    }
+    up
+}
+
+/// What the lazy phase keeps about the tree between moves, by node id.
+struct Lazy<T> {
+    /// The tree.
+    tree: LiveTree,
+    /// Its down rows.
+    store: RowStore<T>,
+    /// Leaf words.
+    word: Vec<u64>,
+    /// Leaf counts.
+    below: Vec<usize>,
+    /// Node per leaf word.
+    by_word: FxHashMap<u64, u32>,
+}
+
+impl<T: BonsaiFloat> Lazy<T> {
+    /// Perform an interchange in place, as [`perform`] numbers it.
+    ///
+    /// The collapse deletes `k` and the splice hangs the star's members under
+    /// the ancestors the primitive made; only those ancestors, the centre and
+    /// the path above it change their rows or their heights. Leaf sets move
+    /// between them: with the upstream side merged, an ancestor takes over the
+    /// centre's old leaf set and the centre the deleted node's.
+    ///
+    /// ### Params
+    ///
+    /// * `star` - The collapsed star at the edge above `k`
+    /// * `k` - The node the collapse deletes
+    /// * `params` - Star primitive knobs
+    ///
+    /// ### Returns
+    ///
+    /// The nodes whose rows the move changed or made, and the ones among them
+    /// whose leaf set the tree did not have; or the error the primitive failed
+    /// with.
+    fn perform(
+        &mut self,
+        star: &CentreStar<T>,
+        k: u32,
+        params: StarParams,
+    ) -> Result<(Vec<u32>, Vec<u32>), BonsaiErrors> {
+        let result = resolve_star(star.view(), Some(params))?;
+        let tree = &self.tree;
+        let l = star.centre;
+        let first_new = tree.id_space() as u32 + 1;
+        let is_new = |v: u32| v >= first_new;
+        let n_made = result.parent.len() - star.member_nodes.len();
+        let edits = splice_edits(star, &result, first_new);
+
+        let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut branch: FxHashMap<u32, f64> = FxHashMap::default();
+        let mut children: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        children.insert(
+            l,
+            tree.children(l)
+                .iter()
+                .copied()
+                .filter(|&c| c != k)
+                .collect(),
+        );
+        for &(v, up, t) in &edits {
+            let old = if is_new(v) {
+                None
+            } else {
+                parent.get(&v).copied().or_else(|| tree.parent(v))
+            };
+            if old != Some(up) {
+                if let Some(op) = old.filter(|&op| op != k) {
+                    children
+                        .entry(op)
+                        .or_insert_with(|| tree.children(op).to_vec())
+                        .retain(|&c| c != v);
+                }
+                children
+                    .entry(up)
+                    .or_insert_with(|| {
+                        if is_new(up) {
+                            Vec::new()
+                        } else {
+                            tree.children(up).to_vec()
+                        }
+                    })
+                    .push(v);
+                parent.insert(v, up);
+            }
+            branch.insert(v, t);
+        }
+        let par_of = |v: u32| parent.get(&v).copied().or_else(|| tree.parent(v));
+        let kids_of = |v: u32| -> &[u32] {
+            match children.get(&v) {
+                Some(kids) => kids,
+                None => tree.children(v),
+            }
+        };
+
+        // The ancestors made, the centre and its ancestors, in post-order.
+        let mut changed: FxHashSet<u32> = (first_new..first_new + n_made as u32).collect();
+        let mut u = Some(l);
+        while let Some(v) = u {
+            changed.insert(v);
+            u = par_of(v);
+        }
+        let mut order: Vec<u32> = Vec::with_capacity(changed.len());
+        let mut stack = vec![(tree.root(), false)];
+        while let Some((v, expanded)) = stack.pop() {
+            if expanded {
+                order.push(v);
+                continue;
+            }
+            stack.push((v, true));
+            for &c in kids_of(v) {
+                if changed.contains(&c) {
+                    stack.push((c, false));
+                }
+            }
+        }
+        debug_assert_eq!(order.len(), changed.len());
+        let mut height: FxHashMap<u32, u32> = FxHashMap::default();
+        for &v in &order {
+            let h = kids_of(v)
+                .iter()
+                .map(|&c| height.get(&c).copied().unwrap_or_else(|| tree.height(c)))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            height.insert(v, h);
+        }
+        // Children in the arena order of the result: height, then the order
+        // before, the ancestors made last.
+        let key = |c: u32| {
+            let h = height.get(&c).copied().unwrap_or_else(|| tree.height(c));
+            if is_new(c) {
+                (h, (u32::MAX, c))
+            } else {
+                (h, tree.order(c))
+            }
+        };
+        let sorted: FxHashMap<u32, Vec<u32>> = order
+            .iter()
+            .map(|&v| {
+                let mut kids = kids_of(v).to_vec();
+                kids.sort_unstable_by_key(|&c| key(c));
+                (v, kids)
+            })
+            .collect();
+
+        // Rows bottom-up, through the kernels the prune dispatches to.
+        let p = self.store.n_features();
+        let mut rows: FxHashMap<u32, (Vec<T>, Vec<T>, f64)> = FxHashMap::default();
+        let mut work: Vec<f64> = Vec::new();
+        for &v in &order {
+            let kids = &sorted[&v];
+            let children_rows: Vec<(&[T], &[T], f64)> = kids
+                .iter()
+                .map(|&c| {
+                    let t = branch.get(&c).copied().unwrap_or_else(|| tree.branch(c));
+                    match rows.get(&c) {
+                        Some(r) => (r.0.as_slice(), r.1.as_slice(), t),
+                        None => (self.store.means(c), self.store.precisions(c), t),
+                    }
+                })
+                .collect();
+            let mut m_out = vec![T::zero(); p];
+            let mut w_out = vec![T::zero(); p];
+            let contrib = if children_rows.len() == 2 {
+                let (a, b) = (children_rows[0], children_rows[1]);
+                prune_binary(a.0, a.1, a.2, b.0, b.1, b.2, &mut m_out, &mut w_out)
+            } else {
+                let need = p * children_rows.len();
+                if work.len() < need {
+                    work.resize(need, 0.0);
+                }
+                prune_general(&children_rows, &mut m_out, &mut w_out, &mut work[..need])
+            };
+            rows.insert(v, (m_out, w_out, contrib));
+        }
+
+        // Read before the move: the id it frees can go to a node it makes, and
+        // the centre can take over the deleted node's leaf set.
+        let old_words: Vec<u64> = order
+            .iter()
+            .filter(|&&v| !is_new(v))
+            .map(|&v| self.word[v as usize])
+            .chain(std::iter::once(self.word[k as usize]))
+            .collect();
+        let before_height = FxHashMap::default();
+        let real = self.tree.apply(MoveEdit {
+            parent: &parent,
+            children: &sorted,
+            branch: &branch,
+            height: &height,
+            before_height: &before_height,
+            suppressed: Some(k),
+            n_made: Some(n_made),
+        });
+        let r = |v: u32| real.get(&v).copied().unwrap_or(v);
+        for (&v, row) in &rows {
+            self.store.write_row(r(v), &row.0, &row.1, row.2);
+        }
+        let space = self.tree.id_space();
+        self.word.resize(space, 0);
+        self.below.resize(space, 0);
+        for &v in &order {
+            let rv = r(v);
+            let (mut w, mut c) = (0u64, 0usize);
+            for &kid in self.tree.children(rv) {
+                w = w.wrapping_add(self.word[kid as usize]);
+                c += self.below[kid as usize];
+            }
+            self.word[rv as usize] = w;
+            self.below[rv as usize] = c;
+        }
+        let changed: Vec<u32> = order.iter().map(|&v| r(v)).collect();
+        let fresh: Vec<u32> = changed
+            .iter()
+            .copied()
+            .filter(|&v| !self.by_word.contains_key(&self.word[v as usize]))
+            .collect();
+        for &v in &changed {
+            self.by_word.insert(self.word[v as usize], v);
+        }
+        for w in old_words {
+            if let Some(&v) = self.by_word.get(&w)
+                && !(self.tree.contains(v) && self.word[v as usize] == w)
+            {
+                self.by_word.remove(&w);
+            }
+        }
+        Ok((changed, fresh))
+    }
+}
+
 /// The greedy phase with cached gains, [`NniSearch::Approximate`].
 ///
 /// Round one scores every edge. After a move, only the edges within `radius`
@@ -1079,17 +1526,16 @@ pub fn nni_greedy<T: BonsaiFloat>(
 /// improving, the next round is a full scan, and a full scan that finds
 /// nothing ends the phase, which is the same stopping rule as the exact phase.
 ///
-/// Nothing is swept per round. The down rows are settled once and kept in a
-/// [`RowStore`], which an accepted move updates in its `O(depth)` changed rows;
-/// up rows are formed by [`LazyRows`] only along the chains the scanned edges
-/// read. Both are the sweep's own bits, so the moves are the ones a settle per
-/// round would make. Measured 2026-09-26 on Baron 10k, steps 3 to 8 from the
-/// same linkage tree: identical tree and loglikelihood, step 6 26.3 s to 7.2 s.
+/// The tree is a [`LiveTree`] for the length of the phase, so a move changes
+/// the rows, words and counts of the nodes on the paths it touched and nothing
+/// else. Down rows are settled once and kept in a [`RowStore`]; up rows are
+/// formed per round along the chains the scanned edges read, all of them on a
+/// full scan. Both are the sweep's own bits, so the moves are the ones a settle
+/// per round would make.
 ///
-/// Edges are keyed by [`leaf_words`] of their lower end, so a gain survives the
-/// renumbering a splice performs. Everything that decides a move is sequential
-/// and the parallel scans collect in edge order, so the result does not depend
-/// on the thread count.
+/// Edges are keyed by [`leaf_words`] of their lower end, as the cache is.
+/// Everything that decides a move is sequential and the parallel scans collect
+/// in edge order, so the result does not depend on the thread count.
 ///
 /// ### Params
 ///
@@ -1109,44 +1555,81 @@ fn nni_lazy<T: BonsaiFloat>(
     radius: usize,
 ) -> Result<NniResult, BonsaiErrors> {
     let min_gain = params.star.min_gain;
-    let mut tree = tree.clone();
     let mut n_moves = 0usize;
     let mut rounds = 0usize;
     let mut trace: Vec<NniRound> = Vec::new();
     let mut cache: FxHashMap<u64, f64> = FxHashMap::default();
+    let mut leaders = Leaders::default();
     let mut full = true;
+    let mut pending: Vec<u32> = Vec::new();
 
-    // Settled once. After that an accepted move rewrites only the `O(depth)`
-    // down rows it changed, and up rows are formed on demand along the chain to
-    // the root, so a round costs what it reads rather than an `O(n p)` settle.
-    let (down, _) = settled_down(&tree, leaves)?;
-    let mut store = RowStore::from_state(&down, tree.n_nodes());
+    let (down, _) = settled_down(tree, leaves)?;
+    let word = leaf_words(tree);
+    let mut lazy = Lazy {
+        store: RowStore::from_state(&down, tree.n_nodes()),
+        tree: LiveTree::from_tree(tree),
+        by_word: word
+            .iter()
+            .enumerate()
+            .map(|(v, &w)| (w, v as u32))
+            .collect(),
+        below: leaves_below(tree),
+        word,
+    };
     drop(down);
 
     while rounds < params.max_rounds {
         rounds += 1;
-        let identity: Vec<u32> = (0..tree.n_nodes() as u32).collect();
-        let rows = LazyRows::new(&tree, &identity, &tree, &store)?;
-        let below = leaves_below(&tree);
-        let word = leaf_words(&tree);
-        if full {
+        let live = &lazy.tree;
+        let edges: Vec<u32> = if full {
             cache.clear();
-        }
-        let edges: Vec<u32> = tree
-            .internal_postorder()
-            .filter(|&k| !cache.contains_key(&word[k as usize]))
-            .collect();
+            leaders.clear();
+            pending.clear();
+            (1..=live.n_levels() as u32)
+                .flat_map(|h| live.level_nodes(h))
+                .collect()
+        } else {
+            let mut edges: Vec<u32> = pending
+                .drain(..)
+                .filter(|&v| {
+                    v as usize >= live.n_leaves()
+                        && live.contains(v)
+                        && !cache.contains_key(&lazy.word[v as usize])
+                })
+                .collect();
+            edges.sort_unstable();
+            edges.dedup();
+            edges
+        };
+        let mut up = if full {
+            fill_up_all(live, &lazy.store)
+        } else {
+            let mut up = FxHashMap::default();
+            fill_up(
+                live,
+                &lazy.store,
+                edges.iter().filter_map(|&k| live.parent(k)),
+                &mut up,
+            );
+            up
+        };
 
-        let scanned: Vec<(u32, NniRound)> = edges
-            .par_iter()
-            .map_init(
-                || PeelScratch::<T>::new(leaves.n_features),
-                |scratch, &k| {
-                    scan_edge(&tree, &rows, &below, k, params.star, scratch)
-                        .map(|(seen, _)| (k, seen))
-                },
-            )
-            .collect::<Result<_, _>>()?;
+        let scanned: Vec<(u32, NniRound)> = {
+            let rows = LiveRows {
+                store: &lazy.store,
+                up: &up,
+            };
+            edges
+                .par_iter()
+                .map_init(
+                    || PeelScratch::<T>::new(leaves.n_features),
+                    |scratch, &k| {
+                        scan_edge(live, &rows, &lazy.below, k, params.star, scratch)
+                            .map(|(seen, _)| (k, seen))
+                    },
+                )
+                .collect::<Result<_, _>>()?
+        };
         let mut round = NniRound {
             best_gain: f64::NEG_INFINITY,
             ..NniRound::default()
@@ -1157,63 +1640,58 @@ fn nni_lazy<T: BonsaiFloat>(
             round.changed += seen.changed;
             round.improving += seen.improving;
             round.best_gain = round.best_gain.max(seen.best_gain);
-            cache.insert(word[k as usize], seen.best_gain);
+            cache.insert(lazy.word[k as usize], seen.best_gain);
+            leaders.set(k, seen.best_gain);
         }
         trace.push(round);
 
         let mut scratch = PeelScratch::<T>::new(leaves.n_features);
         let winner = loop {
-            // Leader and runner-up over the edges the tree has now, ties to
-            // the lower node as in the exact phase.
-            let mut lead: Option<(f64, u32)> = None;
-            let mut second = f64::NEG_INFINITY;
-            for k in tree.internal_postorder() {
-                let g = cache
-                    .get(&word[k as usize])
-                    .copied()
-                    .unwrap_or(f64::NEG_INFINITY);
-                match lead {
-                    Some((top, _)) if g <= top => second = second.max(g),
-                    _ => {
-                        if let Some((top, _)) = lead {
-                            second = second.max(top);
-                        }
-                        lead = Some((g, k));
-                    }
-                }
-            }
-            let Some((_, k)) = lead.filter(|&(g, _)| g > min_gain) else {
+            let Some((_, k, second)) = leaders.lead(live).filter(|&(g, _, _)| g > min_gain) else {
                 break None;
             };
-            let (seen, proposal) = scan_edge(&tree, &rows, &below, k, params.star, &mut scratch)?;
-            cache.insert(word[k as usize], seen.best_gain);
+            fill_up(live, &lazy.store, live.parent(k).into_iter(), &mut up);
+            let rows = LiveRows {
+                store: &lazy.store,
+                up: &up,
+            };
+            let (seen, proposal) =
+                scan_edge(live, &rows, &lazy.below, k, params.star, &mut scratch)?;
+            cache.insert(lazy.word[k as usize], seen.best_gain);
+            leaders.set(k, seen.best_gain);
             if let Some(found) = proposal.filter(|p| p.0 >= second) {
                 break Some(found);
             }
         };
-        drop(rows);
+        drop(up);
 
         match winner {
             None if full => break,
             None => full = true,
-            Some((_, _, star)) => {
-                let before: FxHashSet<u64> = word.iter().copied().collect();
-                let (next, to_old) = perform(&tree, &star, params.star)?;
-                store.accept(&next, &to_old, &tree)?;
-                tree = next;
+            Some((_, k, star)) => {
+                #[cfg(debug_assertions)]
+                let expected = expected_interchange(&lazy.tree, leaves, k, params.star)?;
+                leaders.remove(k);
+                let (changed, fresh) = lazy.perform(&star, k, params.star)?;
+                #[cfg(debug_assertions)]
+                check_interchange(&lazy, &expected, leaves)?;
                 n_moves += 1;
-                let after = leaf_words(&tree);
-                let mut stale = FxHashSet::default();
-                mark_near_new_clades(
-                    &tree,
-                    &after,
-                    |v| !before.contains(&after[v]),
-                    radius,
-                    &mut stale,
-                );
-                for w in &stale {
-                    cache.remove(w);
+                let mut stale: Vec<u32> = Vec::new();
+                near(&lazy.tree, &fresh, radius, &mut stale);
+                for &v in &stale {
+                    cache.remove(&lazy.word[v as usize]);
+                    leaders.remove(v);
                 }
+                // A gain is the leaf set's, as the cache is keyed, so a node
+                // whose leaf set changed takes the gain filed under its new one.
+                for &v in &changed {
+                    leaders.remove(v);
+                    if let Some(&g) = cache.get(&lazy.word[v as usize]) {
+                        leaders.set(v, g);
+                    }
+                }
+                pending.extend(stale);
+                pending.extend(changed);
                 full = false;
             }
         }
@@ -1221,6 +1699,7 @@ fn nni_lazy<T: BonsaiFloat>(
 
     // One sweep at the end rather than one a round: the rows' own sum agrees
     // with it only to rounding, and callers compare against sweeps.
+    let tree = lazy.tree.to_tree()?.0;
     let loglik = tree_loglik(&tree, leaves)?;
     Ok(NniResult {
         tree,
@@ -1229,6 +1708,124 @@ fn nni_lazy<T: BonsaiFloat>(
         rounds,
         trace,
     })
+}
+
+/// Every node within `radius` edges of some nodes, the nodes included.
+///
+/// [`mark_near_new_clades`] over the live tree, from the created clades
+/// alone, so it touches only the neighbourhood it marks.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `seeds` - The nodes to start from
+/// * `radius` - How many edges out to go
+/// * `out` - Receives the nodes reached, each once
+fn near(tree: &LiveTree, seeds: &[u32], radius: usize, out: &mut Vec<u32>) {
+    let mut dist: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut queue = std::collections::VecDeque::new();
+    for &v in seeds {
+        if dist.insert(v, 0).is_none() {
+            queue.push_back(v);
+        }
+    }
+    while let Some(v) = queue.pop_front() {
+        out.push(v);
+        let d = dist[&v];
+        if d == radius {
+            continue;
+        }
+        for nb in tree.children(v).iter().copied().chain(tree.parent(v)) {
+            if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(nb) {
+                e.insert(d + 1);
+                queue.push_back(nb);
+            }
+        }
+    }
+}
+
+/// Debug builds: the tree [`perform`] builds from an interchange on the live
+/// tree numbered as an arena.
+///
+/// ### Params
+///
+/// * `tree` - The live tree
+/// * `leaves` - The leaf data
+/// * `k` - The node the interchange deletes
+/// * `params` - Star primitive knobs
+///
+/// ### Returns
+///
+/// The arena tree the built path makes.
+#[cfg(debug_assertions)]
+fn expected_interchange<T: BonsaiFloat>(
+    tree: &LiveTree,
+    leaves: Leaves<'_, T>,
+    k: u32,
+    params: StarParams,
+) -> Result<Tree, BonsaiErrors> {
+    let (arena, _, arena_of) = tree.to_tree()?;
+    let (down, up, _) = settle(&arena, leaves)?;
+    let rows = Settled {
+        down: &down,
+        up: &up,
+    };
+    let star = collapsed_star(&arena, &rows, arena_of[k as usize])
+        .expect("the live tree found this edge eligible");
+    Ok(perform(&arena, &star, params)?.0)
+}
+
+/// Debug builds: the live tree after an interchange against the built path,
+/// and its rows, words and counts against a fresh settle.
+///
+/// ### Params
+///
+/// * `lazy` - The state after the move
+/// * `expected` - The built path's tree
+/// * `leaves` - The leaf data
+///
+/// ### Returns
+///
+/// `Ok` if they agree; panics otherwise.
+#[cfg(debug_assertions)]
+fn check_interchange<T: BonsaiFloat>(
+    lazy: &Lazy<T>,
+    expected: &Tree,
+    leaves: Leaves<'_, T>,
+) -> Result<(), BonsaiErrors> {
+    let (got, id_of, _) = lazy.tree.to_tree()?;
+    assert_eq!(got.n_nodes(), expected.n_nodes(), "node count");
+    for v in 0..got.n_nodes() as u32 {
+        assert_eq!(got.parent(v), expected.parent(v), "parent of {v}");
+        assert_eq!(
+            got.branch(v).to_bits(),
+            expected.branch(v).to_bits(),
+            "branch of {v}"
+        );
+    }
+    let (fresh, _) = settled_down(&got, leaves)?;
+    let word = leaf_words(&got);
+    let below = leaves_below(&got);
+    for v in 0..got.n_nodes() {
+        let id = id_of[v];
+        let same = |a: &[T], b: &[T]| {
+            a.iter()
+                .zip(b)
+                .all(|(x, y)| x.to_f64().map(f64::to_bits) == y.to_f64().map(f64::to_bits))
+        };
+        assert!(
+            same(lazy.store.means(id), fresh.means(v as u32)),
+            "means of {v}"
+        );
+        assert!(
+            same(lazy.store.precisions(id), fresh.precisions(v as u32)),
+            "precisions of {v}"
+        );
+        assert_eq!(lazy.word[id as usize], word[v], "word of {v}");
+        assert_eq!(lazy.below[id as usize], below[v], "count of {v}");
+        assert_eq!(lazy.by_word.get(&word[v]), Some(&id), "index of {v}");
+    }
+    Ok(())
 }
 
 /// Search step 6: the random phase, then the greedy phase.

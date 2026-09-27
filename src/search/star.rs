@@ -31,7 +31,9 @@ use crate::model::merge::{EffLeaf, MergeParams, MergeScore, MergeScratch, score_
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::rng::SplitMix64;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
+use crate::utils::verbosity::{Verbosity, report_decile_progress};
 use rayon::prelude::*;
+use std::time::Instant;
 
 ////////////////
 // Parameters //
@@ -1194,7 +1196,7 @@ pub fn resolve_star<T: BonsaiFloat>(
     star: Star<'_, T>,
     params: Option<StarParams>,
 ) -> Result<StarResult<T>, BonsaiErrors> {
-    resolve_star_with(star, params, &mut AllPairs)
+    resolve_star_with(star, params, &mut AllPairs, Verbosity::Quiet)
 }
 
 /// Run the star primitive.
@@ -1213,6 +1215,8 @@ pub fn resolve_star<T: BonsaiFloat>(
 /// * `star` - The members and their branches to the centre
 /// * `params` - Tuning knobs, or `None` for the defaults
 /// * `candidates` - Which pairs to consider each round
+/// * `verbosity` - [`Verbosity::Detailed`] prints progress at every tenth of
+///   the possible merges
 ///
 /// ### Returns
 ///
@@ -1222,6 +1226,7 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
     star: Star<'_, T>,
     params: Option<StarParams>,
     candidates: &mut C,
+    verbosity: Verbosity,
 ) -> Result<StarResult<T>, BonsaiErrors> {
     let params = params.unwrap_or_default();
     let p = star.n_features;
@@ -1292,6 +1297,7 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
     let mut branch = star.branch.to_vec();
     let mut merges: Vec<StarMerge> = Vec::with_capacity(max_merges);
     let mut members: Vec<u32> = (0..n as u32).collect();
+    let started = Instant::now();
 
     let mut mc = vec![0.0f64; p];
     let mut wc = vec![0.0f64; p];
@@ -1431,6 +1437,10 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
         );
         best_gain = best.gain;
         merges.push(merge);
+        if verbosity.detailed_verbosity() {
+            let done = merges.len();
+            report_decile_progress(done, done - 1, max_merges, "merges", started.elapsed());
+        }
     }
 
     let ancestor_means = m.split_off(n * p);
@@ -1472,7 +1482,7 @@ pub fn star_tree<T: BonsaiFloat>(
     star: Star<'_, T>,
     params: Option<StarParams>,
 ) -> Result<(Tree, f64), BonsaiErrors> {
-    star_tree_with(star, params, &mut AllPairs)
+    star_tree_with(star, params, &mut AllPairs, Verbosity::Quiet)
 }
 
 /// Resolve a star into a tree, choosing which candidate pairs are considered.
@@ -1496,6 +1506,7 @@ pub fn star_tree<T: BonsaiFloat>(
 /// * `star` - The members and their branches to the centre
 /// * `params` - Star knobs, or `None` for the defaults
 /// * `candidates` - Which pairs to consider each round
+/// * `verbosity` - As [`resolve_star_with`]
 ///
 /// ### Returns
 ///
@@ -1504,8 +1515,9 @@ pub fn star_tree_with<T: BonsaiFloat, C: CandidatePairs<T>>(
     star: Star<'_, T>,
     params: Option<StarParams>,
     candidates: &mut C,
+    verbosity: Verbosity,
 ) -> Result<(Tree, f64), BonsaiErrors> {
-    let result = resolve_star_with(star, params, candidates)?;
+    let result = resolve_star_with(star, params, candidates, verbosity)?;
     let gain: f64 = result.merges.iter().map(|x| x.gain).sum();
 
     let root = result.parent.len() as u32;
@@ -2460,8 +2472,13 @@ mod tests {
         let (m, w) = clustered(5, 2, p, 0.4, 4.0);
         let t0 = vec![0.5f64; n];
 
-        let restricted =
-            resolve_star_with(star(&m, &w, &t0, p), None, &mut Consecutive).expect("resolve");
+        let restricted = resolve_star_with(
+            star(&m, &w, &t0, p),
+            None,
+            &mut Consecutive,
+            Verbosity::Quiet,
+        )
+        .expect("resolve");
         let exhaustive = resolve_star(star(&m, &w, &t0, p), None).expect("resolve");
 
         // The clusters are consecutive in index, so the restriction still finds

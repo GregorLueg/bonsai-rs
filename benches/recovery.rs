@@ -46,6 +46,7 @@ use bonsai_rs::bonsai::bonsai_prepared;
 use bonsai_rs::ingest::PreparedData;
 use bonsai_rs::tree::distance::{MAX_PAIRS, distance_recovery};
 use bonsai_rs::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
+use bonsai_rs::utils::verbosity::Verbosity;
 
 fn main() {
     println!(
@@ -74,7 +75,7 @@ fn main() {
                 n_features_in: p,
             };
 
-            let out = bonsai_prepared(&data, None).expect("bonsai");
+            let out = bonsai_prepared(&data, None, Verbosity::Quiet).expect("bonsai");
 
             // Against the TRUE positions, not the measured ones. Correlating
             // against the measurements rewards a tree for fitting their noise,

@@ -969,6 +969,7 @@ mod tests {
     use crate::search::candidates::{KnnCandidates, KnnCandidatesParams};
     use crate::search::star::{AllPairs, Star, StarParams, StarResult, resolve_star_with};
     use crate::utils::rng::SplitMix64;
+    use crate::utils::verbosity::Verbosity;
 
     /// A star of clustered members with unequal precisions and branches.
     ///
@@ -1246,6 +1247,7 @@ mod tests {
             },
             Some(params),
             provider,
+            Verbosity::Quiet,
         )
         .expect("star")
     }
@@ -1465,9 +1467,9 @@ mod tests {
             n_features: p,
         };
         let params = Some(StarParams::default());
-        let base = resolve_star_with(star, params, &mut AllPairs).expect("base");
+        let base = resolve_star_with(star, params, &mut AllPairs, Verbosity::Quiet).expect("base");
         let mut bounded = EllipsoidBounds::new(AllPairs);
-        let got = resolve_star_with(star, params, &mut bounded).expect("bounded");
+        let got = resolve_star_with(star, params, &mut bounded, Verbosity::Quiet).expect("bounded");
         assert_eq!(base.parent, got.parent);
         assert_eq!(base.centre_children, got.centre_children);
     }

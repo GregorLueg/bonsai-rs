@@ -25,6 +25,8 @@
 //! configuration that was optimal when it was created often is not once the
 //! centre has moved.
 
+use std::time::Instant;
+
 use crate::errors::BonsaiErrors;
 use crate::ingest::{IngestParams, PreparedData, prepare};
 use crate::model::global::{GlobalBranchParams, collapse_onto_every_node, optimise_branch_lengths};
@@ -40,6 +42,7 @@ use crate::tree::Tree;
 use crate::tree::cluster::reroot_for_display;
 use crate::tree::linkage::{LinkageParams, linkage_tree};
 use crate::utils::traits::{BonsaiFloat, narrow};
+use crate::utils::verbosity::Verbosity;
 
 ////////////
 // Consts //
@@ -200,16 +203,47 @@ impl<T: BonsaiFloat> BonsaiResult<T> {
 // Helpers //
 /////////////
 
+/// Announce the start of a step.
+///
+/// ### Params
+///
+/// * `what` - The line to print, e.g. `"Step 5: SPR"`
+/// * `verbosity` - Prints at [`Verbosity::Normal`] and above
+///
+/// ### Returns
+///
+/// The step's start time, for [`record`].
+fn begin(what: &str, verbosity: Verbosity) -> Instant {
+    if verbosity.normal_verbosity() {
+        println!("{what}...");
+    }
+    Instant::now()
+}
+
 /// Append a step report, computing its gain from the previous one.
 ///
 /// ### Params
 ///
-/// * `step` - Which of the seven steps
+/// * `step` - Which of the eight steps
 /// * `loglik` - Loglikelihood after it
 /// * `steps` - Reports so far
-fn record(step: &'static str, loglik: f64, steps: &mut Vec<StepReport>) {
+/// * `verbosity` - Prints the report at [`Verbosity::Normal`] and above
+/// * `started` - When the step began, from [`begin`]
+fn record(
+    step: &'static str,
+    loglik: f64,
+    steps: &mut Vec<StepReport>,
+    verbosity: Verbosity,
+    started: Instant,
+) {
     let gain = steps.last().map_or(0.0, |last| loglik - last.loglik);
     steps.push(StepReport { step, loglik, gain });
+    if verbosity.normal_verbosity() {
+        println!(
+            "  loglik {loglik:.6e}, gain {gain:+.3e} ({:.2?})",
+            started.elapsed()
+        );
+    }
 }
 
 /// A star tree over `n_leaves` cells, every branch at [`INITIAL_STAR_BRANCH`].
@@ -303,6 +337,7 @@ fn posteriors<T: BonsaiFloat>(
 /// * `n_features` - Number of features
 /// * `variances` - Per-feature variance in raw units, or `None` to estimate it
 /// * `params` - Knobs, `None` for the defaults
+/// * `verbosity` - How much to print while running
 ///
 /// ### Returns
 ///
@@ -315,8 +350,10 @@ pub fn bonsai<T: BonsaiFloat>(
     n_features: usize,
     variances: Option<&[f64]>,
     params: Option<BonsaiParams>,
+    verbosity: Verbosity,
 ) -> Result<BonsaiResult<T>, BonsaiErrors> {
     let params = params.unwrap_or_default();
+    let started = begin("Ingest", verbosity);
     let prepared = prepare(
         means,
         sds,
@@ -325,7 +362,14 @@ pub fn bonsai<T: BonsaiFloat>(
         variances,
         Some(params.ingest),
     )?;
-    bonsai_prepared(&prepared, Some(params))
+    if verbosity.normal_verbosity() {
+        println!(
+            "  {n_cells} cells, {} / {n_features} features retained ({:.2?})",
+            prepared.n_features(),
+            started.elapsed()
+        );
+    }
+    bonsai_prepared(&prepared, Some(params), verbosity)
 }
 
 /// Reconstruct a tree from data that has already been through
@@ -338,6 +382,7 @@ pub fn bonsai<T: BonsaiFloat>(
 ///
 /// * `data` - Transformed means and precisions with their retained features
 /// * `params` - Knobs, `None` for the defaults
+/// * `verbosity` - How much to print while running
 ///
 /// ### Returns
 ///
@@ -345,6 +390,7 @@ pub fn bonsai<T: BonsaiFloat>(
 pub fn bonsai_prepared<T: BonsaiFloat>(
     data: &PreparedData<T>,
     params: Option<BonsaiParams>,
+    verbosity: Verbosity,
 ) -> Result<BonsaiResult<T>, BonsaiErrors> {
     let params = params.unwrap_or_default();
     let p = data.n_features();
@@ -360,10 +406,11 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
     let tree = match params.start {
         StartTree::GreedyMerge => {
             // Step 1: a star with optimised branch lengths.
+            let started = begin("Step 1: star", verbosity);
             let mut star = star_of(n_cells)?;
             let mut state = NodeState::new(star.n_nodes(), p, leaves.means, leaves.precisions)?;
             let loglik = optimise_branch_lengths(&mut star, &mut state, Some(params.branch))?;
-            record("1 star", loglik, &mut steps);
+            record("1 star", loglik, &mut steps, verbosity, started);
 
             // Step 2: greedily add ancestors. The star's optimised branch
             // lengths carry over as the members' branches to the centre.
@@ -371,8 +418,8 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
             // The bounds sit outside the neighbour graph: the graph decides
             // which pairs exist, the bounds decide which of those need
             // rescoring this round.
-            let mut candidates =
-                EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)));
+            let started = begin("Step 2: greedy merge", verbosity);
+            let mut candidates = EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)));
             let (tree, _) = star_tree_with(
                 Star {
                     means: leaves.means,
@@ -382,21 +429,35 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
                 },
                 Some(params.star),
                 &mut candidates,
+                verbosity,
             )?;
-            record("2 merge", tree_loglik(&tree, leaves)?, &mut steps);
+            record(
+                "2 merge",
+                tree_loglik(&tree, leaves)?,
+                &mut steps,
+                verbosity,
+                started,
+            );
             tree
         }
         StartTree::Linkage => {
             // Steps 1 and 2 at once, and neither of them scores anything with
             // the model: the linkage supplies a topology and step 4 supplies
             // the branch lengths.
+            let started = begin("Steps 1-2: linkage", verbosity);
             let tree = linkage_tree(leaves.means, n_cells, p, Some(params.linkage))?;
-            record("1-2 linkage", tree_loglik(&tree, leaves)?, &mut steps);
+            record(
+                "1-2 linkage",
+                tree_loglik(&tree, leaves)?,
+                &mut steps,
+                verbosity,
+                started,
+            );
             tree
         }
     };
 
-    refine_from(tree, data, &params, steps)
+    refine_from(tree, data, &params, steps, verbosity)
 }
 
 /// Run the refinement steps on a tree that already exists.
@@ -416,6 +477,7 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
 /// * `tree` - Starting tree, whose leaves must be the cells of `data` in order
 /// * `data` - Transformed means and precisions
 /// * `params` - Knobs, `None` for the defaults
+/// * `verbosity` - How much to print while running
 ///
 /// ### Returns
 ///
@@ -424,6 +486,7 @@ pub fn refine<T: BonsaiFloat>(
     tree: &Tree,
     data: &PreparedData<T>,
     params: Option<BonsaiParams>,
+    verbosity: Verbosity,
 ) -> Result<BonsaiResult<T>, BonsaiErrors> {
     if tree.n_leaves() != data.n_cells {
         return Err(BonsaiErrors::ShapeMismatch {
@@ -434,7 +497,13 @@ pub fn refine<T: BonsaiFloat>(
         });
     }
     let params = params.unwrap_or_default();
-    refine_from(tree.clone(), data, &params, Vec::with_capacity(5))
+    refine_from(
+        tree.clone(),
+        data,
+        &params,
+        Vec::with_capacity(5),
+        verbosity,
+    )
 }
 
 //////////////
@@ -449,6 +518,7 @@ pub fn refine<T: BonsaiFloat>(
 /// * `data` - Transformed means and precisions
 /// * `params` - Knobs, already resolved
 /// * `steps` - Step reports so far, appended to
+/// * `verbosity` - How much to print while running
 ///
 /// ### Returns
 ///
@@ -458,6 +528,7 @@ fn refine_from<T: BonsaiFloat>(
     data: &PreparedData<T>,
     params: &BonsaiParams,
     mut steps: Vec<StepReport>,
+    verbosity: Verbosity,
 ) -> Result<BonsaiResult<T>, BonsaiErrors> {
     let leaves = Leaves {
         means: &data.transformed_means,
@@ -468,26 +539,49 @@ fn refine_from<T: BonsaiFloat>(
     // Step 3: resolve the polytomies that a zero-length branch stands for. The
     // collapse that finds them lives in `search::polytomy`; without it this step
     // sees a structurally binary tree and does nothing.
+    let started = begin("Step 3: resolve polytomies", verbosity);
     let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
     tree = resolved.tree;
-    record("3 polytomy", tree_loglik(&tree, leaves)?, &mut steps);
+    record(
+        "3 polytomy",
+        tree_loglik(&tree, leaves)?,
+        &mut steps,
+        verbosity,
+        started,
+    );
 
     // Step 4: all branch lengths at once. Steps 5 and 6 depend on this having
     // happened; see the module docs.
+    let started = begin("Step 4: branch lengths", verbosity);
     let loglik = optimise_all(&mut tree, leaves, params)?;
-    record("4 branch", loglik, &mut steps);
+    record("4 branch", loglik, &mut steps, verbosity, started);
 
     // Step 5.
-    tree = spr(&tree, leaves, Some(params.spr))?.tree;
-    record("5 spr", tree_loglik(&tree, leaves)?, &mut steps);
+    let started = begin("Step 5: SPR", verbosity);
+    tree = spr(&tree, leaves, Some(params.spr), verbosity)?.tree;
+    record(
+        "5 spr",
+        tree_loglik(&tree, leaves)?,
+        &mut steps,
+        verbosity,
+        started,
+    );
 
     // Step 6.
-    tree = nni(&tree, leaves, Some(params.nni))?.tree;
-    record("6 nni", tree_loglik(&tree, leaves)?, &mut steps);
+    let started = begin("Step 6: NNI", verbosity);
+    tree = nni(&tree, leaves, Some(params.nni), verbosity)?.tree;
+    record(
+        "6 nni",
+        tree_loglik(&tree, leaves)?,
+        &mut steps,
+        verbosity,
+        started,
+    );
 
     // Step 7.
+    let started = begin("Step 7: branch lengths", verbosity);
     let loglik = optimise_all(&mut tree, leaves, params)?;
-    record("7 branch", loglik, &mut steps);
+    record("7 branch", loglik, &mut steps, verbosity, started);
 
     // Step 8, a deviation. SPEC.md section 9 lists seven steps and this is an
     // eighth: collapse the internal zero-length edges the branch solves leave
@@ -509,10 +603,11 @@ fn refine_from<T: BonsaiFloat>(
     // a *leaf*, which is not an internal edge: those are the model declining to
     // separate two cells it has no evidence to separate, and they survive this
     // step by design.
+    let started = begin("Step 8: collapse zero-length edges", verbosity);
     let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
     tree = resolved.tree;
     let loglik = optimise_all(&mut tree, leaves, params)?;
-    record("8 collapse", loglik, &mut steps);
+    record("8 collapse", loglik, &mut steps, verbosity, started);
 
     // Rerooting is a display choice and carries no information (S14), so it
     // happens after the last thing that cares about branch lengths.
@@ -520,7 +615,11 @@ fn refine_from<T: BonsaiFloat>(
         tree = reroot_for_display(&tree)?;
     }
 
+    let started = begin("Posteriors", verbosity);
     let (node_means, node_sds) = posteriors(&tree, leaves, data)?;
+    if verbosity.normal_verbosity() {
+        println!("  {} nodes ({:.2?})", tree.n_nodes(), started.elapsed());
+    }
     Ok(BonsaiResult {
         tree,
         loglik,
@@ -573,7 +672,8 @@ mod tests {
     fn test_the_pipeline_recovers_a_simulated_tree() {
         let (n, p) = (32usize, 128usize);
         let (means, sds, variances, truth) = raw_fixture(n, p, 0.1, 7);
-        let out = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
+        let out =
+            bonsai(&means, &sds, n, p, Some(&variances), None, Verbosity::Quiet).expect("bonsai");
 
         let rf = robinson_foulds(&out.tree, &truth).expect("rf");
         assert_eq!(
@@ -600,8 +700,16 @@ mod tests {
                 start,
                 ..Default::default()
             };
-            let out =
-                bonsai(&means, &sds, n, p, Some(&variances), Some(params)).expect("bonsai");
+            let out = bonsai(
+                &means,
+                &sds,
+                n,
+                p,
+                Some(&variances),
+                Some(params),
+                Verbosity::Quiet,
+            )
+            .expect("bonsai");
 
             assert_eq!(out.steps.len(), n_steps, "{start:?}");
             for step in out.steps.iter().skip(1) {
@@ -627,7 +735,8 @@ mod tests {
         // less certain than it.
         let (n, p) = (16usize, 64usize);
         let (means, sds, variances, _) = raw_fixture(n, p, 0.1, 3);
-        let out = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
+        let out =
+            bonsai(&means, &sds, n, p, Some(&variances), None, Verbosity::Quiet).expect("bonsai");
 
         assert_eq!(out.node_means.len(), out.tree.n_nodes() * p);
         assert_eq!(out.node_sds.len(), out.tree.n_nodes() * p);
@@ -653,7 +762,8 @@ mod tests {
         let (n, p) = (16usize, 64usize);
         let (means, sds, variances, _) = raw_fixture(n, p, 0.2, 5);
 
-        let plain = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
+        let plain =
+            bonsai(&means, &sds, n, p, Some(&variances), None, Verbosity::Quiet).expect("bonsai");
         let rerooted = bonsai(
             &means,
             &sds,
@@ -664,6 +774,7 @@ mod tests {
                 reroot: true,
                 ..Default::default()
             }),
+            Verbosity::Quiet,
         )
         .expect("bonsai");
 
@@ -679,8 +790,10 @@ mod tests {
     fn test_the_same_input_gives_the_same_tree() {
         let (n, p) = (16usize, 64usize);
         let (means, sds, variances, _) = raw_fixture(n, p, 0.2, 9);
-        let first = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
-        let second = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
+        let first =
+            bonsai(&means, &sds, n, p, Some(&variances), None, Verbosity::Quiet).expect("bonsai");
+        let second =
+            bonsai(&means, &sds, n, p, Some(&variances), None, Verbosity::Quiet).expect("bonsai");
         assert_eq!(first.tree.branches(), second.tree.branches());
         assert_eq!(first.loglik.to_bits(), second.loglik.to_bits());
     }
@@ -692,10 +805,11 @@ mod tests {
         // the search is done.
         let (n, p) = (32usize, 128usize);
         let (means, sds, variances, _) = raw_fixture(n, p, 0.2, 13);
-        let full = bonsai(&means, &sds, n, p, Some(&variances), None).expect("bonsai");
+        let full =
+            bonsai(&means, &sds, n, p, Some(&variances), None, Verbosity::Quiet).expect("bonsai");
 
         let prepared = prepare(&means, &sds, n, p, Some(&variances), None).expect("prepare");
-        let again = refine(&full.tree, &prepared, None).expect("refine");
+        let again = refine(&full.tree, &prepared, None, Verbosity::Quiet).expect("refine");
 
         assert_relative_eq!(again.loglik, full.loglik, max_relative = 1e-9);
         assert_eq!(
@@ -727,7 +841,7 @@ mod tests {
         };
         let rf_before = robinson_foulds(&ladder, &truth).expect("rf");
 
-        let out = refine(&ladder, &prepared, None).expect("refine");
+        let out = refine(&ladder, &prepared, None, Verbosity::Quiet).expect("refine");
         let rf_after = robinson_foulds(&out.tree, &truth).expect("rf");
 
         assert!(
@@ -747,14 +861,14 @@ mod tests {
         let (means, sds, variances, _) = raw_fixture(n, p, 0.2, 19);
         let prepared = prepare(&means, &sds, n, p, Some(&variances), None).expect("prepare");
         let wrong = Tree::balanced_binary(8, 1.0).expect("balanced");
-        assert!(refine(&wrong, &prepared, None).is_err());
+        assert!(refine(&wrong, &prepared, None, Verbosity::Quiet).is_err());
     }
 
     #[test]
     fn test_too_few_cells_is_an_error() {
         let means = vec![1.0f64; 4];
         let sds = vec![0.1f64; 4];
-        assert!(bonsai(&means, &sds, 1, 4, None, None).is_err());
+        assert!(bonsai(&means, &sds, 1, 4, None, None, Verbosity::Quiet).is_err());
     }
 
     use approx::assert_relative_eq;

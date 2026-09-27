@@ -42,6 +42,7 @@ use bonsai_rs::tree::simulate::{
     SimulationParams, robinson_foulds, simulate_binary, simulate_unbalanced,
 };
 use bonsai_rs::tree::{NO_NODE, Tree};
+use bonsai_rs::utils::verbosity::Verbosity;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -307,6 +308,7 @@ fn through_step_five(fx: &Fixture, params: &BonsaiParams) -> (Tree, Tree) {
                 },
                 Some(params.star),
                 &mut candidates,
+                Verbosity::Quiet,
             )
             .expect("merge")
             .0
@@ -335,7 +337,7 @@ fn through_step_five(fx: &Fixture, params: &BonsaiParams) -> (Tree, Tree) {
     save_tree(&path4, &tree);
     let t4 = tree.clone();
     let t0 = Instant::now();
-    let out = spr(&tree, leaves, Some(params.spr)).expect("spr");
+    let out = spr(&tree, leaves, Some(params.spr), Verbosity::Quiet).expect("spr");
     println!(
         "step 5: {:.1} s  loglik {:.3}  rf {}  moves {} rounds {}  (load {})",
         t0.elapsed().as_secs_f64(),
@@ -445,7 +447,7 @@ fn main() {
                 _ => {}
             }
             let t0 = Instant::now();
-            let out = nni(&start, leaves, Some(params.nni)).expect("nni");
+            let out = nni(&start, leaves, Some(params.nni), Verbosity::Quiet).expect("nni");
             let secs = t0.elapsed().as_secs_f64();
             print_moves(&out);
             println!(
@@ -471,7 +473,7 @@ fn main() {
                 if reopt {
                     optimise(&mut tree, leaves, &params);
                 }
-                let out = nni(&tree, leaves, Some(params.nni)).expect("nni");
+                let out = nni(&tree, leaves, Some(params.nni), Verbosity::Quiet).expect("nni");
                 let nni_moves = out.n_moves;
                 tree = out.tree;
                 println!(
@@ -484,7 +486,7 @@ fn main() {
                 if reopt {
                     optimise(&mut tree, leaves, &params);
                 }
-                let out = spr(&tree, leaves, Some(params.spr)).expect("spr");
+                let out = spr(&tree, leaves, Some(params.spr), Verbosity::Quiet).expect("spr");
                 let spr_moves = out.gains.len();
                 tree = out.tree;
                 println!(
@@ -527,7 +529,13 @@ fn main() {
                 moved.loglik,
                 moved.loglik - before
             );
-            let climbed = nni(&moved.tree, leaves, Some(NniParams::default())).expect("nni");
+            let climbed = nni(
+                &moved.tree,
+                leaves,
+                Some(NniParams::default()),
+                Verbosity::Quiet,
+            )
+            .expect("nni");
             println!(
                 "perturb: climbed with {} moves -> loglik {:.3} rf {}",
                 climbed.n_moves,
@@ -559,14 +567,14 @@ fn main() {
             );
             let l = optimise(&mut tree, leaves, &params);
             println!("foreign after step 7: loglik {l:.3}");
-            let out = nni(&tree, leaves, Some(params.nni)).expect("nni");
+            let out = nni(&tree, leaves, Some(params.nni), Verbosity::Quiet).expect("nni");
             print_moves(&out);
             println!(
                 "foreign after our nni: loglik {:.3} rf {}",
                 out.loglik,
                 robinson_foulds(&out.tree, &fx.truth).expect("rf")
             );
-            let out = spr(&out.tree, leaves, Some(params.spr)).expect("spr");
+            let out = spr(&out.tree, leaves, Some(params.spr), Verbosity::Quiet).expect("spr");
             println!(
                 "foreign after our spr: loglik {:.3} rf {} moves {}",
                 out.loglik,
@@ -581,7 +589,7 @@ fn main() {
             // than only the three the star primitive creates? Every binary
             // interchange, spliced by hand and handed to step 4.
             let mut tree = t5.clone();
-            let out = nni(&tree, leaves, Some(params.nni)).expect("nni");
+            let out = nni(&tree, leaves, Some(params.nni), Verbosity::Quiet).expect("nni");
             tree = out.tree;
             let base = optimise(&mut tree, leaves, &params);
             println!("neighbours: from the step 7 tree at loglik {base:.3}");
@@ -633,7 +641,7 @@ fn main() {
         }
         "spr-from-4" => {
             // Sanity check of the cache: step 5 again from the step 4 tree.
-            let out = spr(&t4, leaves, Some(params.spr)).expect("spr");
+            let out = spr(&t4, leaves, Some(params.spr), Verbosity::Quiet).expect("spr");
             println!(
                 "spr from step 4: loglik {:.3} rf {} moves {}",
                 out.loglik,

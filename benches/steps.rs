@@ -74,6 +74,7 @@ use bonsai_rs::search::spr::spr;
 use bonsai_rs::search::star::{Star, star_tree_with};
 use bonsai_rs::tree::Tree;
 use bonsai_rs::tree::simulate::{SimulationParams, simulate_binary};
+use bonsai_rs::utils::verbosity::Verbosity;
 use std::time::Instant;
 
 fn main() {
@@ -126,6 +127,7 @@ fn main() {
             },
             None,
             &mut candidates,
+            Verbosity::Quiet,
         )
         .expect("step 2");
         t[1] = t0.elapsed().as_secs_f64();
@@ -146,12 +148,14 @@ fn main() {
 
         // Step 5.
         let t0 = Instant::now();
-        tree = spr(&tree, leaves, None).expect("step 5").tree;
+        tree = spr(&tree, leaves, None, Verbosity::Quiet)
+            .expect("step 5")
+            .tree;
         t[4] = t0.elapsed().as_secs_f64();
 
         // Step 6.
         let t0 = Instant::now();
-        let _ = nni(&tree, leaves, None).expect("step 6");
+        let _ = nni(&tree, leaves, None, Verbosity::Quiet).expect("step 6");
         t[5] = t0.elapsed().as_secs_f64();
 
         println!(

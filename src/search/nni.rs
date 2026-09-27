@@ -73,10 +73,12 @@ use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
 use crate::utils::simd::prune_binary;
 use crate::utils::traits::BonsaiFloat;
+use crate::utils::verbosity::Verbosity;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 ////////////////
 // Parameters //
@@ -1749,6 +1751,7 @@ fn check_interchange<T: BonsaiFloat>(
 /// * `tree` - Tree to improve; not modified
 /// * `leaves` - The leaf data
 /// * `params` - Knobs, or `None` for the defaults, which skip the random phase
+/// * `verbosity` - [`Verbosity::Detailed`] prints one line per climb
 ///
 /// ### Returns
 ///
@@ -1758,17 +1761,29 @@ pub fn nni<T: BonsaiFloat>(
     tree: &Tree,
     leaves: Leaves<'_, T>,
     params: Option<NniParams>,
+    verbosity: Verbosity,
 ) -> Result<NniResult, BonsaiErrors> {
     let params = params.unwrap_or_default();
+    let started = Instant::now();
     let random = nni_random(tree, leaves, Some(params))?;
     let mut best = nni_greedy(&random.tree, leaves, Some(params))?;
     best.n_moves += random.n_moves;
+    if verbosity.detailed_verbosity() {
+        println!(
+            "    climb: {} moves over {} rounds, loglik {:.6e} ({:.2?})",
+            best.n_moves,
+            best.rounds,
+            best.loglik,
+            started.elapsed()
+        );
+    }
 
     // Iterated local search: perturb the best tree so far, climb, keep the
     // better of the two. Each restart draws from its own seed so that the
     // walks differ, and the whole thing is still a function of `params.seed`.
     let mut n_moves = best.n_moves;
     for restart in 0..params.n_restarts {
+        let started = Instant::now();
         let perturbed = nni_random(
             &best.tree,
             leaves,
@@ -1779,6 +1794,16 @@ pub fn nni<T: BonsaiFloat>(
         )?;
         let climbed = nni_greedy(&perturbed.tree, leaves, Some(params))?;
         n_moves += perturbed.n_moves + climbed.n_moves;
+        if verbosity.detailed_verbosity() {
+            println!(
+                "    restart {} / {}: loglik {:.6e}, best {:.6e} ({:.2?})",
+                restart + 1,
+                params.n_restarts,
+                climbed.loglik,
+                best.loglik.max(climbed.loglik),
+                started.elapsed()
+            );
+        }
         if climbed.loglik > best.loglik {
             best = climbed;
         }
@@ -2283,7 +2308,7 @@ mod tests {
                 ..NniParams::default()
             };
             let random = nni_random(&settled.tree, leaves, Some(params)).expect("random");
-            let out = nni(&settled.tree, leaves, Some(params)).expect("nni");
+            let out = nni(&settled.tree, leaves, Some(params), Verbosity::Quiet).expect("nni");
             println!(
                 "seed {seed}: start {:.3} (RF to truth {}), after {} random moves {:.3} \
                  (RF to the start {}), after greedy {:.3}",

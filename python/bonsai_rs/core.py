@@ -170,6 +170,7 @@ def bonsai(
     search: Search = "approximate",
     min_signal_to_noise: float | None = None,
     reroot: bool = True,
+    verbose: int = 0,
 ) -> BonsaiResult:
     """Reconstruct a tree from per-cell means and error bars.
 
@@ -193,6 +194,10 @@ def bonsai(
             before the search. ``None`` for the default of 1, the paper's.
         reroot: Reroot for display once the search is done. Changes the
             picture, not the likelihood.
+        verbose: ``0`` prints nothing, ``1`` one line per step, ``2`` adds
+            progress within the merge, SPR and NNI steps. Printed from Rust
+            to the process's stdout, so a notebook shows it in the kernel's
+            terminal rather than in the cell.
 
     Returns:
         The tree, its loglikelihood and the posterior over every node.
@@ -203,7 +208,9 @@ def bonsai(
     """
     m, s = check_pair(means, sds)
     v = _variances(variances, m.shape[1])
-    return _result(_core.bonsai(m, s, v, start, search, min_signal_to_noise, reroot))
+    return _result(
+        _core.bonsai(m, s, v, start, search, min_signal_to_noise, reroot, verbose)
+    )
 
 
 # `counts` is dense numpy or scipy sparse; scipy is optional, so it is `Any`.
@@ -221,6 +228,7 @@ def bonsai_from_counts(
     min_signal_to_noise: float | None = None,
     max_amplification: float | None = None,
     reroot: bool = True,
+    verbose: int = 0,
 ) -> BonsaiResult:
     """Raw counts to tree: `sanity`, `from_sanity`, then `bonsai`.
 
@@ -240,6 +248,7 @@ def bonsai_from_counts(
         min_signal_to_noise: As `bonsai`.
         max_amplification: As `from_sanity`.
         reroot: As `bonsai`.
+        verbose: As `bonsai`. Covers the tree search, not Sanity.
 
     Returns:
         As `bonsai`, with ``features`` and ``dropped`` indexing the genes of
@@ -263,5 +272,6 @@ def bonsai_from_counts(
             min_signal_to_noise,
             max_amplification,
             reroot,
+            verbose,
         )
     )

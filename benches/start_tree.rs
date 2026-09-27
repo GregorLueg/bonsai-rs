@@ -48,6 +48,7 @@ use bonsai_rs::tree::simulate::{
 };
 use bonsai_rs::tree::{NO_NODE, Tree};
 use bonsai_rs::utils::rng::splitmix64_at;
+use bonsai_rs::utils::verbosity::Verbosity;
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -439,6 +440,7 @@ fn build_start(start: Start, data: &PreparedData<f64>, seed: u64) -> (Tree, f64)
                 },
                 None,
                 &mut candidates,
+                Verbosity::Quiet,
             )
             .expect("step 2")
             .0
@@ -498,7 +500,7 @@ fn run(n: usize, p: usize, noise: f64) -> Vec<(Start, f64, f64, f64, f64)> {
         ] {
             let (tree, build) = build_start(start, &data, seed);
             let t0 = Instant::now();
-            let out = refine(&tree, &data, None).expect("refine");
+            let out = refine(&tree, &data, None, Verbosity::Quiet).expect("refine");
             let refine_s = t0.elapsed().as_secs_f64();
             assert!(out.loglik.is_finite(), "non-finite loglikelihood");
             let rf = robinson_foulds(&out.tree, &sim.tree).expect("rf") as f64;
@@ -582,11 +584,15 @@ fn step_split(n: usize, seed: u64, dense: bool) -> ([f64; 6], f64) {
     t[2] = t0.elapsed().as_secs_f64();
 
     let t0 = Instant::now();
-    tree = spr(&tree, leaves, None).expect("step 5").tree;
+    tree = spr(&tree, leaves, None, Verbosity::Quiet)
+        .expect("step 5")
+        .tree;
     t[3] = t0.elapsed().as_secs_f64();
 
     let t0 = Instant::now();
-    tree = nni(&tree, leaves, None).expect("step 6").tree;
+    tree = nni(&tree, leaves, None, Verbosity::Quiet)
+        .expect("step 6")
+        .tree;
     t[4] = t0.elapsed().as_secs_f64();
 
     let t0 = Instant::now();
@@ -644,7 +650,9 @@ fn spr_ablation(n: usize, seed: u64, noise: f64) -> ([f64; 3], [f64; 3], f64) {
     // Both arms finish with the interchanges and step 7, so the only thing that
     // differs is step 5.
     let finish = |mut tree: Tree| -> (f64, f64) {
-        tree = nni(&tree, leaves, None).expect("step 6").tree;
+        tree = nni(&tree, leaves, None, Verbosity::Quiet)
+            .expect("step 6")
+            .tree;
         let mut state =
             NodeState::new(tree.n_nodes(), p, leaves.means, leaves.precisions).expect("state");
         let loglik = optimise_branch_lengths(&mut tree, &mut state, None).expect("step 7");
@@ -653,7 +661,9 @@ fn spr_ablation(n: usize, seed: u64, noise: f64) -> ([f64; 3], [f64; 3], f64) {
     };
 
     let t0 = Instant::now();
-    let with_tree = spr(&base, leaves, None).expect("step 5").tree;
+    let with_tree = spr(&base, leaves, None, Verbosity::Quiet)
+        .expect("step 5")
+        .tree;
     let (rf_with, ll_with) = finish(with_tree.clone());
     let with = [t0.elapsed().as_secs_f64(), rf_with, ll_with];
 

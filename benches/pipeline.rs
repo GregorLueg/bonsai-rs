@@ -18,6 +18,7 @@
 use bonsai_rs::bonsai::bonsai_prepared;
 use bonsai_rs::ingest::PreparedData;
 use bonsai_rs::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
+use bonsai_rs::utils::verbosity::Verbosity;
 use std::time::Instant;
 
 /// Leaf counts swept, powers of two for the binary generator.
@@ -66,7 +67,7 @@ fn main() {
             };
 
             let t0 = Instant::now();
-            let out = bonsai_prepared(&prepared, None).expect("pipeline");
+            let out = bonsai_prepared(&prepared, None, Verbosity::Quiet).expect("pipeline");
             let secs = t0.elapsed().as_secs_f64();
 
             let rf = robinson_foulds(&out.tree, &data.tree).expect("rf");

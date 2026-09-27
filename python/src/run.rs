@@ -13,6 +13,7 @@ use bonsai_rs::tree::simulate::{
     SimulationParams, simulate_binary, simulate_binary_random_branches, simulate_unbalanced,
 };
 use bonsai_rs::utils::traits::BonsaiFloat;
+use bonsai_rs::utils::verbosity::{Verbosity, parse_verbosity_level};
 use numpy::{Element, IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -344,6 +345,7 @@ fn s5_out<'py, T: Float>(
 /// * `means`, `sds` - `(n_cells, n_features)`, both `float32` or both `float64`
 /// * `variances` - Per-feature variance, `None` to estimate
 /// * `start`, `search`, `min_snr`, `reroot` - As [`params`]
+/// * `verbose` - `0` quiet, `1` one line per step, `2` progress within steps
 ///
 /// ### Returns
 ///
@@ -359,12 +361,14 @@ pub fn bonsai<'py>(
     search: &str,
     min_snr: Option<f64>,
     reroot: bool,
+    verbose: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     let v = variances.as_ref().map(slice).transpose()?;
     let bp = params(start, search, min_snr, None, reroot)?;
+    let verbosity = parse_verbosity_level(verbose);
     match pair(means, sds)? {
-        Pair::F32(m, s) => bonsai_out(py, &m, &s, v, bp),
-        Pair::F64(m, s) => bonsai_out(py, &m, &s, v, bp),
+        Pair::F32(m, s) => bonsai_out(py, &m, &s, v, bp, verbosity),
+        Pair::F64(m, s) => bonsai_out(py, &m, &s, v, bp, verbosity),
     }
 }
 
@@ -383,11 +387,12 @@ fn bonsai_out<'py, T: Float>(
     s: &PyReadonlyArray2<'py, T>,
     v: Option<&[f64]>,
     bp: BonsaiParams,
+    verbosity: Verbosity,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (mean, n, p) = flat(m)?;
     let (sd, _, _) = flat(s)?;
     let res = py
-        .detach(|| bonsai_run(mean, sd, n, p, v, Some(bp)))
+        .detach(|| bonsai_run(mean, sd, n, p, v, Some(bp), verbosity))
         .map_err(BErr)?;
     let features = res.features.clone();
     result_out(py, res, features, Vec::new())
@@ -403,6 +408,7 @@ fn bonsai_out<'py, T: Float>(
 /// * `double` - `float64` storage instead of `float32`
 /// * `gpu` - Run Sanity on the GPU, see [`crate::gpu`]
 /// * `start`, `search`, `min_snr`, `max_amp`, `reroot` - As [`params`]
+/// * `verbose` - As [`bonsai`]; covers the tree search, not Sanity
 ///
 /// ### Returns
 ///
@@ -426,16 +432,18 @@ pub fn bonsai_from_counts<'py>(
     min_snr: Option<f64>,
     max_amp: Option<f64>,
     reroot: bool,
+    verbose: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     check(gpu)?;
     let counts = counts_in(&indices, &values, &indptr, n_cells)?;
     let totals = slice(&cell_totals)?;
     let sp = sanity_params(rule, fixed_variance)?;
     let bp = params(start, search, min_snr, max_amp, reroot)?;
+    let verbosity = parse_verbosity_level(verbose);
     if double {
-        chain::<f64>(py, &counts, totals, sp, bp, gpu)
+        chain::<f64>(py, &counts, totals, sp, bp, gpu, verbosity)
     } else {
-        chain::<f32>(py, &counts, totals, sp, bp, gpu)
+        chain::<f32>(py, &counts, totals, sp, bp, gpu, verbosity)
     }
 }
 
@@ -448,6 +456,7 @@ pub fn bonsai_from_counts<'py>(
 /// * `totals` - Total UMIs per cell
 /// * `sp`, `bp` - Sanity and Bonsai parameters
 /// * `gpu` - Run Sanity on the GPU
+/// * `verbosity` - How much the tree search prints
 ///
 /// ### Returns
 ///
@@ -459,6 +468,7 @@ fn chain<'py, T: Float>(
     sp: SanityParams,
     bp: BonsaiParams,
     gpu: bool,
+    verbosity: Verbosity,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (res, genes, dropped) = py.detach(|| -> Result<_, BErr> {
         let out = run_sanity::<T>(counts, totals, sp, gpu)?;
@@ -471,6 +481,7 @@ fn chain<'py, T: Float>(
             k,
             Some(&lik.variances),
             Some(bp),
+            verbosity,
         )?;
         Ok((res, lik.features, lik.dropped))
     })?;

@@ -114,10 +114,12 @@ use crate::utils::kernels::prune_general;
 use crate::utils::rng::SplitMix64;
 use crate::utils::simd::prune_binary;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
+use crate::utils::verbosity::Verbosity;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 ////////////////
 // Parameters //
@@ -3051,6 +3053,7 @@ fn check_applied<T: BonsaiFloat>(
 /// * `tree` - Tree to improve; not modified
 /// * `leaves` - The leaf data
 /// * `params` - Knobs, or `None` for the defaults
+/// * `verbosity` - [`Verbosity::Detailed`] prints one line per sweep
 ///
 /// ### Returns
 ///
@@ -3060,6 +3063,7 @@ pub fn spr<T: BonsaiFloat>(
     tree: &Tree,
     leaves: Leaves<'_, T>,
     params: Option<SprParams>,
+    verbosity: Verbosity,
 ) -> Result<SprResult, BonsaiErrors> {
     let params = params.unwrap_or_default();
     let (mut settled, loglik) = settled_down(tree, leaves)?;
@@ -3072,6 +3076,7 @@ pub fn spr<T: BonsaiFloat>(
 
     let mut look: Option<FxHashSet<u64>> = None;
     while out.rounds < params.max_rounds {
+        let started = Instant::now();
         // The random order has to differ between rounds, or the second round
         // retries the first round's order on a tree that has moved under it.
         let (round, revisit, next) = sweep(
@@ -3088,6 +3093,15 @@ pub fn spr<T: BonsaiFloat>(
             look = Some(revisit);
         }
         out.rounds += 1;
+        if verbosity.detailed_verbosity() {
+            println!(
+                "    sweep {}: {} moves, loglik {:.6e} ({:.2?})",
+                out.rounds,
+                round.gains.len(),
+                round.loglik,
+                started.elapsed()
+            );
+        }
         let Some(next) = next else {
             break;
         };
@@ -3297,6 +3311,7 @@ mod tests {
             },
             None,
             &mut candidates,
+            Verbosity::Quiet,
         )
         .expect("step 2");
         let tree = resolve_polytomies(&tree, leaves, None)
@@ -3472,7 +3487,7 @@ mod tests {
             };
             let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
             let before = tree_loglik(&start, leaves).expect("loglik");
-            let out = spr(&start, leaves, None).expect("spr");
+            let out = spr(&start, leaves, None, Verbosity::Quiet).expect("spr");
             let after = tree_loglik(&out.tree, leaves).expect("loglik");
             assert!(after >= before, "seed {seed}: {before} fell to {after}");
             assert_relative_eq!(after, out.loglik, max_relative = 1e-12);
@@ -3985,7 +4000,7 @@ mod tests {
             };
             let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
             let before = robinson_foulds(&start, &data.tree).expect("rf");
-            let out = spr(&start, leaves, None).expect("spr");
+            let out = spr(&start, leaves, None, Verbosity::Quiet).expect("spr");
             let after = robinson_foulds(&out.tree, &data.tree).expect("rf");
             // The distance goes to zero on every fixture here. The assertion
             // is the measurement rather than a hedge around it, so a regression
@@ -4015,7 +4030,7 @@ mod tests {
                 n_features: p,
             };
             let start = optimised(&Tree::ladder(n, 1.0).expect("ladder"), leaves);
-            let ordered = spr(&start, leaves, None).expect("spr");
+            let ordered = spr(&start, leaves, None, Verbosity::Quiet).expect("spr");
             let random = spr(
                 &start,
                 leaves,
@@ -4024,6 +4039,7 @@ mod tests {
                     seed: 11,
                     ..SprParams::default()
                 }),
+                Verbosity::Quiet,
             )
             .expect("spr");
             assert_eq!(robinson_foulds(&ordered.tree, &data.tree).expect("rf"), 0);
@@ -4049,7 +4065,7 @@ mod tests {
         for x in 0..3u32 {
             assert!(prune_subtree(&tree, x).expect("prune").is_none());
         }
-        let out = spr(&tree, leaves, None).expect("spr");
+        let out = spr(&tree, leaves, None, Verbosity::Quiet).expect("spr");
         assert_eq!(out.gains.len(), 0);
         assert_eq!(out.rounds, 1);
         assert_eq!(splits(&out.tree), splits(&tree));
@@ -4073,7 +4089,7 @@ mod tests {
         let star = Tree::from_parents(parent, vec![1.0; n + 1], n).expect("star");
         let before = tree_loglik(&star, leaves).expect("loglik");
 
-        let out = spr(&star, leaves, None).expect("spr");
+        let out = spr(&star, leaves, None, Verbosity::Quiet).expect("spr");
         assert!(out.loglik >= before);
         assert_eq!(out.tree.n_leaves(), n);
         for node in out.tree.internal_postorder() {
@@ -4214,6 +4230,7 @@ mod tests {
                     search,
                     ..SprParams::default()
                 }),
+                Verbosity::Quiet,
             )
             .expect("spr")
         };
@@ -4262,6 +4279,7 @@ mod tests {
                     }),
                     ..SprParams::default()
                 }),
+                Verbosity::Quiet,
             )
             .expect("spr");
             assert!(out.loglik > before, "radius {radius}");
@@ -4407,7 +4425,7 @@ mod tests {
                     .num_threads(threads)
                     .build()
                     .expect("pool");
-                pool.install(|| spr(&start, leaves, Some(params)).expect("spr"))
+                pool.install(|| spr(&start, leaves, Some(params), Verbosity::Quiet).expect("spr"))
             })
             .collect();
 
@@ -4548,13 +4566,13 @@ mod tests {
             };
             let start = searched(n, leaves);
             let params = SprParams::default();
-            let first = spr(&start, leaves, Some(params)).expect("spr");
+            let first = spr(&start, leaves, Some(params), Verbosity::Quiet).expect("spr");
             assert!(
                 first.rounds < params.max_rounds,
                 "{n} by {p} ran to the cap at {} rounds",
                 first.rounds
             );
-            let again = spr(&first.tree, leaves, Some(params)).expect("spr");
+            let again = spr(&first.tree, leaves, Some(params), Verbosity::Quiet).expect("spr");
             assert_eq!(
                 again.gains.len(),
                 0,

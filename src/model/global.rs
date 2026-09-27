@@ -49,9 +49,6 @@ pub struct UpState<T> {
     p: usize,
     /// Number of nodes, leaves included.
     n_nodes: usize,
-    /// Scratch for the polytomy path: the total precision and mean at a node,
-    /// before any one child is removed. Grown on demand.
-    scratch: Vec<f64>,
 }
 
 impl<T: BonsaiFloat> UpState<T> {
@@ -71,7 +68,6 @@ impl<T: BonsaiFloat> UpState<T> {
             w: vec![T::zero(); n_nodes * p],
             p,
             n_nodes,
-            scratch: Vec::new(),
         }
     }
 
@@ -122,10 +118,12 @@ impl<T: BonsaiFloat> UpState<T> {
     /// recursion applies to a child, which is what makes this the mirror image
     /// of SPEC.md section 4 rather than a separate derivation.
     ///
-    /// Parents are visited before children, so this is a descending scan over
-    /// the internal nodes: the arena invariant puts every parent at a strictly
-    /// larger index than its children, which makes descending index order a
-    /// valid pre-order.
+    /// Each node's row reads only its parent's, which sits in a higher level,
+    /// so the levels are walked from the top down, the leaves last, and the
+    /// nodes of one level are written in parallel: their rows are contiguous
+    /// and every row they read lies above them. Measured 2026-09-27 at 10,000
+    /// cells by 2,767 features, the sequential sweep was 0.065 s a pass of the
+    /// global branch solve, as long as the parallel edge solves it feeds.
     ///
     /// ### Params
     ///
@@ -136,96 +134,96 @@ impl<T: BonsaiFloat> UpState<T> {
         debug_assert_eq!(tree.n_nodes(), self.n_nodes);
         debug_assert_eq!(down.n_features(), self.p);
 
-        let root = tree.root() as usize * self.p;
-        self.m[root..root + self.p].fill(T::zero());
-        self.w[root..root + self.p].fill(T::zero());
+        let p = self.p;
+        let root = tree.root() as usize * p;
+        self.m[root..root + p].fill(T::zero());
+        self.w[root..root + p].fill(T::zero());
 
-        for a in (tree.n_leaves()..self.n_nodes).rev() {
-            self.sweep_node(tree, down, a as u32);
+        let levels = (0..tree.n_levels())
+            .rev()
+            .map(|level| tree.level(level))
+            .chain(std::iter::once((0, tree.n_leaves())));
+        for (start, end) in levels {
+            let (m_lo, m_hi) = self.m.split_at_mut(end * p);
+            let (w_lo, w_hi) = self.w.split_at_mut(end * p);
+            let above = (&*m_hi, &*w_hi);
+            m_lo[start * p..]
+                .par_chunks_mut(p)
+                .zip(w_lo[start * p..].par_chunks_mut(p))
+                .enumerate()
+                .for_each(|(i, (m_out, w_out))| {
+                    let c = (start + i) as u32;
+                    if let Some(a) = tree.parent(c) {
+                        let lo = (a as usize - end) * p;
+                        let up_a = (&above.0[lo..lo + p], &above.1[lo..lo + p]);
+                        up_row_into(tree, down, c, a, up_a, (m_out, w_out));
+                    }
+                });
         }
     }
+}
 
-    /// Write the up rows of one node's children.
-    ///
-    /// ### Params
-    ///
-    /// * `tree` - Tree whose topology and branch lengths to use
-    /// * `down` - Settled down rows
-    /// * `a` - Internal node whose children are to be written; its own up row
-    ///   must already be settled
-    fn sweep_node(&mut self, tree: &Tree, down: &NodeState<T>, a: u32) {
-        let p = self.p;
-        let kids = tree.children(a);
-        let is_root = tree.parent(a).is_none();
-        let t_a = tree.branch(a);
+/// Write one node's up row from its parent's.
+///
+/// The per-feature expressions of the two-sided sweep, for one child: with a
+/// binary parent the sibling diffused plus the parent's up-part, otherwise the
+/// parent's total with this child's own contribution removed. The total is
+/// formed per child rather than once per parent, the same expressions in the
+/// same order, so the bits do not depend on which child asked.
+///
+/// ### Params
+///
+/// * `tree` - Tree whose topology and branch lengths to use
+/// * `down` - Settled down rows
+/// * `c` - The node whose row is written
+/// * `a` - Its parent
+/// * `up_a` - The parent's up means and precisions
+/// * `out` - The node's up means and precisions rows, written
+fn up_row_into<T: BonsaiFloat>(
+    tree: &Tree,
+    down: &NodeState<T>,
+    c: u32,
+    a: u32,
+    up_a: (&[T], &[T]),
+    out: (&mut [T], &mut [T]),
+) {
+    let (up_m, up_w) = up_a;
+    let (out_m, out_w) = out;
+    let p = out_m.len();
+    let kids = tree.children(a);
+    let is_root = tree.parent(a).is_none();
+    let t_a = tree.branch(a);
 
-        // Children sit strictly below their parent, so one split separates the
-        // rows being written from the row being read.
-        let split = a as usize * p;
-        let (lo_m, hi_m) = self.m.split_at_mut(split);
-        let (lo_w, hi_w) = self.w.split_at_mut(split);
-        let (up_m, up_w) = (&hi_m[..p], &hi_w[..p]);
-
-        if kids.len() == 2 {
-            let (k, l) = (kids[0], kids[1]);
-            let (t_k, t_l) = (tree.branch(k), tree.branch(l));
-            let (m_k, w_k) = (down.means(k), down.precisions(k));
-            let (m_l, w_l) = (down.means(l), down.precisions(l));
-
-            // `children` is built by a scan in ascending node order, so the two
-            // destination rows are ordered and disjoint.
-            debug_assert!(k < l);
-            let (first_m, second_m) = lo_m.split_at_mut(l as usize * p);
-            let (first_w, second_w) = lo_w.split_at_mut(l as usize * p);
-            let base = k as usize * p;
-            let (out_m_k, out_w_k) = (&mut first_m[base..base + p], &mut first_w[base..base + p]);
-            let (out_m_l, out_w_l) = (&mut second_m[..p], &mut second_w[..p]);
-
-            for g in 0..p {
-                let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
-                let wk = wide(w_k[g]);
-                let wl = wide(w_l[g]);
-                let wdk = wk / (1.0 + t_k * wk);
-                let wdl = wl / (1.0 + t_l * wl);
-                let (mk, ml) = (wide(m_k[g]), wide(m_l[g]));
-
-                let tot_k = wdl + w_up;
-                let tot_l = wdk + w_up;
-                out_w_k[g] = narrow(tot_k);
-                out_w_l[g] = narrow(tot_l);
-
-                out_m_k[g] = narrow(ml + (m_up - ml) * (w_up / tot_k));
-                out_m_l[g] = narrow(mk + (m_up - mk) * (w_up / tot_l));
-            }
-            return;
-        }
-
-        if self.scratch.len() < 2 * p {
-            self.scratch.resize(2 * p, 0.0);
-        }
-        let (w_tot, m_tot) = self.scratch.split_at_mut(p);
-        let (m_a, w_a) = (down.means(a), down.precisions(a));
+    if kids.len() == 2 {
+        let o = if kids[0] == c { kids[1] } else { kids[0] };
+        let t_o = tree.branch(o);
+        let (m_o, w_o) = (down.means(o), down.precisions(o));
         for g in 0..p {
             let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
-            let ma = wide(m_a[g]);
-            let tot = wide(w_a[g]) + w_up;
-            w_tot[g] = tot;
-            m_tot[g] = ma + (m_up - ma) * (w_up / tot);
+            let wo = wide(w_o[g]);
+            let wdo = wo / (1.0 + t_o * wo);
+            let mo = wide(m_o[g]);
+            let tot = wdo + w_up;
+            out_w[g] = narrow(tot);
+            out_m[g] = narrow(mo + (m_up - mo) * (w_up / tot));
         }
+        return;
+    }
 
-        for &c in kids {
-            let (m_c, w_c) = (down.means(c), down.precisions(c));
-            let t_c = tree.branch(c);
-            let base = c as usize * p;
-            for g in 0..p {
-                let wc = wide(w_c[g]);
-                let wdc = wc / (1.0 + t_c * wc);
-                let rest = w_tot[g] - wdc;
-                let mc = wide(m_c[g]);
-                lo_w[base + g] = narrow(rest);
-                lo_m[base + g] = narrow(m_tot[g] + (m_tot[g] - mc) * (wdc / rest));
-            }
-        }
+    let (m_a, w_a) = (down.means(a), down.precisions(a));
+    let (m_c, w_c) = (down.means(c), down.precisions(c));
+    let t_c = tree.branch(c);
+    for g in 0..p {
+        let (w_up, m_up) = up_part(is_root, t_a, up_w[g], up_m[g]);
+        let ma = wide(m_a[g]);
+        let w_tot = wide(w_a[g]) + w_up;
+        let m_tot = ma + (m_up - ma) * (w_up / w_tot);
+        let wc = wide(w_c[g]);
+        let wdc = wc / (1.0 + t_c * wc);
+        let rest = w_tot - wdc;
+        let mc = wide(m_c[g]);
+        out_w[g] = narrow(rest);
+        out_m[g] = narrow(m_tot + (m_tot - mc) * (wdc / rest));
     }
 }
 

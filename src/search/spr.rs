@@ -55,10 +55,13 @@
 //! because an interchange edits one internal edge and the star it resolves
 //! summarises the rest of the tree exactly.
 //!
-//! The terms come from [`LazyRows::loglik`], which reads the current tree's
-//! terms wherever the candidate's subtrees are the current tree's and
-//! recomputes the rest; an accepted candidate's rows are written into the
-//! current tree's [`RowStore`] by [`RowStore::accept`] rather than swept. A fresh
+//! The terms come from the masked views of [`crate::search::masked`], which
+//! recompute only the paths a move changed and score it as the current total
+//! less the changed terms plus the new ones ([`fixed`]); where the views
+//! decline, [`LazyRows::score`] does the same on a built candidate. An
+//! accepted candidate is applied in one relabel of the arena
+//! ([`crate::search::masked::apply_move`]) and its rows written into the
+//! current tree's [`RowStore`] rather than swept. A fresh
 //! [`NodeState::prune`] per candidate is correct and is what this replaced, but
 //! it pays an `O(n p)` sweep for every candidate that passes the split filter,
 //! and at the noise levels where the step earns its keep that is a third of the
@@ -90,8 +93,12 @@ use crate::model::likelihood::NodeState;
 use crate::model::merge::EffLeaf;
 use crate::model::place::{PlacementParams, place, place_walk};
 #[cfg(debug_assertions)]
+use crate::search::masked::Applied;
+#[cfg(debug_assertions)]
 use crate::search::masked::Attached;
-use crate::search::masked::{Pruned as PrunedView, PrunedRows, ViewCache, attach};
+use crate::search::masked::{
+    Pruned as PrunedView, PrunedRows, ViewCache, apply_move, attach, score_move,
+};
 use crate::search::polytomy::{CentreStar, splice_result};
 #[cfg(any(test, debug_assertions))]
 use crate::search::split_fingerprint_with;
@@ -180,7 +187,8 @@ const PROPOSAL_CHUNK_MIN: usize = 8;
 ///
 /// Doubles from [`PROPOSAL_CHUNK_MIN`] on every chunk that accepts nothing,
 /// which on a settled tree is every chunk. Bounds memory rather than waste: a
-/// candidate is a whole arena, so a chunk holds this many trees at once.
+/// candidate the views declined is a whole arena, so a chunk can hold this
+/// many trees at once.
 const PROPOSAL_CHUNK_MAX: usize = 256;
 
 /// Default for [`SprApprox::recheck`].
@@ -887,7 +895,7 @@ impl<T: BonsaiFloat> RowStore<T> {
     ///
     /// The term, zero for a leaf.
     #[inline]
-    fn contribution(&self, node: u32) -> f64 {
+    pub(crate) fn contribution(&self, node: u32) -> f64 {
         self.contrib[self.slot[node as usize] as usize]
     }
 
@@ -931,14 +939,26 @@ impl<T: BonsaiFloat> RowStore<T> {
         to_old: &[u32],
         was: &Tree,
     ) -> Result<(), BonsaiErrors> {
-        let LazyRows {
+        let fresh = LazyRows::new(tree, to_old, was, self)?.into_fresh();
+        self.accept_fresh(fresh);
+        Ok(())
+    }
+
+    /// [`RowStore::accept`] with the rows already formed, by the
+    /// [`LazyRows`] that scored the move.
+    ///
+    /// ### Params
+    ///
+    /// * `fresh` - [`LazyRows::into_fresh`] of the rows of the tree the move
+    ///   produced, formed against this store
+    pub(crate) fn accept_fresh(&mut self, fresh: Fresh<T>) {
+        let Fresh {
             inherited,
             slot: fresh_slot,
             fresh_m,
             fresh_w,
             fresh_contrib,
-            ..
-        } = LazyRows::new(tree, to_old, was, self)?;
+        } = fresh;
         let p = self.p;
 
         let mut used = vec![false; self.contrib.len()];
@@ -974,7 +994,54 @@ impl<T: BonsaiFloat> RowStore<T> {
             slot[v] = s as u32;
         }
         self.slot = slot;
-        Ok(())
+    }
+}
+
+/// The rows of the tree a move produced, as [`RowStore::accept_fresh`] takes
+/// them: per node, either the current node whose row it keeps or a row formed
+/// for it.
+pub(crate) struct Fresh<T> {
+    /// Per node, the current node whose row it keeps, or [`NO_NODE`].
+    inherited: Vec<u32>,
+    /// Per node, its row in the formed rows, or [`NO_NODE`].
+    slot: Vec<u32>,
+    /// Formed means, `[slot][feature]`, row-major.
+    fresh_m: Vec<T>,
+    /// Formed precisions, same layout.
+    fresh_w: Vec<T>,
+    /// Loglikelihood term of each formed row, `[slot]`.
+    fresh_contrib: Vec<f64>,
+}
+
+impl<T> Fresh<T> {
+    /// Rows formed somewhere other than [`LazyRows`].
+    ///
+    /// ### Params
+    ///
+    /// * `inherited` - Per node of the new tree, the current node whose row it
+    ///   keeps, or [`NO_NODE`]
+    /// * `slot` - Per node, its row in the next three, or [`NO_NODE`]
+    /// * `fresh_m` - Formed means, `[slot][feature]`
+    /// * `fresh_w` - Formed precisions, same layout
+    /// * `fresh_contrib` - Formed terms, `[slot]`
+    ///
+    /// ### Returns
+    ///
+    /// The rows.
+    pub(crate) fn new(
+        inherited: Vec<u32>,
+        slot: Vec<u32>,
+        fresh_m: Vec<T>,
+        fresh_w: Vec<T>,
+        fresh_contrib: Vec<f64>,
+    ) -> Self {
+        Self {
+            inherited,
+            slot,
+            fresh_m,
+            fresh_w,
+            fresh_contrib,
+        }
     }
 }
 
@@ -1047,10 +1114,13 @@ pub(crate) struct LazyRows<'a, T> {
     fresh_w: Vec<T>,
     /// Loglikelihood contribution of each recomputed row, `[slot]`.
     fresh_contrib: Vec<f64>,
-    /// Up rows, filled a chain at a time.
-    up: Vec<OnceLock<Row<T>>>,
-    /// Effective leaves, filled as the beam search asks for them.
-    eff: Vec<OnceLock<Row<T>>>,
+    /// Up rows, filled a chain at a time. The cells are allocated on first
+    /// use: scoring and accepting a move read none of them, and `2n` empty
+    /// cells per call were most of what those paid.
+    up: OnceLock<Vec<OnceLock<Row<T>>>>,
+    /// Effective leaves, filled as the beam search asks for them; allocated
+    /// like `up`.
+    eff: OnceLock<Vec<OnceLock<Row<T>>>>,
 }
 
 impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
@@ -1131,8 +1201,8 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
             fresh_m: vec![T::zero(); dirty.len() * p],
             fresh_w: vec![T::zero(); dirty.len() * p],
             fresh_contrib: vec![0.0; dirty.len()],
-            up: (0..n).map(|_| OnceLock::new()).collect(),
-            eff: (0..n).map(|_| OnceLock::new()).collect(),
+            up: OnceLock::new(),
+            eff: OnceLock::new(),
         };
 
         // Ascending node index is a valid post-order on the arena, so a dirty
@@ -1187,9 +1257,8 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     /// The same terms [`NodeState::prune`] sums, read off the base state where
     /// the row was inherited and off the recomputed row where it was not.
     /// Summed in fixed point, so the total does not depend on the order the
-    /// arena happens to put the nodes in; the view scoring in
-    /// [`crate::search::masked`] relies on that to reach the same total from
-    /// the changed terms alone. It agrees with `prune`'s `f64` sum to rounding
+    /// arena happens to put the nodes in; [`crate::search::masked::score_move`]
+    /// relies on that to reach the same total from the changed terms alone. It agrees with `prune`'s `f64` sum to rounding
     /// and not to the bit; `test_the_incremental_loglik_matches_a_fresh_prune`
     /// pins how close.
     ///
@@ -1233,9 +1302,10 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     /// Everything outside the node's subtree, positioned at its parent and not
     /// diffused along the branch above it, which is the up sweep's convention.
     pub(crate) fn up_row(&self, node: u32) -> &Row<T> {
+        let up = self.up_cells();
         let mut chain: Vec<u32> = Vec::new();
         let mut here = node;
-        while self.up[here as usize].get().is_none() {
+        while up[here as usize].get().is_none() {
             chain.push(here);
             match self.tree.parent(here) {
                 None => break,
@@ -1244,11 +1314,46 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
         }
         for &v in chain.iter().rev() {
             let row = self.compute_up(v);
-            let _ = self.up[v as usize].set(row);
+            let _ = up[v as usize].set(row);
         }
         // Filled by the loop above, so the initialiser never runs; it is here
         // because `get` returns an option and this module does not unwrap.
-        self.up[node as usize].get_or_init(|| self.compute_up(node))
+        up[node as usize].get_or_init(|| self.compute_up(node))
+    }
+
+    /// Keep the rows this formed and drop the borrows.
+    ///
+    /// ### Returns
+    ///
+    /// The formed rows, for [`RowStore::accept_fresh`].
+    pub(crate) fn into_fresh(self) -> Fresh<T> {
+        Fresh {
+            inherited: self.inherited,
+            slot: self.slot,
+            fresh_m: self.fresh_m,
+            fresh_w: self.fresh_w,
+            fresh_contrib: self.fresh_contrib,
+        }
+    }
+
+    /// The up-row cells, allocated on first use.
+    ///
+    /// ### Returns
+    ///
+    /// One cell per node.
+    fn up_cells(&self) -> &[OnceLock<Row<T>>] {
+        self.up
+            .get_or_init(|| (0..self.tree.n_nodes()).map(|_| OnceLock::new()).collect())
+    }
+
+    /// The effective-leaf cells, allocated on first use.
+    ///
+    /// ### Returns
+    ///
+    /// One cell per node.
+    fn eff_cells(&self) -> &[OnceLock<Row<T>>] {
+        self.eff
+            .get_or_init(|| (0..self.tree.n_nodes()).map(|_| OnceLock::new()).collect())
     }
 
     /// One node's up row, from its parent's.
@@ -1307,7 +1412,7 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     ///
     /// The effective leaf the beam search scores an attachment against.
     fn eff_leaf(&self, node: u32) -> EffLeaf<'_, T> {
-        let rows = self.eff[node as usize].get_or_init(|| {
+        let rows = self.eff_cells()[node as usize].get_or_init(|| {
             let above = self.up_row(node);
             eff_step(
                 self.tree.parent(node).is_none(),
@@ -1631,7 +1736,7 @@ fn regraft_cut(
 }
 
 /// A candidate move, proposed and scored but not yet decided.
-struct Proposal {
+struct Proposal<T> {
     /// The tree the move produces.
     tree: Tree,
     /// Per node of `tree`, the node of the tree the move started from whose
@@ -1644,15 +1749,62 @@ struct Proposal {
     /// [`LazyRows::score`]; what acceptance compares.
     score: i128,
     /// Where the subtree was attached, as a node of the tree the move started
-    /// from, and the new branch; with the two leaf words below, what
-    /// [`SprApprox::recheck`] re-applies.
+    /// from.
     target: u32,
     /// Length of the new branch.
     branch: f64,
-    /// Leaf word of the pruned subtree, set by the sweep.
+    /// The rows `tree` has that the tree the move started from does not.
+    fresh: Fresh<T>,
+}
+
+/// A scored move the sweep has yet to decide on.
+///
+/// Scored by the views wherever they could, in which case nothing was built
+/// and the tree is assembled only if the move is accepted.
+struct Candidate<T> {
+    /// The subtree to prune, as a node of the tree it was scored on.
+    pruned: u32,
+    /// Where to attach it, same ids.
+    target: u32,
+    /// Length of the new branch.
+    branch: f64,
+    /// [`fixed`] total of the tree the move produces.
+    score: i128,
+    /// Leaf word of the pruned subtree; with the next two, what
+    /// [`SprApprox::recheck`] re-applies to a tree that has moved since.
     pruned_word: u64,
-    /// Leaf word of the attachment point, set by the sweep.
+    /// Leaf word of the attachment point.
     target_word: u64,
+    /// The built move, when the built path scored it.
+    built: Option<Proposal<T>>,
+    /// The resolution of the regraft's star, when the views scored it and the
+    /// star needed one; [`apply_move`] reuses it.
+    star: Option<StarResult<T>>,
+}
+
+impl<T> Candidate<T> {
+    /// A candidate from a move the built path scored.
+    ///
+    /// ### Params
+    ///
+    /// * `built` - The proposal
+    /// * `word` - Leaf words of the tree it was proposed on
+    ///
+    /// ### Returns
+    ///
+    /// The candidate, carrying the proposal.
+    fn from_built(built: Proposal<T>, word: &[u64]) -> Self {
+        Self {
+            pruned: built.pruned,
+            target: built.target,
+            branch: built.branch,
+            score: built.score,
+            pruned_word: word[built.pruned as usize],
+            target_word: word[built.target as usize],
+            built: Some(built),
+            star: None,
+        }
+    }
 }
 
 /// Index a tree's [`leaf_words`] by word.
@@ -1677,7 +1829,7 @@ fn word_index(word: &[u64]) -> FxHashMap<u64, u32> {
 /// A proposal whose splits match the current tree's is not a move at all, only
 /// a reoptimisation of the branches the cut and the regraft touched, and is
 /// dropped here; see the module docs for what accepting those costs. The rest
-/// are scored by [`LazyRows::loglik`], which reads the current tree's rows
+/// are scored by [`LazyRows::score`], which reads the current tree's rows
 /// wherever the candidate's subtrees are the current tree's. Which they are
 /// is settled by leaf set: the candidate's nodes are matched to the current
 /// tree's by [`leaf_words`], and [`LazyRows`] then checks children and
@@ -1704,8 +1856,7 @@ fn word_index(word: &[u64]) -> FxHashMap<u64, u32> {
 /// * `here` - Split fingerprint of `tree`
 /// * `by_word` - [`word_index`] of `tree`
 /// * `placed` - The attachment node, in `tree`'s ids, and branch, when
-///   [`fast_no_move`] has already found them; the pruned tree is then never
-///   built
+///   they are already known; the pruned tree is then never built
 ///
 /// ### Returns
 ///
@@ -1720,7 +1871,7 @@ fn propose<T: BonsaiFloat>(
     here: u64,
     by_word: &FxHashMap<u64, u32>,
     placed: Option<(u32, f64)>,
-) -> Result<Option<Proposal>, BonsaiErrors> {
+) -> Result<Option<Proposal<T>>, BonsaiErrors> {
     let (arrays, target, placed_branch) = match placed {
         Some((target, branch)) => {
             let Some(arrays) = cut(tree, x) else {
@@ -1849,16 +2000,17 @@ fn propose<T: BonsaiFloat>(
             }
         })
         .collect();
-    let score = LazyRows::new(&candidate, &to_old, tree, down)?.score();
+    let rows = LazyRows::new(&candidate, &to_old, tree, down)?;
+    let score = rows.score();
+    let fresh = rows.into_fresh();
     Ok(Some(Proposal {
+        fresh,
         tree: candidate,
         to_old,
         pruned: x,
         score,
         target,
         branch: placed_branch,
-        pruned_word: 0,
-        target_word: 0,
     }))
 }
 
@@ -1883,7 +2035,7 @@ fn propose<T: BonsaiFloat>(
 /// ### Returns
 ///
 /// The wrapping sum of [`split_hash`] over the added non-trivial splits.
-fn resolution_splits<T: BonsaiFloat>(
+pub(crate) fn resolution_splits<T: BonsaiFloat>(
     member_word: &[u64],
     member_count: &[usize],
     n_leaves: usize,
@@ -1910,8 +2062,7 @@ fn resolution_splits<T: BonsaiFloat>(
     print
 }
 
-/// What the current tree's fingerprint terms are built from, for the fast
-/// path.
+/// What the views read off the current tree besides its rows.
 struct Prints<'a> {
     /// Leaf words of the current tree.
     word: &'a [u64],
@@ -1919,19 +2070,18 @@ struct Prints<'a> {
     below: &'a [usize],
     /// Its split fingerprint.
     here: u64,
+    /// Its [`fixed`] loglikelihood total.
+    score: i128,
 }
 
-/// Whether pruning `x` and regrafting it where the beam search likes best
-/// changes no split, decided without building either tree.
+/// Score pruning `x` and regrafting it without building either tree.
 ///
 /// The pruned and the regrafted trees are views of the current one
-/// ([`crate::search::masked`]), so a proposal that puts the subtree back where
-/// it came from costs its beam search and two `O(depth p)` paths instead of
-/// two arena assemblies and their row maps. A proposal that does move
-/// something is handed to [`propose`] with the placement already found, so the
-/// remaining tree is never assembled for it either. Measured 2026-09-26 against
-/// the build without the views, same trees: step 5 from 116 s to 110 s at 10k
-/// cells and from 364 s to 301 s at 25k.
+/// ([`crate::search::masked`]), so a proposal costs its beam search and a few
+/// `O(depth p)` paths instead of arena assemblies and their row maps. Most
+/// proposals put the subtree back where it came from and change no split;
+/// the rest are scored by [`score_move`], and the tree is built only if the
+/// sweep accepts the move.
 ///
 /// ### Params
 ///
@@ -1939,20 +2089,24 @@ struct Prints<'a> {
 /// * `down` - Its rows
 /// * `x` - Node to prune
 /// * `params` - Knobs
-/// * `prints` - The current tree's words, counts and fingerprint
+/// * `prints` - The current tree's words, counts, fingerprint and total
+/// * `placed` - The attachment node and branch when they are already known,
+///   which [`SprApprox::recheck`] carries over from an earlier tree; `None`
+///   runs the beam search
 /// * `cache` - Up-row cells for the pruned view, returned emptied
 ///
 /// ### Returns
 ///
 /// See [`Fast`]; or the error the placement or the primitive failed with.
-fn fast_no_move<T: BonsaiFloat>(
+fn view_move<T: BonsaiFloat>(
     tree: &Tree,
     down: &RowStore<T>,
     x: u32,
     params: &SprParams,
     prints: &Prints<'_>,
+    placed: Option<(u32, f64)>,
     cache: &mut ViewCache<T>,
-) -> Result<Fast, BonsaiErrors> {
+) -> Result<Fast<T>, BonsaiErrors> {
     let Some(view) = PrunedView::new(tree, x) else {
         return Ok(Fast::Declined);
     };
@@ -1960,55 +2114,162 @@ fn fast_no_move<T: BonsaiFloat>(
         m: down.means(x),
         w: down.precisions(x),
     };
-    let found = {
+    let fast = (|| -> Result<Fast<T>, BonsaiErrors> {
         let rows = PrunedRows::new(&view, down, cache);
-        let best = place_walk(&view, q, |v| rows.eff_leaf(v), Some(params.placement))?;
-        let attached = attach(
+        let (target, branch) = match placed {
+            Some(placed) => placed,
+            None => {
+                let best = place_walk(&view, q, |v| rows.eff_leaf(v), Some(params.placement))?;
+                (best.node, best.branch)
+            }
+        };
+        let Some(attached) = attach(
             &rows,
-            best.node,
-            best.branch,
+            target,
+            branch,
             prints.word,
             prints.below,
             prints.here,
-        );
-        (best, attached)
-    };
-    cache.reset();
-    let (best, Some(attached)) = found else {
-        return Ok(Fast::Declined);
-    };
-    #[cfg(debug_assertions)]
-    check_against_built(tree, down, x, params, &best, &attached)?;
-    let print =
-        if attached.star.member_nodes.len() <= crate::search::polytomy::RESOLVED_STAR_MEMBERS {
-            attached.print
+        ) else {
+            // A carried-over target the cut suppresses has nowhere to go, as
+            // on the built path; anything else the views decline, it decides.
+            return Ok(if placed.is_some() && tree.parent(x) == Some(target) {
+                Fast::NoMove
+            } else {
+                Fast::Declined
+            });
+        };
+        #[cfg(debug_assertions)]
+        if placed.is_none() {
+            check_against_built(tree, down, x, params, (target, branch), &attached)?;
+        }
+        let small =
+            attached.star.member_nodes.len() <= crate::search::polytomy::RESOLVED_STAR_MEMBERS;
+        let result = if small {
+            None
         } else {
-            let result = resolve_star(attached.star.view(), Some(params.star))?;
-            attached.print.wrapping_add(resolution_splits(
+            Some(resolve_star(attached.star.view(), Some(params.star))?)
+        };
+        let print = match &result {
+            None => attached.print,
+            Some(result) => attached.print.wrapping_add(resolution_splits(
                 &attached.member_word,
                 &attached.member_count,
                 tree.n_leaves(),
                 prints.word[tree.root() as usize],
-                &result,
-            ))
+                result,
+            )),
         };
-    Ok(if print == prints.here {
-        Fast::NoMove
-    } else {
-        Fast::Move(best.node, best.branch)
-    })
+        if print == prints.here {
+            return Ok(Fast::NoMove);
+        }
+        let score = score_move(&rows, &attached, result.as_ref(), prints.score);
+        Ok(Fast::Move(target, branch, score, result))
+    })();
+    cache.reset();
+    fast
 }
 
 /// What the views decided about one proposal.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Fast {
-    /// The proposal changes no split.
+enum Fast<T> {
+    /// The proposal changes no split, or does not apply to this tree.
     NoMove,
-    /// It does: the attachment node in the current tree's ids and its branch,
-    /// the same bits the built path's beam search finds.
-    Move(u32, f64),
+    /// It does: the attachment node in the current tree's ids, its branch,
+    /// the [`fixed`] total of the tree the move produces, the same bits the
+    /// built path finds, and the resolution of the regraft's star if it
+    /// needed one.
+    Move(u32, f64, i128, Option<StarResult<T>>),
     /// The views declined; the built path decides.
     Declined,
+}
+
+/// Debug builds: an applied move against the built path's, field for field.
+///
+/// ### Params
+///
+/// * `tree` - The current tree
+/// * `down` - Its rows
+/// * `params` - Knobs
+/// * `here` - Its split fingerprint
+/// * `by_word` - Its word index
+/// * `cand` - The move
+/// * `applied` - What [`apply_move`] made of it, `to_old` filled in
+///
+/// ### Returns
+///
+/// `Ok` if they agree; panics otherwise.
+#[cfg(debug_assertions)]
+fn check_applied<T: BonsaiFloat>(
+    tree: &Tree,
+    down: &RowStore<T>,
+    params: &SprParams,
+    here: u64,
+    by_word: &FxHashMap<u64, u32>,
+    cand: &Candidate<T>,
+    applied: &Applied<T>,
+) -> Result<(), BonsaiErrors> {
+    let built = propose(
+        tree,
+        down,
+        cand.pruned,
+        params,
+        here,
+        by_word,
+        Some((cand.target, cand.branch)),
+    )?
+    .expect("the built path applies a move the views scored");
+    assert_eq!(built.score, cand.score, "score");
+    let (a, b) = (&applied.tree, &built.tree);
+    assert_eq!(a.n_nodes(), b.n_nodes(), "node count");
+    for v in 0..a.n_nodes() as u32 {
+        assert_eq!(a.parent(v), b.parent(v), "parent of {v}");
+        assert_eq!(
+            a.branch(v).to_bits(),
+            b.branch(v).to_bits(),
+            "branch of {v}"
+        );
+    }
+    assert_eq!(applied.to_old, built.to_old, "row map");
+    assert_eq!(applied.word, leaf_words(b), "words");
+    assert_eq!(applied.below, leaves_below(b), "counts");
+    let word = leaf_words(b);
+    assert_eq!(
+        applied.print,
+        split_fingerprint_counted(b, &word, &leaves_below(b)),
+        "fingerprint"
+    );
+    // Row by row, each side read through its own map onto the current store.
+    let row = |fresh: &Fresh<T>, v: usize| -> (Vec<u64>, Vec<u64>, u64) {
+        let bits = |xs: &[T]| -> Vec<u64> {
+            xs.iter()
+                .map(|x| x.to_f64().map_or(u64::MAX, f64::to_bits))
+                .collect()
+        };
+        let p = down.n_features();
+        match fresh.inherited[v] {
+            NO_NODE => {
+                let k = fresh.slot[v] as usize;
+                (
+                    bits(&fresh.fresh_m[k * p..(k + 1) * p]),
+                    bits(&fresh.fresh_w[k * p..(k + 1) * p]),
+                    fresh.fresh_contrib[k].to_bits(),
+                )
+            }
+            old => (
+                bits(down.means(old)),
+                bits(down.precisions(old)),
+                down.contribution(old).to_bits(),
+            ),
+        }
+    };
+    for v in 0..a.n_nodes() {
+        let (ours, theirs) = (applied.fresh.inherited[v], built.fresh.inherited[v]);
+        if ours != NO_NODE && ours == theirs {
+            continue;
+        }
+        assert_eq!(row(&applied.fresh, v), row(&built.fresh, v), "row of {v}");
+    }
+    Ok(())
 }
 
 /// Debug builds: the views' placement, star and fingerprint against the built
@@ -2020,7 +2281,7 @@ enum Fast {
 /// * `down` - Its rows
 /// * `x` - The pruned node
 /// * `params` - Knobs
-/// * `best` - The placement the view found
+/// * `best` - The attachment node and branch the view found
 /// * `attached` - The star and fingerprint the view built
 ///
 /// ### Returns
@@ -2032,8 +2293,8 @@ fn check_against_built<T: BonsaiFloat>(
     down: &RowStore<T>,
     x: u32,
     params: &SprParams,
-    best: &crate::model::place::Placement,
-    attached: &Attached<T>,
+    best: (u32, f64),
+    attached: &Attached<'_, T>,
 ) -> Result<(), BonsaiErrors> {
     let pruned = prune_subtree(tree, x)?.expect("the view accepted the cut");
     let rows = LazyRows::new(&pruned.tree, &pruned.to_old, tree, down)?;
@@ -2047,20 +2308,8 @@ fn check_against_built<T: BonsaiFloat>(
         |node: u32| rows.eff_leaf(node),
         Some(params.placement),
     )?;
-    assert_eq!(
-        pruned.to_old[built.node as usize], best.node,
-        "placement node"
-    );
-    assert_eq!(
-        built.branch.to_bits(),
-        best.branch.to_bits(),
-        "placement branch"
-    );
-    assert_eq!(
-        built.loglik.to_bits(),
-        best.loglik.to_bits(),
-        "placement score"
-    );
+    assert_eq!(pruned.to_old[built.node as usize], best.0, "placement node");
+    assert_eq!(built.branch.to_bits(), best.1.to_bits(), "placement branch");
 
     let target = pruned.to_old[built.node as usize];
     let (tree_a, centre, to_old) = regraft(&pruned, x, target, built.branch, tree.n_leaves())?;
@@ -2093,6 +2342,149 @@ fn check_against_built<T: BonsaiFloat>(
         "star precisions"
     );
     Ok(())
+}
+
+/// Turn what the views decided into a candidate, falling back to the built
+/// path where they declined.
+///
+/// ### Params
+///
+/// * `tree` - The current tree
+/// * `down` - Its rows
+/// * `x` - The pruned node
+/// * `params` - Knobs
+/// * `prints` - What the views read off the current tree
+/// * `by_word` - [`word_index`] of `tree`
+/// * `placed` - The carried-over attachment, if any
+/// * `fast` - What the views decided
+///
+/// ### Returns
+///
+/// The candidate, `None` if the move changes nothing or does not apply, or the
+/// error the built path failed with.
+#[allow(clippy::too_many_arguments)]
+fn candidate<T: BonsaiFloat>(
+    tree: &Tree,
+    down: &RowStore<T>,
+    x: u32,
+    params: &SprParams,
+    prints: &Prints<'_>,
+    by_word: &FxHashMap<u64, u32>,
+    placed: Option<(u32, f64)>,
+    fast: Fast<T>,
+) -> Result<Option<Candidate<T>>, BonsaiErrors> {
+    match fast {
+        Fast::NoMove => {
+            #[cfg(debug_assertions)]
+            assert!(
+                propose(tree, down, x, params, prints.here, by_word, placed)?.is_none(),
+                "the views called a move no move"
+            );
+            Ok(None)
+        }
+        Fast::Move(target, branch, score, star) => {
+            #[cfg(debug_assertions)]
+            {
+                let built = propose(
+                    tree,
+                    down,
+                    x,
+                    params,
+                    prints.here,
+                    by_word,
+                    Some((target, branch)),
+                )?;
+                assert_eq!(
+                    built.map(|b| b.score),
+                    Some(score),
+                    "the views scored a move differently from the built path"
+                );
+            }
+            Ok(Some(Candidate {
+                pruned: x,
+                target,
+                branch,
+                score,
+                pruned_word: prints.word[x as usize],
+                target_word: prints.word[target as usize],
+                built: None,
+                star,
+            }))
+        }
+        Fast::Declined => Ok(
+            propose(tree, down, x, params, prints.here, by_word, placed)?
+                .map(|built| Candidate::from_built(built, prints.word)),
+        ),
+    }
+}
+
+/// One move to score: a subtree by its leaf word, and where to put it.
+struct Want {
+    /// Leaf word of the subtree to prune.
+    pruned_word: u64,
+    /// Leaf word of the attachment point and the branch, carried over from
+    /// an earlier tree by [`SprApprox::recheck`]; `None` runs the beam search.
+    placed: Option<(u64, f64)>,
+}
+
+/// Score a chunk of moves against the tree as it stands, in parallel.
+///
+/// Scored by the views where they can, by the built path where they decline.
+///
+/// ### Params
+///
+/// * `tree` - The current tree
+/// * `down` - Its rows
+/// * `params` - Knobs
+/// * `prints` - What the views read off the current tree
+/// * `by_word` - [`word_index`] of `tree`
+/// * `caches` - One view cache per worker and one spare
+/// * `wants` - The moves, `None` for a slot with nothing to score
+///
+/// ### Returns
+///
+/// One candidate per slot, `None` where the move changes nothing, does not
+/// apply, or a leaf word no longer names a node; or the error the placement,
+/// the primitive or the arena failed with.
+#[allow(clippy::too_many_arguments)]
+fn score_chunk<T: BonsaiFloat>(
+    tree: &Tree,
+    down: &RowStore<T>,
+    params: &SprParams,
+    prints: &Prints<'_>,
+    by_word: &FxHashMap<u64, u32>,
+    caches: &[Mutex<ViewCache<T>>],
+    wants: &[Option<Want>],
+) -> Result<Vec<Option<Candidate<T>>>, BonsaiErrors> {
+    wants
+        .par_iter()
+        .map(|want| -> Result<Option<Candidate<T>>, BonsaiErrors> {
+            let Some(want) = want else {
+                return Ok(None);
+            };
+            let Some(&x) = by_word.get(&want.pruned_word) else {
+                return Ok(None);
+            };
+            let placed = match want.placed {
+                None => None,
+                Some((target_word, branch)) => match by_word.get(&target_word) {
+                    Some(&target) => Some((target, branch)),
+                    None => return Ok(None),
+                },
+            };
+            let slot = rayon::current_thread_index().unwrap_or(caches.len() - 1);
+            let fast = match caches[slot.min(caches.len() - 1)].try_lock() {
+                Ok(mut cache) => {
+                    if cache.len() < tree.n_nodes() + 1 {
+                        *cache = ViewCache::new(tree.n_nodes() + 1);
+                    }
+                    view_move(tree, down, x, params, prints, placed, &mut cache)?
+                }
+                Err(_) => Fast::Declined,
+            };
+            candidate(tree, down, x, params, prints, by_word, placed, fast)
+        })
+        .collect()
 }
 
 ////////////
@@ -2139,28 +2531,28 @@ fn candidate_order(tree: &Tree, params: &SprParams, rng: &mut SplitMix64) -> Vec
 /// is skipped. Everything the scan reads off the tree is settled once and
 /// resettled only where a move actually moved it.
 ///
-/// A candidate is scored by [`LazyRows::loglik`] on the tree it would produce,
-/// which sums the same per-node terms a fresh [`NodeState::prune`] would and
-/// recomputes only the ones the move changed. An accepted move is therefore an
-/// improvement in the quantity that matters and the sweep is monotone in it.
-/// The one figure that is not incremental is the result's, which is a fresh
-/// prune of the tree the sweep finished on.
+/// A candidate is scored on the tree it would produce, as the current
+/// [`fixed`] total less the terms the move changes plus the ones it forms,
+/// which are the same per-node terms a fresh [`NodeState::prune`] sums. An
+/// accepted move is therefore an improvement in the quantity that matters and
+/// the sweep is monotone in it. The one figure that is not incremental is the
+/// result's, which is a fresh prune of the tree the sweep finished on.
 ///
 /// ### Chunks
 ///
-/// The decisions are sequential and the proposals are not. A candidate must
-/// be decided against the tree as it stands when its turn comes, and an
-/// accepted move changes that tree, so a candidate proposed before an earlier
-/// one was decided may have been proposed against the wrong tree. What makes
-/// parallel proposal safe is refusing to use those: candidates are proposed a
-/// chunk at a time against one tree, decided in order, and at the first
-/// acceptance the rest of the chunk is discarded and proposed again against
-/// the new tree. Every candidate that is decided was proposed against the tree
-/// it is decided against, which is the sequential sweep's invariant, so the
-/// result does not depend on the chunk size or the thread count. The chunk
-/// halves on an acceptance and doubles on a clean chunk, between
-/// [`PROPOSAL_CHUNK_MIN`] and [`PROPOSAL_CHUNK_MAX`], so the work an
-/// acceptance discards tracks how often acceptances come.
+/// The decisions are sequential and the scoring is not. A candidate must be
+/// decided against the tree as it stands when its turn comes, and an accepted
+/// move changes that tree, so a candidate scored before an earlier one was
+/// decided was scored against the wrong tree. Candidates are scored a chunk at
+/// a time against one tree and decided in order; at an acceptance the rest of
+/// the chunk is scored again, in parallel, against the new tree, and deciding
+/// resumes. Without [`SprApprox::recheck`] they are proposed afresh in the
+/// next chunk; with it they keep the attachment found on the older tree.
+/// Either way every candidate is decided against the tree it was scored on, so
+/// the result does not depend on the thread count. The chunk halves on an
+/// acceptance and doubles on a clean chunk, between [`PROPOSAL_CHUNK_MIN`]
+/// and [`PROPOSAL_CHUNK_MAX`], so the work an acceptance discards tracks how
+/// often acceptances come.
 ///
 /// ### Params
 ///
@@ -2216,10 +2608,10 @@ fn sweep<T: BonsaiFloat>(
     let mut below = leaves_below(&tree);
     let mut here = split_fingerprint_counted(&tree, &word, &below);
     let mut by_word = word_index(&word);
-    // One up-row cache per worker, reused across proposals. Taken with
-    // `try_lock`: the star primitive runs rayon work, so a worker can pick up
-    // another proposal while it holds its own, and that one then falls back to
-    // the built path rather than wait.
+    // One up-row cache per worker, reused across proposals, and one for a
+    // caller outside the pool. Taken with `try_lock`: the star primitive runs
+    // rayon work, so a worker can pick up another proposal while it holds its
+    // own, and that one then falls back to the built path rather than wait.
     let caches: Vec<Mutex<ViewCache<T>>> = (0..rayon::current_num_threads() + 1)
         .map(|_| Mutex::new(ViewCache::new(tree.n_nodes() + 1)))
         .collect();
@@ -2233,121 +2625,167 @@ fn sweep<T: BonsaiFloat>(
     let mut chunk = PROPOSAL_CHUNK_MIN;
     while next < order.len() {
         let end = (next + chunk).min(order.len());
-        let prints = Prints {
-            word: &word,
-            below: &below,
-            here,
-        };
-        let proposals: Vec<Option<Proposal>> = order[next..end]
-            .par_iter()
-            .map(|want| -> Result<Option<Proposal>, BonsaiErrors> {
-                let Some(&x) = by_word.get(want) else {
-                    return Ok(None);
-                };
-                let slot = rayon::current_thread_index().unwrap_or(caches.len() - 1);
-                let fast = match caches[slot.min(caches.len() - 1)].try_lock() {
-                    Ok(mut cache) => {
-                        if cache.len() < tree.n_nodes() + 1 {
-                            *cache = ViewCache::new(tree.n_nodes() + 1);
-                        }
-                        fast_no_move(&tree, &down, x, &params, &prints, &mut cache)?
-                    }
-                    Err(_) => Fast::Declined,
-                };
-                match fast {
-                    Fast::NoMove => {
-                        #[cfg(debug_assertions)]
-                        assert!(
-                            propose(&tree, &down, x, &params, here, &by_word, None)?.is_none(),
-                            "the views called a move no move"
-                        );
-                        Ok(None)
-                    }
-                    Fast::Move(target, branch) => {
-                        let built = propose(
-                            &tree,
-                            &down,
-                            x,
-                            &params,
-                            here,
-                            &by_word,
-                            Some((target, branch)),
-                        )?;
-                        debug_assert!(built.is_some(), "the views called no move a move");
-                        Ok(built)
-                    }
-                    Fast::Declined => propose(&tree, &down, x, &params, here, &by_word, None),
-                }
-                .map(|built| {
-                    built.map(|mut p| {
-                        p.pruned_word = word[p.pruned as usize];
-                        p.target_word = word[p.target as usize];
-                        p
-                    })
+        let recheck = params.search.recheck();
+        let wants: Vec<Option<Want>> = order[next..end]
+            .iter()
+            .map(|&w| {
+                Some(Want {
+                    pruned_word: w,
+                    placed: None,
                 })
             })
-            .collect::<Result<_, _>>()?;
-
-        let recheck = params.search.recheck();
+            .collect();
+        let mut batch = score_chunk(
+            &tree,
+            &down,
+            &params,
+            &Prints {
+                word: &word,
+                below: &below,
+                here,
+                score: best,
+            },
+            &by_word,
+            &caches,
+            &wants,
+        )?;
+        // Decided in order. After an acceptance the rest of the chunk was
+        // scored against the tree before it, so with the recheck it is scored
+        // again, in parallel, against the tree after it, and deciding resumes
+        // there. Every candidate is decided against the tree it was scored on.
         let mut accepted = None;
-        for (k, proposal) in proposals.into_iter().enumerate() {
-            let Some(mut proposal) = proposal else {
-                continue;
+        let mut offset = 0usize;
+        loop {
+            let mut hit = None;
+            for (k, cand) in batch.iter_mut().enumerate() {
+                let Some(cand) = cand.take() else {
+                    continue;
+                };
+                if unfixed(cand.score - best) <= acceptance_floor(&params, unfixed(best)) {
+                    continue;
+                }
+                let n_leaves = tree.n_leaves();
+                let radius = params.search.revisit_radius();
+                match cand.built {
+                    Some(proposal) => {
+                        gains.push(SprGain {
+                            pruned: proposal.pruned,
+                            gain: unfixed(proposal.score - best),
+                        });
+                        best = proposal.score;
+                        down.accept_fresh(proposal.fresh);
+                        tree = proposal.tree;
+                        word = leaf_words(&tree);
+                        below = leaves_below(&tree);
+                        here = split_fingerprint_counted(&tree, &word, &below);
+                        by_word = word_index(&word);
+                        if radius > 0 {
+                            mark_near_new_clades(
+                                &tree,
+                                &word,
+                                |v| proposal.to_old[v] == NO_NODE,
+                                radius,
+                                &mut revisit,
+                            );
+                        }
+                    }
+                    None => {
+                        let Some(mut applied) = apply_move(
+                            &tree,
+                            &down,
+                            cand.pruned,
+                            cand.target,
+                            cand.branch,
+                            cand.star.as_ref(),
+                            &word,
+                            &below,
+                            here,
+                        )?
+                        else {
+                            // The views scored it, so they do not decline it.
+                            debug_assert!(false, "the views declined a move they scored");
+                            continue;
+                        };
+                        for &v in &applied.changed {
+                            applied.to_old[v as usize] = by_word
+                                .get(&applied.word[v as usize])
+                                .copied()
+                                .filter(|&old| old as usize >= n_leaves)
+                                .unwrap_or(NO_NODE);
+                        }
+                        #[cfg(debug_assertions)]
+                        check_applied(&tree, &down, &params, here, &by_word, &cand, &applied)?;
+                        gains.push(SprGain {
+                            pruned: cand.pruned,
+                            gain: unfixed(cand.score - best),
+                        });
+                        best = cand.score;
+                        down.accept_fresh(applied.fresh);
+                        for &old in &applied.stale {
+                            if by_word.get(&word[old as usize]) == Some(&old) {
+                                by_word.remove(&word[old as usize]);
+                            }
+                        }
+                        for v in by_word.values_mut() {
+                            *v = applied.new_id[*v as usize];
+                        }
+                        for &v in &applied.changed {
+                            by_word.insert(applied.word[v as usize], v);
+                        }
+                        tree = applied.tree;
+                        word = applied.word;
+                        below = applied.below;
+                        here = applied.print;
+                        if radius > 0 {
+                            mark_near_new_clades(
+                                &tree,
+                                &word,
+                                |v| applied.to_old[v] == NO_NODE,
+                                radius,
+                                &mut revisit,
+                            );
+                        }
+                    }
+                }
+                hit = Some(k);
+                break;
+            }
+            let Some(k) = hit else {
+                break;
             };
-            if accepted.is_some() {
-                // Proposed against the tree before this chunk's acceptance:
-                // re-apply the same move to the tree as it stands and score it
-                // there, or drop it if either end no longer names a node.
-                let (Some(&x), Some(&target)) = (
-                    by_word.get(&proposal.pruned_word),
-                    by_word.get(&proposal.target_word),
-                ) else {
-                    continue;
-                };
-                let Some(again) = propose(
-                    &tree,
-                    &down,
-                    x,
-                    &params,
-                    here,
-                    &by_word,
-                    Some((target, proposal.branch)),
-                )?
-                else {
-                    continue;
-                };
-                proposal = again;
-                proposal.pruned_word = word[proposal.pruned as usize];
-                proposal.target_word = word[proposal.target as usize];
-            }
-            let gain = unfixed(proposal.score - best);
-            if gain <= acceptance_floor(&params, unfixed(best)) {
-                continue;
-            }
-            gains.push(SprGain {
-                pruned: proposal.pruned,
-                gain,
-            });
-            best = proposal.score;
-            down.accept(&proposal.tree, &proposal.to_old, &tree)?;
-            tree = proposal.tree;
-            word = leaf_words(&tree);
-            below = leaves_below(&tree);
-            here = split_fingerprint_counted(&tree, &word, &below);
-            by_word = word_index(&word);
-            if params.search.revisit_radius() > 0 {
-                mark_near_new_clades(
-                    &tree,
-                    &word,
-                    |v| proposal.to_old[v] == NO_NODE,
-                    params.search.revisit_radius(),
-                    &mut revisit,
-                );
-            }
-            accepted = Some(k);
+            accepted.get_or_insert(offset + k);
             if !recheck {
                 break;
             }
+            // Re-applied as the same subtree onto the same attachment with the
+            // same branch, or dropped if either end no longer names a node.
+            let rest: Vec<Option<Want>> = batch[k + 1..]
+                .iter()
+                .map(|c| {
+                    c.as_ref().map(|c| Want {
+                        pruned_word: c.pruned_word,
+                        placed: Some((c.target_word, c.branch)),
+                    })
+                })
+                .collect();
+            if rest.iter().all(Option::is_none) {
+                break;
+            }
+            offset += k + 1;
+            batch = score_chunk(
+                &tree,
+                &down,
+                &params,
+                &Prints {
+                    word: &word,
+                    below: &below,
+                    here,
+                    score: best,
+                },
+                &by_word,
+                &caches,
+                &rest,
+            )?;
         }
 
         // The rest of a chunk that accepted was proposed against the tree
@@ -2984,8 +3422,12 @@ mod tests {
                 Some(PlacementParams::default()),
             )
             .expect("place");
-            total += rows.eff.len();
-            formed += rows.eff.iter().filter(|c| c.get().is_some()).count();
+            total += rows.eff_cells().len();
+            formed += rows
+                .eff_cells()
+                .iter()
+                .filter(|c| c.get().is_some())
+                .count();
         }
         assert!(total > 0);
         // Not an invariant, a measurement: the beam forms a small fraction of

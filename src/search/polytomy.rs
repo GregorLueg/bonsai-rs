@@ -415,11 +415,10 @@ fn apply_splice<T: BonsaiFloat>(
     star: &CentreStar<T>,
     result: &StarResult<T>,
 ) {
-    let n = star.member_nodes.len();
     let old = parent.len();
-    let n_local = result.parent.len();
-    parent.resize(old + n_local - n, NO_NODE);
-    branch.resize(old + n_local - n, 0.0);
+    let n_new = result.parent.len() - star.member_nodes.len();
+    parent.resize(old + n_new, NO_NODE);
+    branch.resize(old + n_new, 0.0);
 
     // A deleted node keeps no parent and, since all of its children are members
     // of the star, gains no children either, so the rebuild's walk never
@@ -427,14 +426,44 @@ fn apply_splice<T: BonsaiFloat>(
     for &node in &star.deleted {
         parent[node as usize] = NO_NODE;
     }
+    for (node, up, t) in splice_edits(star, result, old as u32) {
+        parent[node as usize] = up;
+        branch[node as usize] = t;
+    }
+}
 
+/// The parent and branch every node a resolved star touches ends up with.
+///
+/// The ancestors the primitive made are numbered `first_new` upwards in the
+/// order it made them. Shared by [`apply_splice`] and the masked views of
+/// [`crate::search::masked`], which apply the same edits to a view instead of
+/// an array.
+///
+/// ### Params
+///
+/// * `star` - The star that was resolved
+/// * `result` - What the primitive built
+/// * `first_new` - Id of the first new ancestor
+///
+/// ### Returns
+///
+/// One `(node, parent, branch)` per node whose parent or branch the splice
+/// sets.
+pub(crate) fn splice_edits<T: BonsaiFloat>(
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+    first_new: u32,
+) -> Vec<(u32, u32, f64)> {
+    let n = star.member_nodes.len();
+    let n_local = result.parent.len();
     let map = |i: usize| -> u32 {
         if i < n {
             star.member_nodes[i]
         } else {
-            (old + i - n) as u32
+            first_new + (i - n) as u32
         }
     };
+    let mut edits = Vec::with_capacity(n_local + 1);
 
     // The ancestors between the centre and the upstream member, nearest the
     // upstream member first. These are the nodes whose direction flips.
@@ -454,37 +483,34 @@ fn apply_splice<T: BonsaiFloat>(
         if Some(i) == upstream || on_chain[i] {
             continue;
         }
-        let node = map(i) as usize;
-        parent[node] = match result.parent[i] {
+        let up = match result.parent[i] {
             NO_NODE => star.centre,
             up => map(up as usize),
         };
-        branch[node] = result.branch[i];
+        edits.push((map(i), up, result.branch[i]));
     }
 
     if let Some(u) = upstream {
         // The upstream member is the centre's parent, and it keeps its own
         // place in the tree: only what hangs off it changes.
-        let above = star.member_nodes[u] as usize;
+        let above = star.member_nodes[u];
         match chain.split_first() {
-            None => {
-                parent[star.centre as usize] = above as u32;
-                branch[star.centre as usize] = result.branch[u];
-            }
+            None => edits.push((star.centre, above, result.branch[u])),
             Some((&top, _)) => {
-                parent[map(top as usize) as usize] = above as u32;
-                branch[map(top as usize) as usize] = result.branch[u];
+                edits.push((map(top as usize), above, result.branch[u]));
                 for j in 1..chain.len() {
-                    let node = map(chain[j] as usize) as usize;
-                    parent[node] = map(chain[j - 1] as usize);
-                    branch[node] = result.branch[chain[j - 1] as usize];
+                    edits.push((
+                        map(chain[j] as usize),
+                        map(chain[j - 1] as usize),
+                        result.branch[chain[j - 1] as usize],
+                    ));
                 }
                 let bottom = chain[chain.len() - 1] as usize;
-                parent[star.centre as usize] = map(bottom);
-                branch[star.centre as usize] = result.branch[bottom];
+                edits.push((star.centre, map(bottom), result.branch[bottom]));
             }
         }
     }
+    edits
 }
 
 /// Renumber an arbitrary parent array into the arena invariant and build it.

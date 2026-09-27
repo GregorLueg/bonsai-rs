@@ -31,13 +31,14 @@ both. `512 s32` is the same 512 cells at another seed with a harder gene panel.
 | 5,000 | 2,701 | published, backbone 2,048 | 2,514 | 1,899 | 0.578 | -5,571,002 | -5,565,342 |
 | 5,000 | 2,701 | published, backbone 1,000 | 1,794 | 1,959 | 0.569 | -5,572,684 | -5,566,018 |
 | 5,000 | 2,701 | truth | | 0 | 0.679 | | -5,571,449 |
-| 10,000 | 2,767 | bonsai-rs | 72 | 2,619 | 0.409 | -11,253,736 | -11,253,736 |
+| 10,000 | 2,767 | bonsai-rs | 88 | 2,613 | 0.469 | -11,253,220 | -11,253,220 |
 | 10,000 | 2,767 | published | 16,062 | 5,149 | 0.281 | -11,280,721 | -11,274,900 |
 | 10,000 | 2,767 | published, backbone 2,048 | 3,529 | 3,946 | 0.368 | -11,280,324 | -11,264,651 |
 | 10,000 | 2,767 | published, backbone 1,000 | 3,594 | 4,191 | 0.347 | -11,284,311 | -11,268,274 |
 | 10,000 | 2,767 | truth | | 0 | 0.461 | | -11,282,910 |
 
-bonsai-rs is `BonsaiParams::default()` in 0.2.0, 2026-09-27, ten threads. Published is its
+bonsai-rs is `BonsaiParams::default()` in 0.2.0, 2026-09-27, ten threads; the
+10,000 row uses one random SPR order instead of the default one. Published is its
 standard run on one core; the published backbone is its backbone-based mode
 with `n_initial_cells` 2,048 or 1,000 and `growth_factor_guide` 10, one
 process. Its default of 10,000 initial cells needs more cells than these sets
@@ -70,24 +71,23 @@ recovery are what it's for.
   nats ahead after the refit. The replicate flips it: 222 against 240 and 0.319
   against 0.303, but 32 nats behind.
 - **From 5,000 bonsai-rs pulls ahead**, and at 10,000 by a lot: 2,612 against
-  5,149 splits, 21,000 nats after the refit, and 220 times faster.
+  5,149 splits, 22,000 nats after the refit, and 180 times faster.
 - **The refit matters for the published trees.** It recovers 2,200 nats at 5,000
   and 5,800 at 10,000; 15,700 for the 10,000 backbone. The as-given column
-  overstates bonsai-rs's lead by 62 per cent at 5,000 and 28 at 10,000.
+  overstates bonsai-rs's lead by 62 per cent at 5,000 and 27 at 10,000.
 - **The published backbone pays off in the published implementation**: 2 to 4.5
   times faster than its standard run, and at 10,000 better on splits and on the
-  refit loglikelihood. It is still 50 to 80 times slower than bonsai-rs's
+  refit loglikelihood. It is still 40 to 80 times slower than bonsai-rs's
   standard run at 5,000 and 10,000, and behind it on every column.
-- **The two trees differ from each other** by 26, 110, 1,498 and 4,236 splits.
+- **The two trees differ from each other** by 26, 110, 1,498 and 4,248 splits.
   Equal scores against the truth don't mean the same tree.
 - **The published implementation is deterministic.** A 2026-09-14 rerun gave
   byte-identical Newick at all four sizes. Wall times moved under half a per
   cent where the first run had an idle machine, 30 per cent at 512 and 8 at
   10,000 where it hadn't.
-- **Recovery at 10,000 depends on SPR's candidate order.** 0.2.0 re-applies the
-  rest of a chunk after an acceptance (`SprApprox::recheck`) and lands at 0.409;
-  0.1.1, which didn't, gives 0.476 on the same data, and random candidate orders
-  alone span 0.40 to 0.48 ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)).
+- **Results differ with SPR's subtree order.** At 10,000 cells recovery lands
+  anywhere from 0.36 to 0.49 across orders
+  ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)).
   Recovery above the truth's 0.461 is possible because the truth's branch
   lengths are expected displacements and ours are fitted to what was realised.
 

@@ -42,7 +42,7 @@ use bonsai_rs::search::bounds::EllipsoidBounds;
 use bonsai_rs::search::candidates::KnnCandidates;
 use bonsai_rs::search::nni::nni;
 use bonsai_rs::search::polytomy::resolve_polytomies;
-use bonsai_rs::search::spr::{SprSearch, spr};
+use bonsai_rs::search::spr::{PruneOrder, SprSearch, spr};
 use bonsai_rs::search::star::{Star, star_tree_with};
 use bonsai_rs::tree::distance::{MAX_PAIRS, distance_recovery};
 use bonsai_rs::tree::export::layout_csv;
@@ -86,9 +86,11 @@ fn run() -> Fallible<()> {
     match args.get(1).map(String::as_str) {
         Some("gen") => {
             if args.len() != 7 && args.len() != 8 {
-                return Err("usage: harness gen <dir> <n_leaves> <n_features> <noise_sd> <seed> \
+                return Err(
+                    "usage: harness gen <dir> <n_leaves> <n_features> <noise_sd> <seed> \
                             [balanced|random|unbalanced]"
-                    .into());
+                        .into(),
+                );
             }
             generate(
                 Path::new(&args[2]),
@@ -893,11 +895,16 @@ fn refine_steps(
 }
 
 /// `SPR_RECHECK=0` or `1` switches `SprApprox::recheck` for the approximate
-/// SPR; unset leaves the default.
+/// SPR; `SPR_SEED=<n>` visits subtrees in a random order from that seed.
+/// Unset leaves the defaults.
 fn spr_recheck_from_env(params: &mut BonsaiParams) {
     if let (Ok(v), SprSearch::Approximate(mut a)) = (env::var("SPR_RECHECK"), params.spr.search) {
         a.recheck = v != "0";
         params.spr.search = SprSearch::Approximate(a);
+    }
+    if let Some(seed) = env::var("SPR_SEED").ok().and_then(|v| v.parse().ok()) {
+        params.spr.order = PruneOrder::Random;
+        params.spr.seed = seed;
     }
 }
 

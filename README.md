@@ -39,10 +39,11 @@ For scRNA-seq: Sanity on raw UMI counts, then this.
 
 ```rust
 use bonsai_rs::bonsai::bonsai;
+use bonsai_rs::prelude::Verbosity;
 use bonsai_rs::tree::newick::write_newick;
 
 // means and sds are row-major [cell][gene]; None estimates the per-gene variance
-let out = bonsai::<f32>(&means, &sds, n_cells, n_genes, None, None)?;
+let out = bonsai::<f32>(&means, &sds, n_cells, n_genes, None, None, Verbosity::Normal)?;
 println!("{}", write_newick(&out.tree, &cell_names)?);
 ```
 
@@ -51,6 +52,10 @@ dud run tells you which step did nothing. Tune via `BonsaiParams`; `None` takes
 the documented defaults. `ingest::prepare` plus `bonsai_prepared` splits ingest
 from search, for your own feature selection or several parameter settings on
 one ingest.
+
+`Verbosity` sets what gets printed while it runs: `Quiet` (the default) prints
+nothing, `Normal` one line per step with its loglikelihood, gain and time,
+`Detailed` adds progress within the merge, SPR and NNI steps.
 
 ### From raw counts
 
@@ -65,11 +70,20 @@ bonsai-rs = { version = "0.2", features = ["sanity"] }
 ```rust
 use bonsai_rs::bonsai::bonsai;
 use bonsai_rs::ingest::from_sanity_output;
+use bonsai_rs::prelude::Verbosity;
 use sanity_sc_rs::sanity;
 
 let post = sanity::<f32>(&counts, &cell_totals, None)?;
 let lik = from_sanity_output(&post, None)?;
-let out = bonsai(&lik.means, &lik.sds, lik.n_cells, lik.features.len(), Some(&lik.variances), None)?;
+let out = bonsai(
+    &lik.means,
+    &lik.sds,
+    lik.n_cells,
+    lik.features.len(),
+    Some(&lik.variances),
+    None,
+    Verbosity::Quiet,
+)?;
 ```
 
 The `gpu` feature runs Sanity through CubeCL/wgpu; the output goes into
@@ -99,9 +113,13 @@ uv pip install bonsai-rs
 ```python
 import bonsai_rs as bs
 
-res = bs.bonsai_from_counts(counts)  # cells x genes, dense or scipy sparse
+res = bs.bonsai_from_counts(counts, verbose=1)  # cells x genes, dense or scipy sparse
 xy = bs.layout(res.tree)
 ```
+
+`verbose` is `0`, `1` or `2`, as `Quiet`, `Normal` and `Detailed` above. It
+prints from Rust to the process's stdout, so in a notebook it lands in the
+kernel's terminal, not the cell. It covers the tree search, not Sanity.
 
 Docs at [gregorlueg.github.io/bonsai-rs](https://gregorlueg.github.io/bonsai-rs/).
 Bindings live in `python/` and version separately.
@@ -159,12 +177,13 @@ Want the search exactly as the paper specifies it? It's one setting away:
 
 ```rust
 use bonsai_rs::bonsai::BonsaiParams;
+use bonsai_rs::prelude::Verbosity;
 use bonsai_rs::search::{nni::NniSearch, spr::SprSearch};
 
 let mut params = BonsaiParams::default();
 params.spr.search = SprSearch::Exact;
 params.nni.search = NniSearch::Exact;
-let out = bonsai::<f32>(&means, &sds, n_cells, n_genes, None, Some(params))?;
+let out = bonsai::<f32>(&means, &sds, n_cells, n_genes, None, Some(params), Verbosity::Quiet)?;
 ```
 
 In Python: `bs.bonsai(..., search="exact")`.
@@ -174,8 +193,8 @@ The default also starts from a Ward linkage rather than the paper's greedy merge
 3 to 5x slower. `StartTree::GreedyMerge` (Python `start="greedy"`) brings it
 back for like-for-like reproduction.
 
-[Performance](docs/PERFORMANCE.md) has the numbers and the failures, [design](docs/DESIGN.md) the
-build.
+[Performance](docs/PERFORMANCE.md) has the numbers and the failures,
+[design](docs/DESIGN.md) the build.
 
 ## Licence
 

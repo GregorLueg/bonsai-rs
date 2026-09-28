@@ -38,8 +38,8 @@ both. `512 s32` is the same 512 cells at another seed with a harder gene panel.
 | 10,000 | 2,767 | truth | | 0 | 0.461 | | -11,282,910 |
 
 bonsai-rs is `BonsaiParams::default()` in 0.2.0, 2026-09-27, ten threads; the
-10,000 row uses one random SPR order instead of the default one. Published is its
-standard run on one core; the published backbone is its backbone-based mode
+10,000 row uses one random SPR order instead of the default one. Published is
+its standard run on one core; the published backbone is its backbone-based mode
 with `n_initial_cells` 2,048 or 1,000 and `growth_factor_guide` 10, one
 process. Its default of 10,000 initial cells needs more cells than these sets
 have.
@@ -158,9 +158,9 @@ process per rank. MPI also changes its answer: RF 141 against 146 at 512, 2,016
 against 1,937 at 5,000, 5,151 against 5,149 at 10,000.
 
 Two cautions. Differences between the Rust Sanity paths and search modes sit
-inside the run-to-run spread ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)): 0.45 against 0.57 at 5,000 is two basins, not the GPU
-making better trees. The gaps to the published trees, hundreds to 2,500 splits,
-are far outside it.
+inside the run-to-run spread ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)):
+0.45 against 0.57 at 5,000 is two basins, not the GPU making better trees. The
+gaps to the published trees, hundreds to 2,500 splits, are far outside it.
 
 Same trees drawn as in [What the trees look like](#what-the-trees-look-like):
 clade fragments (ideal ten) and recovery on the selected genes, same 20,000

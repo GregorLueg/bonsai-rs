@@ -27,7 +27,7 @@
 //! `transformed_` fields are the only ones that are transformed.
 //! [`PreparedData::restore_scale`] is the way back.
 
-use crate::errors::BonsaiErrors;
+use crate::prelude::*;
 use crate::utils::kernels::edge_newton;
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
 use rayon::prelude::*;

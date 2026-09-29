@@ -38,9 +38,7 @@ For scRNA-seq: Sanity on raw UMI counts, then this.
 ## Usage
 
 ```rust
-use bonsai_rs::bonsai::bonsai;
-use bonsai_rs::prelude::Verbosity;
-use bonsai_rs::tree::newick::write_newick;
+use bonsai_rs::prelude::*;
 
 // means and sds are row-major [cell][gene]; None estimates the per-gene variance
 let out = bonsai::<f32>(&means, &sds, n_cells, n_genes, None, None, Verbosity::Normal)?;
@@ -68,9 +66,7 @@ bonsai-rs = { version = "0.2", features = ["sanity"] }
 ```
 
 ```rust
-use bonsai_rs::bonsai::bonsai;
-use bonsai_rs::ingest::from_sanity_output;
-use bonsai_rs::prelude::Verbosity;
+use bonsai_rs::prelude::*;
 use sanity_sc_rs::sanity;
 
 let post = sanity::<f32>(&counts, &cell_totals, None)?;
@@ -137,17 +133,16 @@ same input, same scorer:
 | 5,000 | 2,701 | published | 4,868 | 1,937 | 0.496 |
 | 5,000 | 2,701 | published, backbone 2,048 | 2,514 | 1,899 | 0.578 |
 | 5,000 | 2,701 | published, backbone 1,000 | 1,794 | 1,959 | 0.569 |
-| 10,000 | 2,767 | bonsai-rs | 88 | 2,613 | 0.469 |
+| 10,000 | 2,767 | bonsai-rs | 72 | 2,618 | 0.409 |
 | 10,000 | 2,767 | published | 16,062 | 5,149 | 0.281 |
 | 10,000 | 2,767 | published, backbone 2,048 | 3,529 | 3,946 | 0.368 |
 | 10,000 | 2,767 | published, backbone 1,000 | 3,594 | 4,191 | 0.347 |
 
 The published backbone mode is its fast route for large data: built on a
-subset of 2,048 or 1,000 cells, the rest placed onto it. bonsai-rs is 40 to 80
-times faster than that at 5,000 and 10,000 cells, 150 and 180 times faster than
+subset of 2,048 or 1,000 cells, the rest placed onto it. bonsai-rs is 50 to 80
+times faster than that at 5,000 and 10,000 cells, 150 and 220 times faster than
 the published standard run, and closer to the truth on both metrics. At 512
-it's a tie. Results differ with the order SPR visits subtrees in; the 10,000
-row is one random order. Timings aren't like for like (ten threads against one process);
+it's a tie. Results differ with the order SPR visits subtrees in. Timings aren't like for like (ten threads against one process);
 [comparison](docs/COMPARISON.md) has the caveats and the loglikelihoods.
 
 ### Exact or approximate search
@@ -168,7 +163,7 @@ Full search on the headline data above, 2026-09-27:
 |---|---|---|---|---|---|
 | 512 | 4.9 s | 2.9 s | -527,187 / -527,187 | 136 / 136 | 0.656 / 0.652 |
 | 5,000 | 107 s | 32 s | -5,558,395 / -5,557,911 | 1,324 / 1,287 | 0.538 / 0.666 |
-| 10,000 | 533 s | 88 s | -11,252,144 / -11,253,220 | 2,623 / 2,613 | 0.480 / 0.469 |
+| 10,000 | 533 s | 72 s | -11,252,144 / -11,253,736 | 2,622 / 2,618 | 0.480 / 0.409 |
 
 One run each. SPR's subtree order alone moves results by more than these gaps
 ([performance](docs/PERFORMANCE.md#how-much-one-real-data-run-says)).
@@ -176,9 +171,7 @@ One run each. SPR's subtree order alone moves results by more than these gaps
 Want the search exactly as the paper specifies it? It's one setting away:
 
 ```rust
-use bonsai_rs::bonsai::BonsaiParams;
-use bonsai_rs::prelude::Verbosity;
-use bonsai_rs::search::{nni::NniSearch, spr::SprSearch};
+use bonsai_rs::prelude::*;
 
 let mut params = BonsaiParams::default();
 params.spr.search = SprSearch::Exact;

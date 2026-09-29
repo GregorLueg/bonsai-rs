@@ -198,32 +198,40 @@ took step 6 from 69 s to 41 s at 131,072 cells.
 ### How much one real-data run says
 
 Not much. Runs differing only in SPR's subtree order are equally valid and
-spread widely (2026-09-25):
+spread widely. 0.2.0 defaults, 2026-09-27:
 
 | cells | SPR order | loglikelihood | Robinson-Foulds | recovery |
 |---|---|---|---|---|
-| 5,000 | longest branch, the default | -5,557,978 | 1,288 | 0.666 |
-| 5,000 | random, seed 1 | -5,558,223 | 1,274 | 0.581 |
-| 5,000 | random, seed 2 | -5,557,825 | 1,258 | 0.668 |
-| 5,000 | random, seed 3 | -5,557,834 | 1,275 | 0.665 |
-| 5,000 | random, seed 4 | -5,557,764 | 1,267 | 0.666 |
-| 10,000 | longest branch, the default | -11,252,721 | 2,624 | 0.476 |
-| 10,000 | random, seed 1 | -11,254,387 | 2,668 | 0.403 |
-| 10,000 | random, seed 2 | -11,253,896 | 2,563 | 0.479 |
-| 10,000 | random, seed 3 | -11,254,362 | 2,571 | 0.404 |
+| 5,000 | longest branch, the default | -5,557,911 | 1,287 | 0.666 |
+| 5,000 | random, seed 1 | -5,558,197 | 1,267 | 0.582 |
+| 5,000 | random, seed 2 | -5,558,859 | 1,249 | 0.551 |
+| 5,000 | random, seed 3 | -5,558,174 | 1,266 | 0.624 |
+| 10,000 | longest branch, the default | -11,253,736 | 2,618 | 0.409 |
+| 10,000 | random, seed 1 | -11,255,000 | 2,699 | 0.361 |
+| 10,000 | random, seed 2 | -11,254,555 | 2,559 | 0.488 |
+| 10,000 | random, seed 3 | -11,254,226 | 2,622 | 0.385 |
+| 10,000 | random, seed 4 | -11,253,220 | 2,613 | 0.469 |
+| 10,000 | random, seed 5 | -11,253,079 | 2,660 | 0.391 |
+| 10,000 | random, seed 6 | -11,254,244 | 2,623 | 0.376 |
+| 10,000 | random, seed 7 | -11,253,997 | 2,621 | 0.386 |
+| 10,000 | random, seed 8 | -11,253,669 | 2,636 | 0.472 |
 
-About 460 nats and recovery 0.58 to 0.67 at 5,000; 1,700 nats and 0.40 to 0.48
-at 10,000. A few hundred nats on one run is noise. An approximation is only
-proven harmless when it reproduces the exact result outright, as lazy NNI does.
-The revisit radius does on the 512-cell and low-noise sets; at 5,000 and 10,000
-it lands 3 nats below and 467 above exact, both inside the spread. Same caution
-the other way: the loose branch tolerance's 1,281-nat, 0.38-recovery loss at
-10,000 looks like a bad basin, not a measured cost.
+About 950 nats and recovery 0.55 to 0.67 at 5,000; 1,900 nats and 0.36 to 0.49
+at 10,000. The same seeds with `SprApprox::recheck` off stay inside that: 940
+nats and 0.57 to 0.67 at 5,000, 1,700 nats and 0.37 to 0.49 at 10,000. A few
+hundred nats on one run is noise. An approximation is only proven harmless when
+it reproduces the exact result outright, as lazy NNI does. The revisit radius
+does on the 512-cell and low-noise sets; at 5,000 and 10,000 it lands 3 nats
+below and 467 above exact (2026-09-24), both inside the spread. Same caution the
+other way: the loose branch tolerance's 1,281-nat, 0.38-recovery loss at 10,000
+looks like a bad basin, not a measured cost.
 
-Two basins, one with visibly worse recovery, and the loglikelihood separates
-them every time. Best-of-several by loglikelihood is cheap now a run is a few
-minutes. The specified longest-branch order isn't dominated: random did better
-at 5,000 and worse at 10,000.
+**The loglikelihood doesn't pick the better tree.** At 5,000 it roughly does:
+the best loglikelihood has the best recovery, the worst the worst. At 10,000 it
+doesn't: seed 5 has the best loglikelihood and recovery 0.391, seed 2 the
+second worst and 0.488. Best-of-several by loglikelihood is cheap but buys
+likelihood, not recovery. The specified longest-branch order isn't dominated:
+best loglikelihood of the four at 5,000, fourth of nine at 10,000.
 
 ### Splice pairs through the regrafted subtree
 

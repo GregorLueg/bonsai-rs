@@ -35,6 +35,7 @@ use crate::errors::BonsaiErrors;
 use crate::model::global::UpState;
 use crate::model::likelihood::NodeState;
 use crate::search::Leaves;
+use crate::search::spr::{LazyRows, RowStore, lazy_centre_star};
 use crate::search::star::{Star, StarParams, StarResult, resolve_star};
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::traits::BonsaiFloat;
@@ -153,8 +154,6 @@ pub struct Splice {
 pub struct PolytomyResult {
     /// The tree with every polytomy resolved as far as it will go.
     pub tree: Tree,
-    /// Total loglikelihood gain over the input tree, in nats.
-    pub gain: f64,
     /// Number of polytomies the input tree had, once its zero-length internal
     /// edges were collapsed into their parents.
     pub n_polytomies: usize,
@@ -270,6 +269,77 @@ pub fn splice_star<T: BonsaiFloat>(
     })
 }
 
+/// [`splice_result`], plus where every node of the new tree came from: per
+/// node, its node in the tree the star was built from, recovered by walking up
+/// from each leaf in the spliced parent array and in the rebuilt tree in step.
+///
+/// ### Params
+///
+/// * `tree` - The tree the star was built from
+/// * `star` - The star that was resolved
+/// * `result` - What the primitive built
+///
+/// ### Returns
+///
+/// The spliced tree and, per node of it, its node in `tree` or [`NO_NODE`].
+fn splice_result_mapped<T: BonsaiFloat>(
+    tree: &Tree,
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+) -> Result<(Tree, Vec<u32>), BonsaiErrors> {
+    let mut parent: Vec<u32> = (0..tree.n_nodes())
+        .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
+        .collect();
+    let mut branch = tree.branches().to_vec();
+    apply_splice(&mut parent, &mut branch, star, result);
+    let out = rebuild(&parent, &branch, tree.root(), tree.n_leaves())?;
+    let to_old = map_back(&parent, &out, tree.n_nodes())?;
+    Ok((out, to_old))
+}
+
+/// Where every node of a rebuilt tree came from.
+///
+/// [`rebuild`] numbers the arena for itself, so the map is recovered by walking
+/// up from each leaf in the input parent array and in the rebuilt tree in step.
+/// Leaves keep their indices, and every internal node has a leaf below it, so
+/// each reachable node is paired exactly once.
+///
+/// ### Params
+///
+/// * `parent` - The parent array [`rebuild`] was given
+/// * `out` - The tree it built
+/// * `n_old` - Node count of the tree the array was edited from; input indices
+///   at or above it are nodes the edit created
+///
+/// ### Returns
+///
+/// Per node of `out`, its node in the original tree or [`NO_NODE`] for a
+/// created one, or `MalformedTree` if the two walks disagree.
+fn map_back(parent: &[u32], out: &Tree, n_old: usize) -> Result<Vec<u32>, BonsaiErrors> {
+    let mut to_old = vec![NO_NODE; out.n_nodes()];
+    for leaf in 0..out.n_leaves() as u32 {
+        let (mut from, mut to) = (leaf, leaf);
+        while to_old[to as usize] == NO_NODE {
+            to_old[to as usize] = from;
+            match (parent[from as usize], out.parent(to)) {
+                (NO_NODE, None) => break,
+                (up, Some(next)) if up != NO_NODE => (from, to) = (up, next),
+                _ => {
+                    return Err(BonsaiErrors::MalformedTree {
+                        reason: format!("rebuild map lost step at leaf {leaf}"),
+                    });
+                }
+            }
+        }
+    }
+    for old in &mut to_old {
+        if *old != NO_NODE && *old as usize >= n_old {
+            *old = NO_NODE;
+        }
+    }
+    Ok(to_old)
+}
+
 /// Map a resolved star back onto tree node ids and rebuild the arena.
 ///
 /// Local index `i < n_members` is the member's own node, except the upstream
@@ -287,21 +357,41 @@ pub fn splice_star<T: BonsaiFloat>(
 /// ### Returns
 ///
 /// The spliced tree, or the error the arena failed with.
-fn splice_result<T: BonsaiFloat>(
+pub(crate) fn splice_result<T: BonsaiFloat>(
     tree: &Tree,
     star: &CentreStar<T>,
     result: &StarResult<T>,
 ) -> Result<Tree, BonsaiErrors> {
-    let n = star.member_nodes.len();
-    let old = tree.n_nodes();
-    let n_local = result.parent.len();
-
-    let mut parent: Vec<u32> = (0..old)
+    let mut parent: Vec<u32> = (0..tree.n_nodes())
         .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
         .collect();
     let mut branch = tree.branches().to_vec();
-    parent.resize(old + n_local - n, NO_NODE);
-    branch.resize(old + n_local - n, 0.0);
+    apply_splice(&mut parent, &mut branch, star, result);
+    rebuild(&parent, &branch, tree.root(), tree.n_leaves())
+}
+
+/// Write a resolved star into a parent array, appending its new nodes.
+///
+/// The body of [`splice_result`] without the rebuild, so that several stars
+/// whose members do not overlap can be written into one array and rebuilt
+/// once. See [`splice_result`] for the index mapping.
+///
+/// ### Params
+///
+/// * `parent` - Parent per node, grown by the star's new internal nodes
+/// * `branch` - Branch above each node, same indexing
+/// * `star` - The star that was resolved, in the array's node ids
+/// * `result` - What the primitive built
+fn apply_splice<T: BonsaiFloat>(
+    parent: &mut Vec<u32>,
+    branch: &mut Vec<f64>,
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+) {
+    let old = parent.len();
+    let n_new = result.parent.len() - star.member_nodes.len();
+    parent.resize(old + n_new, NO_NODE);
+    branch.resize(old + n_new, 0.0);
 
     // A deleted node keeps no parent and, since all of its children are members
     // of the star, gains no children either, so the rebuild's walk never
@@ -309,14 +399,44 @@ fn splice_result<T: BonsaiFloat>(
     for &node in &star.deleted {
         parent[node as usize] = NO_NODE;
     }
+    for (node, up, t) in splice_edits(star, result, old as u32) {
+        parent[node as usize] = up;
+        branch[node as usize] = t;
+    }
+}
 
+/// The parent and branch every node a resolved star touches ends up with.
+///
+/// The ancestors the primitive made are numbered `first_new` upwards in the
+/// order it made them. Shared by [`apply_splice`] and the masked views of
+/// [`crate::search::masked`], which apply the same edits to a view instead of
+/// an array.
+///
+/// ### Params
+///
+/// * `star` - The star that was resolved
+/// * `result` - What the primitive built
+/// * `first_new` - Id of the first new ancestor
+///
+/// ### Returns
+///
+/// One `(node, parent, branch)` per node whose parent or branch the splice
+/// sets.
+pub(crate) fn splice_edits<T: BonsaiFloat>(
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+    first_new: u32,
+) -> Vec<(u32, u32, f64)> {
+    let n = star.member_nodes.len();
+    let n_local = result.parent.len();
     let map = |i: usize| -> u32 {
         if i < n {
             star.member_nodes[i]
         } else {
-            (old + i - n) as u32
+            first_new + (i - n) as u32
         }
     };
+    let mut edits = Vec::with_capacity(n_local + 1);
 
     // The ancestors between the centre and the upstream member, nearest the
     // upstream member first. These are the nodes whose direction flips.
@@ -336,39 +456,34 @@ fn splice_result<T: BonsaiFloat>(
         if Some(i) == upstream || on_chain[i] {
             continue;
         }
-        let node = map(i) as usize;
-        parent[node] = match result.parent[i] {
+        let up = match result.parent[i] {
             NO_NODE => star.centre,
             up => map(up as usize),
         };
-        branch[node] = result.branch[i];
+        edits.push((map(i), up, result.branch[i]));
     }
 
     if let Some(u) = upstream {
         // The upstream member is the centre's parent, and it keeps its own
         // place in the tree: only what hangs off it changes.
-        let above = star.member_nodes[u] as usize;
+        let above = star.member_nodes[u];
         match chain.split_first() {
-            None => {
-                parent[star.centre as usize] = above as u32;
-                branch[star.centre as usize] = result.branch[u];
-            }
+            None => edits.push((star.centre, above, result.branch[u])),
             Some((&top, _)) => {
-                parent[map(top as usize) as usize] = above as u32;
-                branch[map(top as usize) as usize] = result.branch[u];
+                edits.push((map(top as usize), above, result.branch[u]));
                 for j in 1..chain.len() {
-                    let node = map(chain[j] as usize) as usize;
-                    parent[node] = map(chain[j - 1] as usize);
-                    branch[node] = result.branch[chain[j - 1] as usize];
+                    edits.push((
+                        map(chain[j] as usize),
+                        map(chain[j - 1] as usize),
+                        result.branch[chain[j - 1] as usize],
+                    ));
                 }
                 let bottom = chain[chain.len() - 1] as usize;
-                parent[star.centre as usize] = map(bottom);
-                branch[star.centre as usize] = result.branch[bottom];
+                edits.push((star.centre, map(bottom), result.branch[bottom]));
             }
         }
     }
-
-    rebuild(&parent, &branch, tree.root(), tree.n_leaves())
+    edits
 }
 
 /// Renumber an arbitrary parent array into the arena invariant and build it.
@@ -500,9 +615,10 @@ fn rebuild(
 ///
 /// ### Returns
 ///
-/// The collapsed tree, or `None` if there was no zero-length internal edge, or
-/// the error the arena rejected the rebuild with.
-fn collapse_zero_edges(tree: &Tree) -> Result<Option<Tree>, BonsaiErrors> {
+/// The collapsed tree and, per node of it, its node in `tree`; or `None` if
+/// there was no zero-length internal edge, or the error the arena rejected the
+/// rebuild with.
+pub(crate) fn collapse_zero_edges(tree: &Tree) -> Result<Option<(Tree, Vec<u32>)>, BonsaiErrors> {
     let n = tree.n_nodes();
     let n_leaves = tree.n_leaves();
     let root = tree.root();
@@ -536,7 +652,9 @@ fn collapse_zero_edges(tree: &Tree) -> Result<Option<Tree>, BonsaiErrors> {
         branch[i] = tree.branch(i as u32);
     }
 
-    rebuild(&parent, &branch, root, n_leaves).map(Some)
+    let out = rebuild(&parent, &branch, root, n_leaves)?;
+    let to_old = map_back(&parent, &out, n)?;
+    Ok(Some((out, to_old)))
 }
 
 /// Resolve every polytomy in a tree (SPEC.md section 9.2).
@@ -591,25 +709,19 @@ fn collapse_zero_edges(tree: &Tree) -> Result<Option<Tree>, BonsaiErrors> {
 /// seeds came out with a worse Robinson-Foulds despite a four-fold larger gain,
 /// which is the data's noise rather than the search's doing.
 ///
-/// ### What a sweep costs, and what is left in it
+/// ### What a sweep costs
 ///
-/// One resolution per sweep and one settling of the whole tree per sweep, so
-/// the step is `O(sweeps * n * p)` and `sweeps` grows with the leaf count.
-/// Almost all of a sweep is the down-and-up pass itself, and the share grows
-/// with the tree.
-///
-/// Everything this module does per sweep is now the remaining 4 per cent, and
-/// the exponent is the two settling sweeps against a resolution count that
-/// grows. Getting it down needs one of two things, both outside this module.
-/// Either [`NodeState`] and [`UpState`] gain a way to settle only the rows a
-/// sweep actually reads, which is the down rows of a polytomy centre's children
-/// and the up row of the centre itself, `O(n_polytomies * depth * p)` rather
-/// than `O(n p)`; or they gain a way to be reused across sweeps, since
-/// `NodeState::prune` asserts on the node count and every sweep therefore
-/// reallocates and refills two `n * p` slabs. Resolving several polytomies per
-/// sweep would do it too and is not available: a resolution changes every up
-/// row in the tree, so the second centre of a sweep would be resolved against
-/// stale rows and the answer would move.
+/// One resolution per sweep. The down rows are settled once and kept in a
+/// [`RowStore`] that a collapse or a splice updates in the rows it changed,
+/// and each sweep's stars read their up rows through [`LazyRows`], so a sweep
+/// costs its stars and the `O(depth p)` chains above them rather than a settle
+/// of the whole tree. Every row is the settle's own bits, so the resolutions
+/// are the ones a settle per sweep makes. Measured 2026-09-26 on 25k
+/// Sanity-preprocessed cells, from the same tree: identical loglikelihood,
+/// 69 s to 3.5 s. Resolving several polytomies per sweep is still not
+/// available: a resolution changes every up row in the tree, so the second
+/// centre of a sweep would be resolved against stale rows and the answer would
+/// move.
 ///
 /// ### Params
 ///
@@ -643,25 +755,34 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
         });
     }
     let mut tree = match collapse_zero_edges(tree)? {
-        Some(collapsed) => collapsed,
+        Some((collapsed, _)) => collapsed,
         None => tree.clone(),
     };
     let n_polytomies = count_polytomies(&tree);
-    let mut gain = 0.0f64;
     let mut n_resolved = 0usize;
     let mut sweeps = 0usize;
+
+    // Settled once. A collapse or a splice then rewrites only the down rows it
+    // changed, and each sweep forms up rows only along the chains its stars
+    // read; both are the sweep's own bits, so every resolution is the one a
+    // settle per sweep would make, at `O(depth p)` a sweep instead of `O(n p)`.
+    let (down, _) = crate::search::settled_down(&tree, leaves)?;
+    let mut store = RowStore::from_state(&down, tree.n_nodes());
+    drop(down);
 
     loop {
         sweeps += 1;
         // A no-op on the first sweep, since the entry tree was collapsed above.
         // Later sweeps need it because a resolution can itself place an
         // ancestor at zero distance from its centre.
-        if let Some(collapsed) = collapse_zero_edges(&tree)? {
+        if let Some((collapsed, to_old)) = collapse_zero_edges(&tree)? {
+            store.accept(&collapsed, &to_old, &tree)?;
             tree = collapsed;
         }
-        let (down, up, _) = crate::search::settle(&tree, leaves)?;
+        let identity: Vec<u32> = (0..tree.n_nodes() as u32).collect();
+        let rows = LazyRows::new(&tree, &identity, &tree, &store)?;
 
-        let mut accepted: Option<Splice> = None;
+        let mut accepted: Option<(Tree, Vec<u32>)> = None;
         for node in tree.internal_postorder() {
             // The degree test first, off the tree, and the star only for a node
             // that passes it. `CentreStar::is_polytomy` reads nothing the tree
@@ -671,27 +792,25 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
             if !is_polytomy(&tree, node) {
                 continue;
             }
-            let star = centre_star(&tree, &down, &up, node)?;
+            let star = lazy_centre_star(&tree, &rows, node)?;
             // Splicing builds a tree, which is `O(n)`; the primitive that
             // decides whether there is anything to splice is `O(deg^3 p)` over
             // a handful of members. So resolve first and splice only the
             // resolution that is kept.
             let result = resolve_star(star.view(), params)?;
             if !result.merges.is_empty() {
-                accepted = Some(Splice {
-                    gain: result.merges.iter().map(|x| x.gain).sum(),
-                    n_merges: result.merges.len(),
-                    tree: splice_result(&tree, &star, &result)?,
-                });
+                let (next, to_old) = splice_result_mapped(&tree, &star, &result)?;
+                accepted = Some((next, to_old));
                 break;
             }
         }
+        drop(rows);
         match accepted {
             None => break,
-            Some(spliced) => {
-                gain += spliced.gain;
+            Some((next, to_old)) => {
+                store.accept(&next, &to_old, &tree)?;
                 n_resolved += 1;
-                tree = spliced.tree;
+                tree = next;
             }
         }
         if sweeps >= MAX_SWEEPS {
@@ -701,7 +820,6 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
 
     Ok(PolytomyResult {
         tree,
-        gain,
         n_polytomies,
         n_resolved,
         sweeps,
@@ -1073,7 +1191,6 @@ mod tests {
                 after >= before - 1e-9,
                 "seed {seed}: {before} fell to {after}"
             );
-            assert_relative_eq!(out.gain, after - before, max_relative = 1e-7);
         }
     }
 
@@ -1123,7 +1240,7 @@ mod tests {
         let start = star_shaped(n, 0.5);
         let out = resolve_polytomies(&start, leaves, None).expect("resolve");
 
-        assert!(out.gain > 0.0);
+        assert!(loglik(&out.tree, leaves) > loglik(&start, leaves));
         assert_eq!(out.n_polytomies, 1);
         assert_eq!(count_polytomies(&out.tree), 0);
         assert!(loglik(&out.tree, leaves) > loglik(&start, leaves));
@@ -1142,7 +1259,6 @@ mod tests {
         assert_eq!(out.n_polytomies, 0);
         assert_eq!(out.n_resolved, 0);
         assert_eq!(out.sweeps, 1);
-        assert_eq!(out.gain, 0.0);
         assert_eq!(splits(&out.tree), splits(&tree));
     }
 
@@ -1174,7 +1290,8 @@ mod tests {
 
         let collapsed = collapse_zero_edges(&tree)
             .expect("collapse")
-            .expect("the zero-length edge was not found");
+            .expect("the zero-length edge was not found")
+            .0;
         let after = loglik(&collapsed, leaves);
 
         assert_eq!(collapsed.n_nodes(), tree.n_nodes() - 1);
@@ -1232,7 +1349,7 @@ mod tests {
             "step 3 saw no polytomy in a tree with {zeros} zero-length internal edges"
         );
         assert!(
-            out.n_resolved > 0 && out.gain > 0.0,
+            out.n_resolved > 0 && loglik(&out.tree, leaves) > loglik(&merged, leaves),
             "step 3 gained nothing"
         );
         assert!(loglik(&out.tree, leaves) > loglik(&merged, leaves));
@@ -1258,7 +1375,6 @@ mod tests {
         let once = resolve_polytomies(&start, leaves, None).expect("resolve");
         let twice = resolve_polytomies(&once.tree, leaves, None).expect("resolve");
         assert_eq!(twice.n_resolved, 0);
-        assert_eq!(twice.gain, 0.0);
         assert_eq!(splits(&twice.tree), splits(&once.tree));
     }
 

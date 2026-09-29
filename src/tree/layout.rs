@@ -46,9 +46,8 @@ use crate::tree::Tree;
 /// the last doubling that keeps a default `equal_daylight` call inside a few
 /// seconds on one core; anyone who wants the
 /// next one can raise `LayoutParams::daylight_max_nodes` and pay for it. Above
-/// the gate the equal-angle layout comes back unchanged with
-/// `DaylightReport::refined` set to `false`.
-pub const DAYLIGHT_MAX_NODES: usize = 2048;
+/// the gate the equal-angle layout comes back unchanged.
+const DAYLIGHT_MAX_NODES: usize = 2048;
 
 /// Hard cap on refinement sweeps in [`equal_daylight`].
 ///
@@ -58,7 +57,7 @@ pub const DAYLIGHT_MAX_NODES: usize = 2048;
 /// balanced, ladder, star and random trees: twelve sweeps take the daylight
 /// discrepancy to within two per cent of where forty sweeps leave it on every
 /// shape tried, and the remaining two per cent is not visible in a drawing.
-pub const DAYLIGHT_MAX_SWEEPS: usize = 12;
+const DAYLIGHT_MAX_SWEEPS: usize = 12;
 
 /// Largest rotation, in radians, a sweep may apply and still count as
 /// converged.
@@ -67,7 +66,7 @@ pub const DAYLIGHT_MAX_SWEEPS: usize = 12;
 /// thousand pixels across, that moves the outermost node by roughly a
 /// twentieth of a pixel, so a sweep that moves nothing by more than this has
 /// stopped changing the picture and there is no point running another.
-pub const DAYLIGHT_ANGLE_TOL: f64 = 1e-4;
+const DAYLIGHT_ANGLE_TOL: f64 = 1e-4;
 
 /// Number of times a sweep may halve its rotation looking for a step that both
 /// improves the daylight and keeps the drawing planar.
@@ -90,14 +89,14 @@ const DAYLIGHT_MAX_BACKTRACKS: usize = 10;
 /// overshoots into a crossing on its first move and then has to backtrack from
 /// there anyway; starting at a half saves that wasted pass and costs nothing,
 /// since the search doubles the step back up whenever it is accepted.
-pub const DAYLIGHT_DAMPING: f64 = 0.5;
+const DAYLIGHT_DAMPING: f64 = 0.5;
 
 /// Vertical spacing between adjacent leaves in [`dendrogram`].
 ///
 /// Purely a display scale, since the vertical axis of a dendrogram carries no
 /// information. One unit per leaf keeps leaf rows at integer coordinates,
 /// which is the easiest thing for a plotting layer to label.
-pub const DEFAULT_LEAF_SPACING: f64 = 1.0;
+const DEFAULT_LEAF_SPACING: f64 = 1.0;
 
 /// Fraction of the layout's largest coordinate below which a point counts as
 /// coincident with the node it is being measured from.
@@ -626,30 +625,6 @@ pub fn equal_angle(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, 
 // Equal daylight //
 ////////////////////
 
-/// What one [`equal_daylight`] run did.
-#[derive(Clone, Copy, Debug)]
-pub struct DaylightReport {
-    /// Whether refinement was attempted at all. `false` means the tree was
-    /// larger than `daylight_max_nodes` and the equal-angle layout came back
-    /// untouched.
-    pub refined: bool,
-    /// Number of sweeps run, adopted or not. A sweep that no step size could
-    /// make both cleaner and planar is counted and then ends the run.
-    pub sweeps: usize,
-    /// Daylight discrepancy of the starting equal-angle layout; `None` if it
-    /// was never measured.
-    pub initial_discrepancy: Option<f64>,
-    /// Daylight discrepancy of the returned layout. Never larger than
-    /// `initial_discrepancy`.
-    pub final_discrepancy: Option<f64>,
-    /// `Some(true)` if the returned layout was checked, edge pair by edge
-    /// pair, and found free of crossings. `Some(false)` can only happen when
-    /// no sweep was ever accepted and the equal-angle layout it fell back to
-    /// crossed to begin with. `None` if the check was never run, which is the
-    /// gated case.
-    pub crossing_free: Option<bool>,
-}
-
 /// One subtree incident to a node, as the angular arc it occupies.
 #[derive(Clone, Copy, Debug)]
 struct Wedge {
@@ -1035,8 +1010,7 @@ fn daylight_discrepancy(
 ///   sweep here does too. It is prevented rather than merely reported: every
 ///   candidate is checked exactly by [`has_edge_crossing`], edge pair against
 ///   edge pair, and one that crosses is discarded rather than adopted, so a
-///   crossing can never reach the caller. `DaylightReport::crossing_free` says
-///   so for the layout actually returned.
+///   crossing can never reach the caller.
 ///
 /// How far each rotation actually travels is found by a backtracking search:
 /// a sweep starts at `daylight_damping` and halves until it lands one that is
@@ -1051,8 +1025,7 @@ fn daylight_discrepancy(
 ///
 /// Every check costs a full `O(n^2)` pass, the same order as the sweep itself.
 /// Above `daylight_max_nodes` that is not worth paying and the equal-angle
-/// layout is returned unrefined, with `refined` set to `false` rather than
-/// quietly.
+/// layout is returned unrefined.
 ///
 /// ### Params
 ///
@@ -1062,41 +1035,22 @@ fn daylight_discrepancy(
 ///
 /// ### Returns
 ///
-/// The coordinates and a [`DaylightReport`] saying what happened, or
-/// `MalformedTree` if a branch length or a layout parameter cannot be drawn
-/// with.
-pub fn equal_daylight(
-    tree: &Tree,
-    params: Option<LayoutParams>,
-) -> Result<(Layout, DaylightReport), BonsaiErrors> {
+/// The coordinates, or `MalformedTree` if a branch length or a layout
+/// parameter cannot be drawn with.
+pub fn equal_daylight(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, BonsaiErrors> {
     let p = params.unwrap_or_default();
     let base = equal_angle(tree, params)?;
 
     if tree.n_nodes() > p.daylight_max_nodes {
-        return Ok((
-            base,
-            DaylightReport {
-                refined: false,
-                sweeps: 0,
-                initial_discrepancy: None,
-                final_discrepancy: None,
-                crossing_free: None,
-            },
-        ));
+        return Ok(base);
     }
 
     let tour = tour(tree);
     let eps = COINCIDENT_REL_EPS * layout_scale(&base);
     let mut scratch = Scratch::default();
 
-    let initial = daylight_discrepancy(tree, &tour, &base, eps, &mut scratch);
-    // Only ever `false` if the equal-angle layout itself crossed and nothing
-    // better was found: every candidate that is adopted has been checked.
-    let mut clean = !has_edge_crossing(tree, &base)?;
-
+    let mut score = daylight_discrepancy(tree, &tour, &base, eps, &mut scratch);
     let mut best = base;
-    let mut score = initial;
-    let mut sweeps = 0usize;
     let mut step = p.daylight_damping;
     let mut converged = false;
 
@@ -1123,7 +1077,6 @@ pub fn equal_daylight(
                 best = candidate;
                 score = next;
                 accepted = true;
-                clean = true;
                 converged = moved < p.daylight_angle_tol;
                 // Let the step grow back, so one awkward sweep does not pin
                 // the rest of the run at a needlessly tiny rotation.
@@ -1132,22 +1085,12 @@ pub fn equal_daylight(
             }
             step *= 0.5;
         }
-        sweeps += 1;
         if !accepted || converged {
             break;
         }
     }
 
-    Ok((
-        best,
-        DaylightReport {
-            refined: true,
-            sweeps,
-            initial_discrepancy: Some(initial),
-            final_discrepancy: Some(score),
-            crossing_free: Some(clean),
-        },
-    ))
+    Ok(best)
 }
 
 //////////////////////
@@ -1215,7 +1158,7 @@ fn on_segment(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> bool {
 ///
 /// `true` if some pair of non-adjacent edges intersects, or `NodeOutOfRange`
 /// if the layout does not cover the tree.
-pub fn has_edge_crossing(tree: &Tree, layout: &Layout) -> Result<bool, BonsaiErrors> {
+fn has_edge_crossing(tree: &Tree, layout: &Layout) -> Result<bool, BonsaiErrors> {
     let n = tree.n_nodes();
     if layout.x.len() != n || layout.y.len() != n {
         return Err(BonsaiErrors::NodeOutOfRange {
@@ -1291,6 +1234,23 @@ mod tests {
     use crate::tree::NO_NODE;
     use crate::utils::rng::SplitMix64;
     use approx::assert_relative_eq;
+
+    /// The daylight discrepancy of a layout, measured as `equal_daylight`
+    /// measures it.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - Tree the layout belongs to
+    /// * `layout` - Coordinates to score
+    ///
+    /// ### Returns
+    ///
+    /// The discrepancy, in squared radians.
+    fn discrepancy(tree: &Tree, layout: &Layout) -> f64 {
+        let base = equal_angle(tree, None).expect("angle");
+        let eps = COINCIDENT_REL_EPS * layout_scale(&base);
+        daylight_discrepancy(tree, &tour(tree), layout, eps, &mut Scratch::default())
+    }
 
     /// A star: every leaf hanging directly off the root.
     ///
@@ -1506,11 +1466,7 @@ mod tests {
         for (name, tree) in shapes() {
             let dendro = dendrogram(&tree, None).expect(name);
             let angle = equal_angle(&tree, None).expect(name);
-            let (daylight, report) = equal_daylight(&tree, None).expect(name);
-            assert!(
-                report.refined,
-                "{name}: small tree should have been refined"
-            );
+            let daylight = equal_daylight(&tree, None).expect(name);
             for layout in [&dendro, &angle, &daylight] {
                 assert_eq!(layout.n_nodes(), tree.n_nodes(), "{name}");
                 for i in 0..layout.n_nodes() {
@@ -1565,15 +1521,14 @@ mod tests {
     fn test_equal_daylight_never_crosses_edges() {
         for seed in 0..16u64 {
             let tree = random_tree(24, seed);
-            let (layout, report) = equal_daylight(&tree, None).expect("layout");
-            assert_eq!(report.crossing_free, Some(true), "seed {seed}");
+            let layout = equal_daylight(&tree, None).expect("layout");
             assert!(
                 !has_edge_crossing(&tree, &layout).expect("check"),
                 "seed {seed}: equal-daylight produced a crossing"
             );
         }
         for (name, tree) in shapes() {
-            let (layout, _) = equal_daylight(&tree, None).expect(name);
+            let layout = equal_daylight(&tree, None).expect(name);
             assert!(
                 !has_edge_crossing(&tree, &layout).expect(name),
                 "{name}: equal-daylight produced a crossing"
@@ -1585,7 +1540,7 @@ mod tests {
     fn test_circular_layouts_place_each_node_its_branch_length_from_its_parent() {
         for (name, tree) in shapes() {
             let angle = equal_angle(&tree, None).expect(name);
-            let (daylight, _) = equal_daylight(&tree, None).expect(name);
+            let daylight = equal_daylight(&tree, None).expect(name);
             for layout in [&angle, &daylight] {
                 for v in 0..tree.n_nodes() as u32 {
                     let Some(p) = tree.parent(v) else { continue };
@@ -1646,21 +1601,12 @@ mod tests {
     fn test_equal_daylight_never_increases_the_discrepancy_and_terminates() {
         for seed in 0..12u64 {
             let tree = random_tree(28, seed);
-            let (_, report) = equal_daylight(&tree, None).expect("layout");
-            assert!(report.refined, "seed {seed}");
-            let (Some(before), Some(after)) =
-                (report.initial_discrepancy, report.final_discrepancy)
-            else {
-                panic!("seed {seed}: refined run reported no discrepancy");
-            };
+            let layout = equal_daylight(&tree, None).expect("layout");
+            let before = discrepancy(&tree, &equal_angle(&tree, None).expect("angle"));
+            let after = discrepancy(&tree, &layout);
             assert!(
                 after <= before,
                 "seed {seed}: discrepancy rose from {before} to {after}"
-            );
-            assert!(
-                report.sweeps <= DAYLIGHT_MAX_SWEEPS,
-                "seed {seed}: {} sweeps exceeds the cap",
-                report.sweeps
             );
         }
     }
@@ -1670,12 +1616,9 @@ mod tests {
         // A shape with obviously wasted daylight: a ladder, whose equal-angle
         // drawing crowds every rung into one narrowing wedge.
         let tree = Tree::ladder(24, 1.0).expect("ladder");
-        let (_, report) = equal_daylight(&tree, None).expect("layout");
-        let (Some(before), Some(after)) = (report.initial_discrepancy, report.final_discrepancy)
-        else {
-            panic!("refined run reported no discrepancy");
-        };
-        assert!(report.sweeps > 0, "no sweep was accepted");
+        let layout = equal_daylight(&tree, None).expect("layout");
+        let before = discrepancy(&tree, &equal_angle(&tree, None).expect("angle"));
+        let after = discrepancy(&tree, &layout);
         assert!(
             after < before,
             "discrepancy did not fall: {before} to {after}"
@@ -1689,17 +1632,13 @@ mod tests {
         // search the refinement would be a no-op here.
         for leaves in [64usize, 128, 256] {
             let tree = random_tree(leaves, leaves as u64);
-            let (layout, report) = equal_daylight(&tree, None).expect("layout");
-            let (Some(before), Some(after)) =
-                (report.initial_discrepancy, report.final_discrepancy)
-            else {
-                panic!("{leaves} leaves: refined run reported no discrepancy");
-            };
+            let layout = equal_daylight(&tree, None).expect("layout");
+            let before = discrepancy(&tree, &equal_angle(&tree, None).expect("angle"));
+            let after = discrepancy(&tree, &layout);
             assert!(
                 after < before,
                 "{leaves} leaves: discrepancy did not fall, {before} to {after}"
             );
-            assert_eq!(report.crossing_free, Some(true), "{leaves} leaves");
             assert!(!has_edge_crossing(&tree, &layout).expect("check"));
         }
     }
@@ -1707,16 +1646,10 @@ mod tests {
     #[test]
     fn test_equal_daylight_terminates_on_a_layout_it_cannot_improve() {
         // A star is already perfectly lit: every gap around the root is equal,
-        // so no step of any size lowers the discrepancy and the run must stop
-        // after the first sweep rather than grinding through the cap.
+        // so the run must stop there rather than grind through the cap.
         let tree = star(64, 1.0);
-        let (_, report) = equal_daylight(&tree, None).expect("layout");
-        assert_eq!(report.sweeps, 1);
-        assert_relative_eq!(
-            report.final_discrepancy.unwrap_or(f64::NAN),
-            0.0,
-            epsilon = 1e-20
-        );
+        let layout = equal_daylight(&tree, None).expect("layout");
+        assert_relative_eq!(discrepancy(&tree, &layout), 0.0, epsilon = 1e-20);
     }
 
     #[test]
@@ -1726,10 +1659,7 @@ mod tests {
             daylight_max_nodes: 8,
             ..LayoutParams::default()
         };
-        let (layout, report) = equal_daylight(&tree, Some(params)).expect("layout");
-        assert!(!report.refined);
-        assert_eq!(report.sweeps, 0);
-        assert_eq!(report.crossing_free, None);
+        let layout = equal_daylight(&tree, Some(params)).expect("layout");
         assert_eq!(layout, equal_angle(&tree, Some(params)).expect("angle"));
     }
 
@@ -1840,10 +1770,11 @@ mod tests {
                     equal_angle(&tree, None).expect(name),
                     "{name}: equal-angle drifted"
                 );
-                let (a, ra) = equal_daylight(&tree, None).expect(name);
-                let (b, rb) = equal_daylight(&tree, None).expect(name);
-                assert_eq!(a, b, "{name}: equal-daylight drifted");
-                assert_eq!(ra.sweeps, rb.sweeps, "{name}: sweep count drifted");
+                assert_eq!(
+                    equal_daylight(&tree, None).expect(name),
+                    equal_daylight(&tree, None).expect(name),
+                    "{name}: equal-daylight drifted"
+                );
             }
         }
     }
@@ -1871,8 +1802,7 @@ mod tests {
 
         // Far past the gate, so this must come back unrefined rather than
         // spending the afternoon in the quadratic.
-        let (daylight, report) = equal_daylight(&tree, None).expect("equal daylight");
-        assert!(!report.refined);
+        let daylight = equal_daylight(&tree, None).expect("equal daylight");
         assert_eq!(daylight, angle);
 
         let disk = angle.hyperbolic(None);

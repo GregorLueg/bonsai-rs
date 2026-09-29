@@ -25,7 +25,7 @@ from ._types import (
     Step,
     Tree,
 )
-from .core import backbone, bonsai, bonsai_from_counts, from_sanity, sanity
+from .core import bonsai, bonsai_from_counts, from_sanity, sanity
 from .tree import (
     cluster,
     layout,
@@ -47,7 +47,6 @@ __all__ = [
     "Tree",
     "__core_version__",
     "__version__",
-    "backbone",
     "bonsai",
     "bonsai_from_counts",
     "cluster",

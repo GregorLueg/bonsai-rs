@@ -18,7 +18,7 @@
 //!
 //! * An underscore in an unquoted label stays an underscore. Strict Newick reads
 //!   it as a space, which would mangle cell barcodes such as `AACGT_1`.
-//! * Internal labels are written on request but discarded on parsing:
+//! * Internal labels are never written and are discarded on parsing:
 //!   [`Tree::from_parents`] permutes internal indices into level order without
 //!   reporting the permutation, so there is no index to hand them back under.
 //! * Negative branch lengths are rejected. They are diffusion times here
@@ -94,34 +94,7 @@ const MAX_NODES: usize = NO_NODE as usize;
 /// count does not match the leaf count, or if the tree is a lone leaf, which
 /// has no Newick form the reader will take back.
 pub fn write_newick<S: AsRef<str>>(tree: &Tree, leaf_labels: &[S]) -> Result<String, BonsaiErrors> {
-    write_newick_labelled::<S, S>(tree, leaf_labels, None)
-}
-
-/// Serialise a tree to Newick, optionally labelling the internal nodes too.
-///
-/// Internal labels are a courtesy for downstream viewers. Nothing in this crate
-/// reads them back, see the module docs.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `leaf_labels` - One label per leaf, indexed by leaf index
-/// * `internal_labels` - One label per internal node, indexed by
-///   `node - tree.n_leaves()`, or `None` to leave internal nodes unlabelled. An
-///   empty string is written as no label rather than as `''`
-///
-/// ### Returns
-///
-/// The Newick string, semicolon terminated, or `MalformedTree` if either label
-/// count does not match the arena, or if the tree is a lone leaf, which has no
-/// Newick form the reader will take back.
-pub fn write_newick_labelled<S: AsRef<str>, T: AsRef<str>>(
-    tree: &Tree,
-    leaf_labels: &[S],
-    internal_labels: Option<&[T]>,
-) -> Result<String, BonsaiErrors> {
     let n_leaves = tree.n_leaves();
-    let n_internal = tree.n_nodes() - n_leaves;
     // A lone leaf, which the arena holds and Newick has no form for; see the
     // module docs. Refusing here is what keeps the writer and the reader agreed
     // on what a tree is.
@@ -137,16 +110,6 @@ pub fn write_newick_labelled<S: AsRef<str>, T: AsRef<str>>(
             reason: format!(
                 "{} leaf labels supplied for a tree with {n_leaves} leaves",
                 leaf_labels.len()
-            ),
-        });
-    }
-    if let Some(internal) = internal_labels
-        && internal.len() != n_internal
-    {
-        return Err(BonsaiErrors::MalformedTree {
-            reason: format!(
-                "{} internal labels supplied for a tree with {n_internal} internal nodes",
-                internal.len()
             ),
         });
     }
@@ -171,16 +134,13 @@ pub fn write_newick_labelled<S: AsRef<str>, T: AsRef<str>>(
         }
 
         // Every child is out; close the group, if there was one, and annotate.
-        if !children.is_empty() {
-            out.push(')');
-        }
-        let label = if children.is_empty() {
-            leaf_labels[node as usize].as_ref()
+        if children.is_empty() {
+            let label = leaf_labels[node as usize].as_ref();
+            if !label.is_empty() {
+                push_label(&mut out, label);
+            }
         } else {
-            internal_labels.map_or("", |l| l[node as usize - n_leaves].as_ref())
-        };
-        if !label.is_empty() {
-            push_label(&mut out, label);
+            out.push(')');
         }
         if node != root {
             out.push(':');
@@ -944,13 +904,10 @@ mod tests {
     }
 
     #[test]
-    fn test_internal_labels_are_written_and_ignored_on_reparse() {
+    fn test_internal_labels_are_ignored_on_parse() {
         let tree = Tree::balanced_binary(4, 0.5).expect("a valid fixture");
-        let internal = vec!["anc0".to_string(), "anc1".to_string(), "root".to_string()];
-        let text = write_newick_labelled(&tree, &labels(4), Some(&internal)).expect("writing");
-        assert!(text.contains("anc0"), "internal label missing from {text}");
-        assert!(text.ends_with("root;"), "root label missing from {text}");
-        let (back, names) = parse_newick(&text).expect("parsing");
+        let text = "((L0:0.5,L1:0.5)anc0:0.5,(L2:0.5,L3:0.5)anc1:0.5)root;";
+        let (back, names) = parse_newick(text).expect("parsing");
         assert_eq!(canonical(&tree, &labels(4)), canonical(&back, &names));
     }
 
@@ -1049,11 +1006,6 @@ mod tests {
         let tree = Tree::balanced_binary(4, 1.0).expect("a valid fixture");
         assert!(matches!(
             write_newick(&tree, &labels(3)),
-            Err(BonsaiErrors::MalformedTree { .. })
-        ));
-        let internal = vec!["only one".to_string()];
-        assert!(matches!(
-            write_newick_labelled(&tree, &labels(4), Some(&internal)),
             Err(BonsaiErrors::MalformedTree { .. })
         ));
     }

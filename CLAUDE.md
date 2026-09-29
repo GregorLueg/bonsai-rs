@@ -42,9 +42,8 @@ src/
   errors.rs       # single BonsaiErrors enum, sectioned by subsystem
   bonsai.rs       # the pipeline: ingest, steps 1 to 8
   ingest.rs       # scale transform, feature selection, Sanity handover (SPEC 3)
-  backbone.rs     # subset, place, refine (SPEC 15)
   model/          # likelihood, branch, merge, place, global
-  search/         # star, polytomy, spr, nni, candidates, bounds
+  search/         # star, polytomy, spr, nni, candidates, bounds, live, masked
   tree/           # arena, linkage, newick, layout, distance, cluster, simulate
   utils/          # BonsaiFloat, scalar kernels, simd.rs (only file naming `wide`)
 benches/          # plain `main`, harness = false
@@ -57,7 +56,9 @@ docs/             # SPEC (the only implementation source), DESIGN, PERFORMANCE, 
 
 **Arena.** Leaves are `0..n_leaves`, internal nodes follow ordered by height. So ascending index is a post-order, a parent row sits above its children (`split_at_mut`, no aliasing), and each level is contiguous. Violations break silently. `Tree::from_parents` relabels to enforce it.
 
-**One layout.** `NodeState`, row-major `[node][feature]`, sequential. A feature-blocked parallel `BlockedState` was 6x faster on the kernel, called "the production path" for a month, and only ever built by a benchmark. Prune is 2.1 to 2.4 per cent of a run. Deleted 2026-09-06. **Measure a component's share of the whole, and check the pipeline calls it, before optimising it.**
+**Live tree.** SPR and NNI's lazy phase run on `search::live::LiveTree`: stable ids, arena order kept per level, one conversion each way per step. Moves are scored on `search::masked` views without building a tree. New nodes are numbered by assembly (level order kept, height changers to the front or back, new nodes last), not by traversal; that is what lets an accept stay local. Debug builds check every proposal and accept against the built path, so run a debug harness on real data after touching either.
+
+**One layout.** `NodeState`, row-major `[node][feature]`, sequential. A feature-blocked parallel `BlockedState` was 6x faster on the kernel, called "the production path" for a month, and only ever built by a benchmark. Prune was 2.1 to 2.4 per cent of a run then. Deleted 2026-09-06. Once SPR got cheap the sequential prune was three quarters of the global branch solve, and a level-parallel prune took steps 4 and 7 down 3.4 to 4.1x (2026-09-27). **Measure a component's share of the whole, and check the pipeline calls it, before optimising it.**
 
 **Numerics.** Storage generic over `BonsaiFloat`, every reduction in `f64`. Don't "simplify" back:
 
@@ -68,7 +69,7 @@ Means are judged on absolute error, loglikelihoods on relative.
 
 **Units.** Input divided by `sqrt(v_g)` at ingest; `2*pi` and `v_g` terms dropped. Loglikelihoods are up to a constant. **This crate works in `L`, not `2L`**: halve any threshold from the paper.
 
-**Determinism.** Same input, same tree, any thread count. Parallel reductions sum per-unit contributions in a fixed order. Never `.sum()` on a `ParallelIterator`.
+**Determinism.** Same input, same tree, any thread count. Parallel reductions sum per-unit contributions in a fixed order; SPR scores on fixed-point integer totals so a move's score doesn't depend on summation order. Never `.sum()` on a `ParallelIterator`.
 
 ## Conventions
 

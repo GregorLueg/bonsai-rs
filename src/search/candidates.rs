@@ -442,6 +442,7 @@ mod tests {
     use crate::model::merge::MergeParams;
     use crate::search::star::{Star, StarResult, resolve_star, resolve_star_with};
     use crate::utils::rng::SplitMix64;
+    use crate::utils::verbosity::Verbosity;
 
     /// Leaves in tight groups, far apart from each other.
     ///
@@ -553,6 +554,7 @@ mod tests {
             },
             None,
             &mut provider,
+            Verbosity::Quiet,
         )
         .expect("resolve")
     }
@@ -757,6 +759,7 @@ mod tests {
                 },
                 None,
                 provider,
+                Verbosity::Quiet,
             )
             .expect("resolve")
         };

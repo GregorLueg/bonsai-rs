@@ -42,6 +42,7 @@ def bonsai(
     search: str,
     min_snr: float | None,
     reroot: bool,
+    verbose: int,
     /,
 ) -> dict[str, Any]: ...
 def bonsai_from_counts(
@@ -59,18 +60,7 @@ def bonsai_from_counts(
     min_snr: float | None,
     max_amp: float | None,
     reroot: bool,
-    /,
-) -> dict[str, Any]: ...
-def backbone(
-    means: np.ndarray,
-    sds: np.ndarray,
-    variances: np.ndarray | None,
-    start: str,
-    search: str,
-    min_snr: float | None,
-    reroot: bool,
-    backbone_cells: int | None,
-    seed: int,
+    verbose: int,
     /,
 ) -> dict[str, Any]: ...
 def simulate(

@@ -1,19 +1,17 @@
 //! The reconstruction entry points: Sanity, the S5 conversion, Bonsai, the
-//! chain from counts, backbone mode and the simulator.
+//! chain from counts and the simulator.
 //!
 //! Every numeric entry point dispatches on the input's element type and runs
 //! generic over it, so `float32` in means `float32` storage all the way down.
 //! Reductions are `f64` either way; that is the core's policy, not ours.
 
-use bonsai_rs::backbone::{BackboneParams, backbone as backbone_run};
-use bonsai_rs::bonsai::{BonsaiParams, StartTree, bonsai as bonsai_run};
-use bonsai_rs::ingest::{IngestParams, from_sanity as s5, from_sanity_output, prepare};
-use bonsai_rs::search::nni::{NniParams, NniSearch};
-use bonsai_rs::search::spr::{SprParams, SprSearch};
+// Aliased: this file's `bonsai` and `from_sanity` are the Python entry points.
+use bonsai_rs::bonsai::bonsai as bonsai_run;
+use bonsai_rs::ingest::from_sanity as s5;
+use bonsai_rs::prelude::*;
 use bonsai_rs::tree::simulate::{
     SimulationParams, simulate_binary, simulate_binary_random_branches, simulate_unbalanced,
 };
-use bonsai_rs::utils::traits::BonsaiFloat;
 use numpy::{Element, IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -345,6 +343,7 @@ fn s5_out<'py, T: Float>(
 /// * `means`, `sds` - `(n_cells, n_features)`, both `float32` or both `float64`
 /// * `variances` - Per-feature variance, `None` to estimate
 /// * `start`, `search`, `min_snr`, `reroot` - As [`params`]
+/// * `verbose` - `0` quiet, `1` one line per step, `2` progress within steps
 ///
 /// ### Returns
 ///
@@ -360,12 +359,14 @@ pub fn bonsai<'py>(
     search: &str,
     min_snr: Option<f64>,
     reroot: bool,
+    verbose: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     let v = variances.as_ref().map(slice).transpose()?;
     let bp = params(start, search, min_snr, None, reroot)?;
+    let verbosity = parse_verbosity_level(verbose);
     match pair(means, sds)? {
-        Pair::F32(m, s) => bonsai_out(py, &m, &s, v, bp),
-        Pair::F64(m, s) => bonsai_out(py, &m, &s, v, bp),
+        Pair::F32(m, s) => bonsai_out(py, &m, &s, v, bp, verbosity),
+        Pair::F64(m, s) => bonsai_out(py, &m, &s, v, bp, verbosity),
     }
 }
 
@@ -384,11 +385,12 @@ fn bonsai_out<'py, T: Float>(
     s: &PyReadonlyArray2<'py, T>,
     v: Option<&[f64]>,
     bp: BonsaiParams,
+    verbosity: Verbosity,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (mean, n, p) = flat(m)?;
     let (sd, _, _) = flat(s)?;
     let res = py
-        .detach(|| bonsai_run(mean, sd, n, p, v, Some(bp)))
+        .detach(|| bonsai_run(mean, sd, n, p, v, Some(bp), verbosity))
         .map_err(BErr)?;
     let features = res.features.clone();
     result_out(py, res, features, Vec::new())
@@ -404,6 +406,7 @@ fn bonsai_out<'py, T: Float>(
 /// * `double` - `float64` storage instead of `float32`
 /// * `gpu` - Run Sanity on the GPU, see [`crate::gpu`]
 /// * `start`, `search`, `min_snr`, `max_amp`, `reroot` - As [`params`]
+/// * `verbose` - As [`bonsai`]; covers the tree search, not Sanity
 ///
 /// ### Returns
 ///
@@ -427,16 +430,18 @@ pub fn bonsai_from_counts<'py>(
     min_snr: Option<f64>,
     max_amp: Option<f64>,
     reroot: bool,
+    verbose: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     check(gpu)?;
     let counts = counts_in(&indices, &values, &indptr, n_cells)?;
     let totals = slice(&cell_totals)?;
     let sp = sanity_params(rule, fixed_variance)?;
     let bp = params(start, search, min_snr, max_amp, reroot)?;
+    let verbosity = parse_verbosity_level(verbose);
     if double {
-        chain::<f64>(py, &counts, totals, sp, bp, gpu)
+        chain::<f64>(py, &counts, totals, sp, bp, gpu, verbosity)
     } else {
-        chain::<f32>(py, &counts, totals, sp, bp, gpu)
+        chain::<f32>(py, &counts, totals, sp, bp, gpu, verbosity)
     }
 }
 
@@ -449,6 +454,7 @@ pub fn bonsai_from_counts<'py>(
 /// * `totals` - Total UMIs per cell
 /// * `sp`, `bp` - Sanity and Bonsai parameters
 /// * `gpu` - Run Sanity on the GPU
+/// * `verbosity` - How much the tree search prints
 ///
 /// ### Returns
 ///
@@ -460,6 +466,7 @@ fn chain<'py, T: Float>(
     sp: SanityParams,
     bp: BonsaiParams,
     gpu: bool,
+    verbosity: Verbosity,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (res, genes, dropped) = py.detach(|| -> Result<_, BErr> {
         let out = run_sanity::<T>(counts, totals, sp, gpu)?;
@@ -472,79 +479,13 @@ fn chain<'py, T: Float>(
             k,
             Some(&lik.variances),
             Some(bp),
+            verbosity,
         )?;
         Ok((res, lik.features, lik.dropped))
     })?;
     // `res.features` indexes the S5 survivors; map back to the count matrix.
     let features = res.features.iter().map(|&k| genes[k]).collect();
     result_out(py, res, features, dropped)
-}
-
-/// Backbone mode (SPEC 15): build on a subset, place the rest, refine.
-///
-/// ### Params
-///
-/// * `means`, `sds`, `variances`, `start`, `search`, `min_snr`, `reroot` - As
-///   [`bonsai`]
-/// * `backbone_cells` - Cells in the backbone, `None` for the default
-/// * `seed` - Seed for choosing the backbone
-///
-/// ### Returns
-///
-/// As [`bonsai`].
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-pub fn backbone<'py>(
-    py: Python<'py>,
-    means: &Bound<'py, PyAny>,
-    sds: &Bound<'py, PyAny>,
-    variances: Option<PyReadonlyArray1<'py, f64>>,
-    start: &str,
-    search: &str,
-    min_snr: Option<f64>,
-    reroot: bool,
-    backbone_cells: Option<usize>,
-    seed: u64,
-) -> PyResult<Bound<'py, PyDict>> {
-    let v = variances.as_ref().map(slice).transpose()?;
-    let mut bb = BackboneParams {
-        bonsai: params(start, search, min_snr, None, reroot)?,
-        seed,
-        ..BackboneParams::default()
-    };
-    if let Some(c) = backbone_cells {
-        bb.backbone_cells = c;
-    }
-    match pair(means, sds)? {
-        Pair::F32(m, s) => backbone_out(py, &m, &s, v, bb),
-        Pair::F64(m, s) => backbone_out(py, &m, &s, v, bb),
-    }
-}
-
-/// [`backbone`] at one float type.
-///
-/// ### Params
-///
-/// As [`backbone`], typed and resolved.
-///
-/// ### Returns
-///
-/// As [`backbone`].
-fn backbone_out<'py, T: Float>(
-    py: Python<'py>,
-    m: &PyReadonlyArray2<'py, T>,
-    s: &PyReadonlyArray2<'py, T>,
-    v: Option<&[f64]>,
-    bb: BackboneParams,
-) -> PyResult<Bound<'py, PyDict>> {
-    let (mean, n, p) = flat(m)?;
-    let (sd, _, _) = flat(s)?;
-    let (res, _) = py.detach(|| -> Result<_, BErr> {
-        let data = prepare(mean, sd, n, p, v, Some(bb.bonsai.ingest))?;
-        Ok(backbone_run(&data, Some(bb))?)
-    })?;
-    let features = res.features.clone();
-    result_out(py, res, features, Vec::new())
 }
 
 //////////////

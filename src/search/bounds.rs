@@ -31,17 +31,16 @@
 //! treatment: its bound is its own gain in the round it was scored in.
 //!
 //! `nsteps` then decides one thing only: how far the centre may travel before
-//! the *linearisation* is redone. See [`EllipsoidBoundsParams::nsteps`].
+//! the *linearisation* is redone. See [`DEFAULT_NSTEPS`].
 //!
 //! ### Honesty about what this is not
 //!
 //! It is not a strict mathematical bound. The linearisation can underestimate.
-//! [`EllipsoidBoundsParams::verify`] turns that from an argument into a
-//! measurement: it scores every offered pair every round, counts how often a
-//! true gain exceeds its recorded bound, and replays the primitive's walk to
-//! count how often that cost the answer. On this crate's fixtures the first
+//! Measured by scoring every offered pair every round, counting how often a
+//! true gain exceeds its recorded bound, and replaying the primitive's walk to
+//! count how often that cost the answer: on this crate's fixtures the first
 //! number is about one in a thousand and the second is zero. Both are
-//! tabulated, with the diagnosis, in [`EllipsoidBoundsParams::default`].
+//! tabulated, with the diagnosis, in [`DEFAULT_NSTEPS`].
 //!
 //! ### The derivative
 //!
@@ -62,9 +61,114 @@ use std::collections::HashMap;
 // Constants //
 ///////////////
 
-/// Default for [`EllipsoidBoundsParams::nsteps`].
+/// Where the online schedule starts `nsteps`: how far the centre may travel,
+/// in the metric of SPEC.md section 10.3, before every bound is redrawn.
 ///
-/// See [`EllipsoidBoundsParams::default`] for the measurement that pins it.
+/// One merge moves the centre about two to three of these units, so this is
+/// `nsteps` in the section's sense to within that constant. It does not control
+/// how loose a bound is: a bound grows exactly in step with the distance the
+/// centre has actually travelled since the pair was scored. What it controls is
+/// how far the *linearisation* is stretched before it is redone, and therefore
+/// the trade between redrawing often and walking deep.
+///
+/// ### Where these came from
+///
+/// Ours, chosen by measurement over clustered stars of 128 members by 200
+/// features, four seeds, wrapping [`crate::search::star::AllPairs`] so the
+/// comparison is the `349,500` pairs a star scores exhaustively in 1.68
+/// seconds. "Bounded" is the pairs the provider scored to build bounds,
+/// "walked" the pairs the primitive's walk scored, and "scored" their sum,
+/// which is the whole cost.
+///
+/// | `nsteps` | redraws | bounded | walked | scored | fraction | seconds |
+/// |---|---|---|---|---|---|---|
+/// | 6 | 25.2 | 93,644 | 2,633 | 96,276 | 0.275 | 0.586 |
+/// | 12 | 14.0 | 56,134 | 5,045 | 61,179 | 0.175 | 0.411 |
+/// | 24 | 7.8 | 35,459 | 8,413 | 43,872 | 0.126 | 0.336 |
+/// | 48 | 4.2 | 24,963 | 10,573 | 35,536 | 0.102 | 0.289 |
+/// | 96 | 3.0 | 19,893 | 19,297 | 39,190 | 0.112 | 0.357 |
+/// | 192 | 2.0 | 17,351 | 42,157 | 59,508 | 0.170 | 0.594 |
+///
+/// A bowl with its floor at 48, where the two halves are within a factor of
+/// two of each other. That is a factor of ten in pairs and six in wall
+/// time, and it widens with the star: the exhaustive term is `O(n^3 p)` and
+/// this one is much flatter.
+///
+/// ### How it composes, and how it scales
+///
+/// Same fixtures at 200 features, defaults throughout, four seeds. The
+/// `k`-nearest-neighbour restriction of SPEC.md section 11 is the other
+/// half of the acceleration and the two multiply:
+///
+/// | members | exhaustive pairs | bounds only | with section 11 | seconds, exhaustive to both |
+/// |---|---|---|---|---|
+/// | 64 | 43,676 | 9,046 | 4,512 | 0.219 to 0.041 |
+/// | 128 | 349,500 | 37,618 | 14,480 | 1.683 to 0.133 |
+/// | 256 | 2,796,156 | 144,116 | 46,605 | 13.619 to 0.457 |
+///
+/// Sixty times fewer pairs and thirty times less wall time at 256 members,
+/// growing with `n`. The wall-time factor lags the pair-count factor
+/// because the walk is a sequence of small parallel scans while the
+/// exhaustive scan is one large one; see
+/// [`crate::search::star::BOUND_WALK_CHUNK`].
+///
+/// ### The online schedule
+///
+/// Its value is not the couple of per cent it buys at the right starting
+/// point. It is what a wrong starting point costs:
+///
+/// | start | fixed there | adaptive from there |
+/// |---|---|---|
+/// | 12 | 0.175 | 0.109 |
+/// | 48 | 0.102 | 0.108 |
+/// | 192 | 0.170 | 0.137 |
+///
+/// A default measured on one star size is a guess at another, and the
+/// schedule halves what that guess can cost. At the right value it is
+/// slightly worse than the fixed setting, because it spends the first
+/// rounds finding it.
+///
+/// ### Bound violations
+///
+/// The linearisation is not a strict bound and SPEC.md section 10.2 says
+/// so, so this is measured rather than assumed. Scoring every offered pair
+/// in every round and checking it against its recorded bound, four seeds, every offered pair checked against its recorded bound every
+/// round:
+///
+/// | members | features | checks | `nsteps` | violations | worst, nats | worst / best gain | misses |
+/// |---|---|---|---|---|---|---|---|
+/// | 48 | 64 | 73,680 | 1 | 0 | 0 | 0 | 0 |
+/// | 48 | 64 | 73,680 | 3 | 63 | 0.45 | 0.7% | 0 |
+/// | 48 | 64 | 73,680 | 12 | 96 | 2.08 | 3.6% | 0 |
+/// | 48 | 64 | 73,680 | 48 | 67 | 2.08 | 3.6% | 0 |
+/// | 48 | 64 | 73,680 | 768 | 90 | 2.08 | 3.6% | 0 |
+/// | 96 | 128 | 589,744 | 3 | 185 | 0.53 | 0.5% | 0 |
+/// | 96 | 128 | 589,744 | 12 | 234 | 1.41 | 1.2% | 0 |
+/// | 96 | 128 | 589,744 | 48 | 107 | 2.16 | 1.9% | 0 |
+/// | 96 | 128 | 589,744 | 768 | 82 | 2.17 | 1.9% | 0 |
+///
+/// **Violations happen: about one check in a thousand, by up to two nats
+/// against best gains of sixty to a hundred and seventy.** They appear the
+/// moment the centre travels further than about one merge and then
+/// plateau, which is the signature of a second-order term and not of a
+/// wrong derivative: at `nsteps <= 1` every round redraws, every bound is
+/// its own pair's gain, and the count is exactly zero. The plateau is
+/// because the walk rescores the top of the list every round and resets
+/// those bounds, so only pairs nobody is looking at drift far.
+///
+/// The suspect is the peel. `WR = W_r - Wd_k - Wd_l` is linear and exact,
+/// but `MR` is a ratio whose denominator is that difference, so for a pair
+/// carrying much of the centre's precision the second derivative is large.
+/// [`crate::search::star::peel`] flags the same conditioning for the same
+/// reason.
+///
+/// **What it costs is nothing, and that is also measured.** The "misses"
+/// column replays the primitive's walk over the true gains and counts the
+/// rounds where it would have stopped on a pair that was not the round's
+/// best. It is zero everywhere: a violated bound has never yet belonged to
+/// a pair anybody was going to pick. `test_bounded_search_matches_the_exhaustive_scan`
+/// is the same claim made structurally, over four star sizes, three seeds
+/// and four ellipsoid sizes.
 const DEFAULT_NSTEPS: f64 = 48.0;
 
 /// Smallest value the online sizing will shrink `nsteps` to.
@@ -108,213 +212,6 @@ const GROW: f64 = 1.05;
 /// did. The tail of every star is such a round. Four chunks is where the signal
 /// stops being dominated by the granularity.
 const ADAPT_MIN_CHUNKS: usize = 4;
-
-///////////////////////////
-// EllipsoidBoundsParams //
-///////////////////////////
-
-/// Tuning knobs for [`EllipsoidBounds`].
-///
-/// None of these change the answer. `nsteps` and the online schedule trade
-/// bound tightness against how often the linearisation is redrawn; `verify` is
-/// a measurement mode.
-#[derive(Clone, Copy, Debug)]
-pub struct EllipsoidBoundsParams {
-    /// How far the centre may travel before every bound is redrawn, in the
-    /// metric of SPEC.md section 10.3.
-    ///
-    /// One merge moves the centre about two to three of these units, so this is
-    /// `nsteps` in the section's sense to within that constant.
-    ///
-    /// **What it does and does not control.** It does not control how loose a
-    /// bound is: a bound grows exactly in step with the distance the centre has
-    /// actually travelled since the pair was scored, so a pair scored last
-    /// round is bounded tightly whatever this is set to. What it controls is
-    /// how far the *linearisation* is stretched before it is redone, and
-    /// therefore the trade between redrawing often and walking deep. The total
-    /// is a bowl; see [`EllipsoidBoundsParams::default`].
-    pub nsteps: f64,
-    /// Move `nsteps` towards the size that costs least (SPEC.md section 10.5).
-    pub adapt: bool,
-    /// Score every offered pair every round and check it against its recorded
-    /// bound.
-    ///
-    /// Costs the whole saving, so this is for tests and for the measurements in
-    /// [`EllipsoidBoundsParams::default`], not for production. The pairs
-    /// emitted and their order are unchanged, so a verified run builds the same
-    /// tree as an unverified one.
-    pub verify: bool,
-}
-
-impl Default for EllipsoidBoundsParams {
-    /// `nsteps = 48`, online sizing on, verification off.
-    ///
-    /// ### Where these came from
-    ///
-    /// Ours, chosen by measurement over clustered stars of 128 members by 200
-    /// features, four seeds, wrapping [`crate::search::star::AllPairs`] so the
-    /// comparison is the `349,500` pairs a star scores exhaustively in 1.68
-    /// seconds. "Bounded" is the pairs the provider scored to build bounds,
-    /// "walked" the pairs the primitive's walk scored, and "scored" their sum,
-    /// which is the whole cost.
-    ///
-    /// | `nsteps` | redraws | bounded | walked | scored | fraction | seconds |
-    /// |---|---|---|---|---|---|---|
-    /// | 6 | 25.2 | 93,644 | 2,633 | 96,276 | 0.275 | 0.586 |
-    /// | 12 | 14.0 | 56,134 | 5,045 | 61,179 | 0.175 | 0.411 |
-    /// | 24 | 7.8 | 35,459 | 8,413 | 43,872 | 0.126 | 0.336 |
-    /// | 48 | 4.2 | 24,963 | 10,573 | 35,536 | 0.102 | 0.289 |
-    /// | 96 | 3.0 | 19,893 | 19,297 | 39,190 | 0.112 | 0.357 |
-    /// | 192 | 2.0 | 17,351 | 42,157 | 59,508 | 0.170 | 0.594 |
-    ///
-    /// A bowl with its floor at 48, where the two halves are within a factor of
-    /// two of each other. That is a factor of ten in pairs and six in wall
-    /// time, and it widens with the star: the exhaustive term is `O(n^3 p)` and
-    /// this one is much flatter.
-    ///
-    /// ### How it composes, and how it scales
-    ///
-    /// Same fixtures at 200 features, defaults throughout, four seeds. The
-    /// `k`-nearest-neighbour restriction of SPEC.md section 11 is the other
-    /// half of the acceleration and the two multiply:
-    ///
-    /// | members | exhaustive pairs | bounds only | with section 11 | seconds, exhaustive to both |
-    /// |---|---|---|---|---|
-    /// | 64 | 43,676 | 9,046 | 4,512 | 0.219 to 0.041 |
-    /// | 128 | 349,500 | 37,618 | 14,480 | 1.683 to 0.133 |
-    /// | 256 | 2,796,156 | 144,116 | 46,605 | 13.619 to 0.457 |
-    ///
-    /// Sixty times fewer pairs and thirty times less wall time at 256 members,
-    /// growing with `n`. The wall-time factor lags the pair-count factor
-    /// because the walk is a sequence of small parallel scans while the
-    /// exhaustive scan is one large one; see
-    /// [`crate::search::star::BOUND_WALK_CHUNK`].
-    ///
-    /// ### The online schedule
-    ///
-    /// Its value is not the couple of per cent it buys at the right starting
-    /// point. It is what a wrong starting point costs:
-    ///
-    /// | start | fixed there | adaptive from there |
-    /// |---|---|---|
-    /// | 12 | 0.175 | 0.109 |
-    /// | 48 | 0.102 | 0.108 |
-    /// | 192 | 0.170 | 0.137 |
-    ///
-    /// A default measured on one star size is a guess at another, and the
-    /// schedule halves what that guess can cost. At the right value it is
-    /// slightly worse than the fixed setting, because it spends the first
-    /// rounds finding it.
-    ///
-    /// ### Bound violations
-    ///
-    /// The linearisation is not a strict bound and SPEC.md section 10.2 says
-    /// so, so this is measured rather than assumed. With `verify` on, four
-    /// seeds, every offered pair checked against its recorded bound every
-    /// round:
-    ///
-    /// | members | features | checks | `nsteps` | violations | worst, nats | worst / best gain | misses |
-    /// |---|---|---|---|---|---|---|---|
-    /// | 48 | 64 | 73,680 | 1 | 0 | 0 | 0 | 0 |
-    /// | 48 | 64 | 73,680 | 3 | 63 | 0.45 | 0.7% | 0 |
-    /// | 48 | 64 | 73,680 | 12 | 96 | 2.08 | 3.6% | 0 |
-    /// | 48 | 64 | 73,680 | 48 | 67 | 2.08 | 3.6% | 0 |
-    /// | 48 | 64 | 73,680 | 768 | 90 | 2.08 | 3.6% | 0 |
-    /// | 96 | 128 | 589,744 | 3 | 185 | 0.53 | 0.5% | 0 |
-    /// | 96 | 128 | 589,744 | 12 | 234 | 1.41 | 1.2% | 0 |
-    /// | 96 | 128 | 589,744 | 48 | 107 | 2.16 | 1.9% | 0 |
-    /// | 96 | 128 | 589,744 | 768 | 82 | 2.17 | 1.9% | 0 |
-    ///
-    /// **Violations happen: about one check in a thousand, by up to two nats
-    /// against best gains of sixty to a hundred and seventy.** They appear the
-    /// moment the centre travels further than about one merge and then
-    /// plateau, which is the signature of a second-order term and not of a
-    /// wrong derivative: at `nsteps <= 1` every round redraws, every bound is
-    /// its own pair's gain, and the count is exactly zero. The plateau is
-    /// because the walk rescores the top of the list every round and resets
-    /// those bounds, so only pairs nobody is looking at drift far.
-    ///
-    /// The suspect is the peel. `WR = W_r - Wd_k - Wd_l` is linear and exact,
-    /// but `MR` is a ratio whose denominator is that difference, so for a pair
-    /// carrying much of the centre's precision the second derivative is large.
-    /// [`crate::search::star::peel`] flags the same conditioning for the same
-    /// reason.
-    ///
-    /// **What it costs is nothing, and that is also measured.** The "misses"
-    /// column replays the primitive's walk over the true gains and counts the
-    /// rounds where it would have stopped on a pair that was not the round's
-    /// best. It is zero everywhere: a violated bound has never yet belonged to
-    /// a pair anybody was going to pick. `test_bounded_search_matches_the_exhaustive_scan`
-    /// is the same claim made structurally, over four star sizes, three seeds
-    /// and four ellipsoid sizes.
-    ///
-    /// ### Returns
-    ///
-    /// The default parameters.
-    fn default() -> Self {
-        Self {
-            nsteps: DEFAULT_NSTEPS,
-            adapt: true,
-            verify: false,
-        }
-    }
-}
-
-///////////////
-// Reporting //
-///////////////
-
-/// What a run of [`EllipsoidBounds`] cost and whether the bounds held.
-///
-/// The saving is the whole justification for the module, so it is reported
-/// rather than asserted. Cumulative over the provider's whole life, so an
-/// instance reused across several stars reports their total.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct EllipsoidBoundsStats {
-    /// Rounds the provider was asked for candidates.
-    pub rounds: usize,
-    /// Rounds in which every bound had to be recomputed.
-    pub refreshes: usize,
-    /// Candidate pairs offered, summed over rounds. What an exhaustive scan
-    /// would have scored.
-    pub offered: usize,
-    /// Pairs the provider scored to build a bound.
-    pub bounded: usize,
-    /// Pairs the primitive's bound-ordered walk scored.
-    ///
-    /// Reported to the provider one round late, since it is the only channel
-    /// the primitive has, so the last round of a star is not counted. That is
-    /// one round in `n` and it is not corrected for.
-    pub walked: usize,
-    /// Bound checks made under [`EllipsoidBoundsParams::verify`].
-    pub checked: usize,
-    /// Checks in which the true gain exceeded the recorded bound.
-    pub violations: usize,
-    /// Largest `true gain - bound` seen, or zero if none was positive.
-    pub worst_violation: f64,
-    /// Rounds in which the bound-ordered walk would have stopped on a pair
-    /// that was not the round's true best.
-    ///
-    /// The only consequence a violation can have. A bound that is exceeded by
-    /// a pair nobody was going to pick costs nothing; this counts the times it
-    /// cost the answer.
-    pub misses: usize,
-}
-
-impl EllipsoidBoundsStats {
-    /// Pairs scored, over pairs an exhaustive scan would have scored.
-    ///
-    /// ### Returns
-    ///
-    /// The fraction, or one if nothing was offered.
-    pub fn work_fraction(&self) -> f64 {
-        if self.offered == 0 {
-            1.0
-        } else {
-            (self.bounded + self.walked) as f64 / self.offered as f64
-        }
-    }
-}
 
 /////////////////
 // The kernels //
@@ -381,7 +278,7 @@ struct Branches {
 /// for movements that keep it there. A movement that frees it improves the true
 /// score by more than this predicts, which is one of the two things that can
 /// make a bound too small; the other is the curvature of the peel. See
-/// [`EllipsoidBoundsParams::default`] for what the two of them together
+/// [`DEFAULT_NSTEPS`] for what the two of them together
 /// actually cost, which on the fixtures here is nothing.
 ///
 /// ### Params
@@ -483,7 +380,7 @@ fn centre_partials(f: Feature, b: Branches) -> (f64, f64) {
 /// Measured on this crate's fixtures, one merge moves the centre about three of
 /// these units in the mean and two in the precision, so the derivation is right
 /// to a small constant and not to the digit. That constant is why
-/// [`EllipsoidBoundsParams::nsteps`] is measured rather than set to a merge
+/// [`DEFAULT_NSTEPS`] is measured rather than set to a merge
 /// count.
 ///
 /// ### Params
@@ -775,11 +672,12 @@ fn bound_pair<T: BonsaiFloat>(
 pub struct EllipsoidBounds<C> {
     /// Which pairs exist.
     inner: C,
-    /// Tuning knobs.
-    params: EllipsoidBoundsParams,
     /// How far the centre may travel before the linearisation is redrawn,
     /// which the online schedule moves.
     nsteps: f64,
+    /// Whether the online schedule moves `nsteps`; off only in tests that pin
+    /// a size.
+    adapt: bool,
     /// The centre's effective precisions when the metric was fixed.
     metric_w: Vec<f64>,
     /// Members the centre had then.
@@ -809,8 +707,6 @@ pub struct EllipsoidBounds<C> {
     raw: Vec<(usize, usize)>,
     /// Emission order being built: bound, then node ids for the tie-break.
     order: Vec<(f64, u32, u32, usize, usize)>,
-    /// What the run cost and whether the bounds held.
-    stats: EllipsoidBoundsStats,
 }
 
 impl<C> EllipsoidBounds<C> {
@@ -819,18 +715,15 @@ impl<C> EllipsoidBounds<C> {
     /// ### Params
     ///
     /// * `inner` - Provider deciding which pairs exist
-    /// * `params` - Tuning knobs, or `None` for
-    ///   [`EllipsoidBoundsParams::default`]
     ///
     /// ### Returns
     ///
     /// The provider. The first round of a star anchors it.
-    pub fn new(inner: C, params: Option<EllipsoidBoundsParams>) -> Self {
-        let params = params.unwrap_or_default();
+    pub fn new(inner: C) -> Self {
         Self {
             inner,
-            params,
-            nsteps: params.nsteps,
+            nsteps: DEFAULT_NSTEPS,
+            adapt: true,
             metric_w: Vec::new(),
             metric_nc: 0.0,
             prev_m: Vec::new(),
@@ -845,26 +738,27 @@ impl<C> EllipsoidBounds<C> {
             emitted: Vec::new(),
             raw: Vec::new(),
             order: Vec::new(),
-            stats: EllipsoidBoundsStats::default(),
         }
     }
 
-    /// What the run has cost so far.
+    /// A provider pinned at one ellipsoid size, the online schedule off, so
+    /// tests can sweep sizes.
+    ///
+    /// ### Params
+    ///
+    /// * `inner` - Provider deciding which pairs exist
+    /// * `nsteps` - The size
     ///
     /// ### Returns
     ///
-    /// The statistics.
-    pub fn stats(&self) -> EllipsoidBoundsStats {
-        self.stats
-    }
-
-    /// The ellipsoid size the online schedule has settled on.
-    ///
-    /// ### Returns
-    ///
-    /// The current `nsteps`.
-    pub fn nsteps(&self) -> f64 {
-        self.nsteps
+    /// The provider.
+    #[cfg(test)]
+    fn fixed(inner: C, nsteps: f64) -> Self {
+        Self {
+            nsteps,
+            adapt: false,
+            ..Self::new(inner)
+        }
     }
 
     /// Move `nsteps` towards the size that costs least.
@@ -883,9 +777,8 @@ impl<C> EllipsoidBounds<C> {
     /// total is a bowl. So both costs are tracked as running averages and the
     /// schedule walks downhill on their difference, which for a trade-off of
     /// this shape puts the resting point at the bottom of the bowl. It lands at
-    /// `nsteps` near 60 on the fixtures in
-    /// [`EllipsoidBoundsParams::default`], where the fixed-value sweep has its
-    /// floor at 48.
+    /// `nsteps` near 60 on the fixtures in [`DEFAULT_NSTEPS`], where the
+    /// fixed-value sweep has its floor at 48.
     ///
     /// Rounds offering less than `ADAPT_MIN_CHUNKS` chunks are ignored: the
     /// tail of every star is such a round and it reads as maximally deep
@@ -897,7 +790,7 @@ impl<C> EllipsoidBounds<C> {
     /// * `walked` - Pairs the previous round's walk scored
     /// * `offered` - Pairs this round offered
     fn adapt(&mut self, bounded: usize, walked: usize, offered: usize) {
-        if !self.params.adapt || offered < ADAPT_MIN_CHUNKS * BOUND_WALK_CHUNK {
+        if !self.adapt || offered < ADAPT_MIN_CHUNKS * BOUND_WALK_CHUNK {
             return;
         }
         self.cost_bounded += COST_DECAY * (bounded as f64 - self.cost_bounded);
@@ -936,9 +829,6 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
 
         let p = round.n_features;
         let nc = round.members.len() as f64;
-        self.stats.rounds += 1;
-        self.stats.offered += self.raw.len();
-        self.stats.walked += round.scored_last_round;
 
         // The first round of a star, whoever owned this provider before. No
         // ancestor exists yet exactly then, and node ids restart with the star,
@@ -975,7 +865,6 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
             self.path_m = 0.0;
             self.path_w = 0.0;
             self.anchored = true;
-            self.stats.refreshes += 1;
         }
         self.prev_m.clear();
         self.prev_m.extend_from_slice(round.centre_means);
@@ -1006,7 +895,6 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
             .collect();
         self.metric_w = metric_w;
         let scored = scored?;
-        self.stats.bounded += scored.len();
         self.adapt(scored.len(), round.scored_last_round, self.raw.len());
 
         for (&(i, j), &bound) in missing.iter().zip(scored.iter()) {
@@ -1043,10 +931,6 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
             out.push((i, j));
             self.emitted.push(bound);
         }
-
-        if self.params.verify {
-            self.check(&round)?;
-        }
         Ok(())
     }
 
@@ -1074,84 +958,6 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
     }
 }
 
-impl<C> EllipsoidBounds<C> {
-    /// Score every emitted pair and check it against its recorded bound.
-    ///
-    /// The property the whole scheme rests on, measured rather than assumed.
-    /// Only runs under [`EllipsoidBoundsParams::verify`], and does not change
-    /// what is emitted.
-    ///
-    /// ### Params
-    ///
-    /// * `round` - The round's view of the star
-    ///
-    /// ### Returns
-    ///
-    /// Nothing, or the error the branch-length solve failed with.
-    fn check<T: BonsaiFloat>(&mut self, round: &Round<'_, T>) -> Result<(), BonsaiErrors> {
-        let p = round.n_features;
-        // Non-finite gains become minus infinity, which is what the primitive
-        // does with them, so the replay below orders pairs the same way it
-        // would and no comparison ever sees a `NaN`.
-        let gains: Vec<f64> = self
-            .order
-            .par_iter()
-            .map_init(
-                || PairScratch::new(p),
-                |scratch, &(_, _, _, i, j)| {
-                    round.score_pair(i, j, scratch).map(|score| {
-                        if score.gain.is_finite() {
-                            score.gain
-                        } else {
-                            f64::NEG_INFINITY
-                        }
-                    })
-                },
-            )
-            .collect::<Result<Vec<_>, BonsaiErrors>>()?;
-
-        for (gain, &bound) in gains.iter().zip(self.emitted.iter()) {
-            if *gain == f64::NEG_INFINITY {
-                continue;
-            }
-            self.stats.checked += 1;
-            let excess = gain - bound;
-            if excess > 0.0 {
-                self.stats.violations += 1;
-                self.stats.worst_violation = self.stats.worst_violation.max(excess);
-            }
-        }
-
-        // Replay the primitive's walk over the emitted order and see whether it
-        // would have stopped on the round's true best. This is the only thing a
-        // violation can actually cost.
-        let key = |i: usize| {
-            (
-                gains[i],
-                std::cmp::Reverse((self.order[i].1, self.order[i].2)),
-            )
-        };
-        let better = |a: usize, b: usize| if key(b) > key(a) { b } else { a };
-        let mut best = 0usize;
-        let mut done = 0usize;
-        while done < gains.len() {
-            if gains[best] > self.emitted[done] && done > 0 {
-                break;
-            }
-            let end = (done + BOUND_WALK_CHUNK).min(gains.len());
-            for i in done..end {
-                best = better(best, i);
-            }
-            done = end;
-        }
-        let truth = (0..gains.len()).fold(0usize, better);
-        if key(best) != key(truth) {
-            self.stats.misses += 1;
-        }
-        Ok(())
-    }
-}
-
 ///////////
 // Tests //
 ///////////
@@ -1163,6 +969,7 @@ mod tests {
     use crate::search::candidates::{KnnCandidates, KnnCandidatesParams};
     use crate::search::star::{AllPairs, Star, StarParams, StarResult, resolve_star_with};
     use crate::utils::rng::SplitMix64;
+    use crate::utils::verbosity::Verbosity;
 
     /// A star of clustered members with unequal precisions and branches.
     ///
@@ -1440,6 +1247,7 @@ mod tests {
             },
             Some(params),
             provider,
+            Verbosity::Quiet,
         )
         .expect("star")
     }
@@ -1486,23 +1294,12 @@ mod tests {
                     let (m, w, branch) = star_fixture(n, p, seed);
                     let params = StarParams::default();
                     let base = run(&m, &w, &branch, p, params, &mut AllPairs);
-                    let mut bounded = EllipsoidBounds::new(
-                        AllPairs,
-                        Some(EllipsoidBoundsParams {
-                            nsteps,
-                            adapt: false,
-                            verify: false,
-                        }),
-                    );
+                    let mut bounded = EllipsoidBounds::fixed(AllPairs, nsteps);
                     let got = run(&m, &w, &branch, p, params, &mut bounded);
                     assert_same(
                         &base,
                         &got,
                         &format!("n {n}, p {p}, seed {seed:x}, nsteps {nsteps}"),
-                    );
-                    assert!(
-                        bounded.stats().refreshes >= 1,
-                        "n {n} nsteps {nsteps}: never anchored"
                     );
                 }
             }
@@ -1517,7 +1314,7 @@ mod tests {
             let (m, w, branch) = star_fixture(n, p, seed);
             let params = StarParams::default();
             let base = run(&m, &w, &branch, p, params, &mut AllPairs);
-            let mut bounded = EllipsoidBounds::new(AllPairs, None);
+            let mut bounded = EllipsoidBounds::new(AllPairs);
             let got = run(&m, &w, &branch, p, params, &mut bounded);
             assert_same(&base, &got, &format!("adaptive, seed {seed:x}"));
         }
@@ -1542,93 +1339,16 @@ mod tests {
                 params,
                 &mut KnnCandidates::new(Some(knn)),
             );
-            let mut bounded =
-                EllipsoidBounds::new(KnnCandidates::new(Some(knn)), Some(Default::default()));
+            let mut bounded = EllipsoidBounds::new(KnnCandidates::new(Some(knn)));
             let got = run(&m, &w, &branch, p, params, &mut bounded);
             assert_same(&base, &got, &format!("knn composition, seed {seed:x}"));
-            assert!(bounded.stats().work_fraction() < 1.0);
-        }
-    }
-
-    /// The property the whole scheme rests on, quantified rather than assumed.
-    ///
-    /// **Violations are real and this test does not pretend otherwise.** The
-    /// rate and the diagnosis are in [`EllipsoidBoundsParams::default`]. What
-    /// is asserted here is the two things that must hold: they are rare, and
-    /// they never change which pair the walk picks. A regression that made the
-    /// bound wrong rather than merely soft would break the second long before
-    /// it broke the first.
-    #[test]
-    fn test_no_true_gain_exceeds_its_bound() {
-        let mut checked = 0usize;
-        let mut violations = 0usize;
-        let mut misses = 0usize;
-        let mut worst = 0.0f64;
-        for &(n, p) in &[(24usize, 24usize), (40, 48)] {
-            for seed in [0x71u64, 0x82, 0x93] {
-                for nsteps in [1.0f64, 8.0, 64.0, 512.0] {
-                    let (m, w, branch) = star_fixture(n, p, seed);
-                    let mut bounded = EllipsoidBounds::new(
-                        AllPairs,
-                        Some(EllipsoidBoundsParams {
-                            nsteps,
-                            adapt: false,
-                            verify: true,
-                        }),
-                    );
-                    run(&m, &w, &branch, p, StarParams::default(), &mut bounded);
-                    let s = bounded.stats();
-                    checked += s.checked;
-                    violations += s.violations;
-                    misses += s.misses;
-                    worst = worst.max(s.worst_violation);
-                }
-            }
-        }
-        assert!(checked > 10_000, "only {checked} bound checks made");
-        assert_eq!(
-            misses, 0,
-            "the walk would have stopped on the wrong pair in {misses} rounds"
-        );
-        assert!(
-            violations * 100 < checked,
-            "{violations} of {checked} true gains exceeded their bound, worst by {worst:e}: \
-             that is over one per cent and far past the one in a thousand measured"
-        );
-    }
-
-    /// Redrawing every round makes the bounds exact, so nothing can exceed one.
-    ///
-    /// The control for the test above: it separates "the linearisation is
-    /// stretched too far" from "the derivative is wrong".
-    #[test]
-    fn test_bounds_are_exact_when_they_are_never_stretched() {
-        for seed in [0x71u64, 0x82, 0x93] {
-            let (n, p) = (32, 40);
-            let (m, w, branch) = star_fixture(n, p, seed);
-            let mut bounded = EllipsoidBounds::new(
-                AllPairs,
-                Some(EllipsoidBoundsParams {
-                    nsteps: 0.0,
-                    adapt: false,
-                    verify: true,
-                }),
-            );
-            run(&m, &w, &branch, p, StarParams::default(), &mut bounded);
-            let s = bounded.stats();
-            assert_eq!(s.refreshes, s.rounds);
-            assert_eq!(
-                s.violations, 0,
-                "{} of {} exceeded a bound that was redrawn every round",
-                s.violations, s.checked
-            );
         }
     }
 
     /// The refresh path has to be exercised, not accidentally never taken.
     ///
     /// A tiny ellipsoid leaves it every round; a huge one never does. Both must
-    /// build the same tree, and the small one must actually refresh.
+    /// build the same tree.
     #[test]
     fn test_the_refresh_path_is_taken_and_is_correct() {
         let (n, p) = (32, 32);
@@ -1636,60 +1356,13 @@ mod tests {
         let params = StarParams::default();
         let base = run(&m, &w, &branch, p, params, &mut AllPairs);
 
-        let mut tight = EllipsoidBounds::new(
-            AllPairs,
-            Some(EllipsoidBoundsParams {
-                nsteps: 1e-6,
-                adapt: false,
-                verify: false,
-            }),
-        );
+        let mut tight = EllipsoidBounds::fixed(AllPairs, 1e-6);
         let got = run(&m, &w, &branch, p, params, &mut tight);
         assert_same(&base, &got, "tight ellipsoid");
-        let s = tight.stats();
-        assert_eq!(
-            s.refreshes, s.rounds,
-            "a tiny ellipsoid must refresh always"
-        );
 
-        let mut loose = EllipsoidBounds::new(
-            AllPairs,
-            Some(EllipsoidBoundsParams {
-                nsteps: 1e12,
-                adapt: false,
-                verify: false,
-            }),
-        );
+        let mut loose = EllipsoidBounds::fixed(AllPairs, 1e12);
         let got = run(&m, &w, &branch, p, params, &mut loose);
         assert_same(&base, &got, "loose ellipsoid");
-        assert_eq!(
-            loose.stats().refreshes,
-            1,
-            "a huge ellipsoid must anchor once"
-        );
-    }
-
-    /// The saving, which is the entire justification for the module.
-    #[test]
-    fn test_the_bounds_cut_the_pairs_scored() {
-        // Loose against the numbers in `EllipsoidBoundsParams::default`, which
-        // are 0.207 at 64 members and 0.108 at 128 with more features. This is
-        // a regression guard on the saving existing at all, not a restatement
-        // of the measurement.
-        for &(n, want) in &[(48usize, 0.45f64), (96, 0.30), (192, 0.15)] {
-            let p = 64;
-            let (m, w, branch) = star_fixture(n, p, 0x9001);
-            let mut bounded = EllipsoidBounds::new(AllPairs, None);
-            run(&m, &w, &branch, p, StarParams::default(), &mut bounded);
-            let s = bounded.stats();
-            assert!(
-                s.work_fraction() < want,
-                "{n} members: scored {} of {} offered, fraction {:.3}, wanted under {want}",
-                s.bounded + s.walked,
-                s.offered,
-                s.work_fraction()
-            );
-        }
     }
 
     /// The winner cannot depend on how rayon split the work.
@@ -1704,7 +1377,7 @@ mod tests {
                 .build()
                 .expect("pool");
             let got = pool.install(|| {
-                let mut bounded = EllipsoidBounds::new(AllPairs, None);
+                let mut bounded = EllipsoidBounds::new(AllPairs);
                 run(&m, &w, &branch, p, StarParams::default(), &mut bounded)
             });
             match &reference {
@@ -1723,7 +1396,7 @@ mod tests {
     #[test]
     fn test_one_instance_over_two_stars() {
         let p = 32;
-        let mut shared = EllipsoidBounds::new(AllPairs, None);
+        let mut shared = EllipsoidBounds::new(AllPairs);
         for seed in [0x1111u64, 0x2222] {
             for n in [20usize, 28] {
                 let (m, w, branch) = star_fixture(n, p, seed);
@@ -1746,16 +1419,15 @@ mod tests {
         let (m, w, branch) = star_fixture(4, p, 0x2468);
         let params = StarParams::default();
         let base = run(&m, &w, &branch, p, params, &mut AllPairs);
-        let mut bounded = EllipsoidBounds::new(AllPairs, None);
+        let mut bounded = EllipsoidBounds::new(AllPairs);
         let got = run(&m, &w, &branch, p, params, &mut bounded);
         assert_same(&base, &got, "four members");
 
         // Three members is already resolved, so no round ever runs.
         let (m, w, branch) = star_fixture(3, p, 0x2468);
-        let mut bounded = EllipsoidBounds::new(AllPairs, None);
+        let mut bounded = EllipsoidBounds::new(AllPairs);
         let got = run(&m, &w, &branch, p, params, &mut bounded);
         assert!(got.merges.is_empty());
-        assert_eq!(bounded.stats().rounds, 0);
     }
 
     /// Every pair scoring identically is where a non-strict stopping rule would
@@ -1776,7 +1448,7 @@ mod tests {
             ..StarParams::default()
         };
         let base = run(&m, &w, &branch, p, params, &mut AllPairs);
-        let mut bounded = EllipsoidBounds::new(AllPairs, None);
+        let mut bounded = EllipsoidBounds::new(AllPairs);
         let got = run(&m, &w, &branch, p, params, &mut bounded);
         assert_same(&base, &got, "identical members");
     }
@@ -1795,9 +1467,9 @@ mod tests {
             n_features: p,
         };
         let params = Some(StarParams::default());
-        let base = resolve_star_with(star, params, &mut AllPairs).expect("base");
-        let mut bounded = EllipsoidBounds::new(AllPairs, None);
-        let got = resolve_star_with(star, params, &mut bounded).expect("bounded");
+        let base = resolve_star_with(star, params, &mut AllPairs, Verbosity::Quiet).expect("base");
+        let mut bounded = EllipsoidBounds::new(AllPairs);
+        let got = resolve_star_with(star, params, &mut bounded, Verbosity::Quiet).expect("bounded");
         assert_eq!(base.parent, got.parent);
         assert_eq!(base.centre_children, got.centre_children);
     }

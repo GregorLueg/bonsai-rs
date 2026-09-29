@@ -10,6 +10,7 @@ use crate::tree::Tree;
 use crate::utils::kernels::prune_general;
 use crate::utils::simd::prune_binary;
 use crate::utils::traits::BonsaiFloat;
+use rayon::prelude::*;
 
 ///////////////
 // NodeState //
@@ -44,8 +45,6 @@ pub struct NodeState<T> {
     /// by summing these where it agrees and recomputing where it does not,
     /// which is what search step 5 does with its candidates.
     contrib: Vec<f64>,
-    /// Scratch for the polytomy path, grown on demand.
-    scratch: Vec<f64>,
 }
 
 impl<T: BonsaiFloat> NodeState<T> {
@@ -101,7 +100,6 @@ impl<T: BonsaiFloat> NodeState<T> {
             n_nodes,
             n_leaf_rows,
             contrib: vec![0.0; n_nodes],
-            scratch: Vec::new(),
         })
     }
 
@@ -162,17 +160,17 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// Run the pruning recursion over the whole tree and return its
     /// loglikelihood.
     ///
-    /// Sequential, and measurement says it should stay that way: the prune
-    /// kernels and the up-sweep together are 2.8 per cent of busy thread time
-    /// over a whole run at 5,000 cells, sampled 2026-09-24, so parallelising
-    /// this cannot matter. Walks levels from the leaves up and, within a level,
-    /// ascending node index, which the arena invariant makes a valid post-order.
+    /// Walks levels from the leaves up. The nodes of one level are pruned in
+    /// parallel: each writes its own row, the level's rows are contiguous, and
+    /// every row a level reads lies below it, which the arena invariant
+    /// guarantees. Measured 2026-09-27 at 10,000 cells by 2,767 features, the
+    /// sequential prune was three quarters of the global branch solve (steps
+    /// 4, 7 and 8), 0.16 s a call.
     ///
-    /// Per-node contributions are summed within a level and only then added to
-    /// the running total, which keeps the association fixed to the tree so that
-    /// this routine's own answer does not depend on how the levels happen to be
-    /// walked. That is what makes this routine's answer a property of the tree
-    /// rather than of the traversal.
+    /// Per-node contributions are summed within a level, in ascending node
+    /// index, and only then added to the running total, which keeps the
+    /// association fixed to the tree: the answer is the same bits whatever the
+    /// thread count.
     ///
     /// ### Params
     ///
@@ -206,20 +204,29 @@ impl<T: BonsaiFloat> NodeState<T> {
             "this state was filled with {} leaf rows",
             self.n_leaf_rows
         );
+        let p = self.p;
         let mut total = 0.0f64;
         for level in 0..tree.n_levels() {
             let (start, end) = tree.level(level);
+            let (m_lo, m_hi) = self.m.split_at_mut(start * p);
+            let (w_lo, w_hi) = self.w.split_at_mut(start * p);
+            let (m_lo, w_lo) = (&*m_lo, &*w_lo);
+            m_hi[..(end - start) * p]
+                .par_chunks_mut(p)
+                .zip(w_hi[..(end - start) * p].par_chunks_mut(p))
+                .zip(self.contrib[start..end].par_iter_mut())
+                .enumerate()
+                .for_each_init(Vec::new, |scratch, (i, ((m_out, w_out), here))| {
+                    *here = prune_node(
+                        tree,
+                        (start + i) as u32,
+                        (m_lo, w_lo),
+                        (m_out, w_out),
+                        scratch,
+                    );
+                });
             let mut level_total = 0.0f64;
-            for node in start..end {
-                let here = prune_node_into(
-                    tree,
-                    node as u32,
-                    self.p,
-                    &mut self.m,
-                    &mut self.w,
-                    &mut self.scratch,
-                );
-                self.contrib[node] = here;
+            for &here in &self.contrib[start..end] {
                 level_total += here;
             }
             total += level_total;
@@ -232,42 +239,33 @@ impl<T: BonsaiFloat> NodeState<T> {
 // Per-node dispatch //
 ///////////////////////
 
-/// Prune one internal node into a slab, reading its children's settled rows.
+/// Prune one internal node, reading its children's settled rows.
 ///
-/// A "row" here is `[node][feature]` over all `p` features. This is written
-/// against a slab of equal-length rows indexed by node rather than against
-/// `NodeState` itself, which is what let a second layout share it; that layout
-/// is gone, but the shape is still the right one to write the dispatch between
-/// the binary and polytomy kernels against. The traversal order and the order
-/// the per-node contributions are summed in stay each module's own business,
-/// which is what makes the two independent enough to cross-check.
+/// The dispatch between the binary and polytomy kernels, against a slab of
+/// equal-length rows indexed by node.
 ///
 /// ### Params
 ///
 /// * `tree` - Tree whose topology and branch lengths to use
 /// * `node` - Internal node to settle
-/// * `len` - Row stride, that is, features per node in this slab
-/// * `m` - Effective means slab, `node`'s row written in place
-/// * `w` - Effective precisions slab, same
+/// * `below` - Means and precisions slabs holding at least every row below
+///   `node`, `[node][feature]`
+/// * `out` - The node's own means and precisions rows, written
 /// * `scratch` - Polytomy scratch, grown on demand and reused across calls
 ///
 /// ### Returns
 ///
 /// The node's loglikelihood contribution.
-pub(crate) fn prune_node_into<T: BonsaiFloat>(
+fn prune_node<T: BonsaiFloat>(
     tree: &Tree,
     node: u32,
-    len: usize,
-    m: &mut [T],
-    w: &mut [T],
+    below: (&[T], &[T]),
+    out: (&mut [T], &mut [T]),
     scratch: &mut Vec<f64>,
 ) -> f64 {
-    let split = node as usize * len;
-    let (m_lo, m_hi) = m.split_at_mut(split);
-    let (w_lo, w_hi) = w.split_at_mut(split);
-    let m_out = &mut m_hi[..len];
-    let w_out = &mut w_hi[..len];
-
+    let (m_lo, w_lo) = below;
+    let (m_out, w_out) = out;
+    let len = m_out.len();
     let kids = tree.children(node);
     match kids.len() {
         2 => {

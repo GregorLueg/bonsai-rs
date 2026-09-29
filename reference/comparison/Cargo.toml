@@ -8,7 +8,8 @@ publish = false
 [workspace]
 
 [dependencies]
-bonsai-rs = { path = "../.." }
+bonsai-rs = { path = "../..", features = ["sanity"] }
+sanity-sc-rs = "0.1.0"
 
 [[bin]]
 name = "harness"

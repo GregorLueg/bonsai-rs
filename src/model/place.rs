@@ -1,8 +1,7 @@
 //! Placing a node on an existing tree.
 //!
-//! Used twice by the search: regrafting the pruned subtree of an SPR move,
-//! and adding a cell to an existing backbone. Both reduce to the same question,
-//! "which node of this tree should `q` hang off", so both go through [`place`].
+//! Used by the search to regraft the pruned subtree of an SPR move: "which
+//! node of this tree should `q` hang off".
 //!
 //! ### Why the score is an ordinary edge
 //!
@@ -60,11 +59,7 @@ const DEFAULT_TOLERANCE: f64 = 4.0;
 ///
 /// Eight ships because on the shape that fails it is nearly free, and what it
 /// costs on the shapes that do not fail is a handful of extra node scores per
-/// query. A caller placing millions of cells against a fixed backbone, and
-/// willing to accept the ladder case, can drop it to one through
-/// [`PlacementParams::n_starts`]. Eight is also roughly `log2(n)` over the few
-/// hundred nodes a backbone round works with, the same order as the `log(n)`
-/// the paper describes.
+/// query.
 const DEFAULT_STARTS: usize = 8;
 
 /// Tuning knobs for the beam search of SPEC.md section 7.2.
@@ -80,27 +75,6 @@ pub struct PlacementParams {
     /// Number of start points, clamped to at least one and at most the node
     /// count.
     pub n_starts: usize,
-}
-
-impl PlacementParams {
-    /// Build parameters explicitly.
-    ///
-    /// ### Params
-    ///
-    /// * `tolerance` - Beam tolerance in nats; `0.0` for greedy hill-climbing,
-    ///   `f64::INFINITY` for an exhaustive scan
-    /// * `n_starts` - Number of start points; clamped into `1..=n_nodes` by
-    ///   [`start_points`]
-    ///
-    /// ### Returns
-    ///
-    /// The parameters.
-    pub fn new(tolerance: f64, n_starts: usize) -> Self {
-        Self {
-            tolerance,
-            n_starts,
-        }
-    }
 }
 
 impl Default for PlacementParams {
@@ -287,9 +261,9 @@ fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
 /// are everything outside a node's subtree, positioned at the node's *parent*
 /// and not diffused along the branch above it, so a caller who passes them
 /// straight in is wrong on two counts. The composition that is right is
-/// `model::global::collapse_onto_every_node`, which is what
-/// `backbone` hands in; `search::spr` forms the same rows one node at a time
-/// rather than all at once, because a proposal reads a few dozen of them.
+/// `model::global::collapse_onto_every_node`; `search::spr` forms the same
+/// rows one node at a time rather than all at once, because a proposal reads a
+/// few dozen of them.
 ///
 /// A plain closure is used rather than a trait because the provider is free to
 /// store the sweep in whatever layout suits it, needs no wrapper type, and the
@@ -318,23 +292,80 @@ pub fn place<'a, T: BonsaiFloat, F>(
 where
     F: Fn(u32) -> EffLeaf<'a, T>,
 {
+    place_walk(tree, q, eff, params)
+}
+
+/// What the beam search needs from the tree it walks.
+///
+/// A [`Tree`] is one. The other is a tree that exists only as a view, the one
+/// an SPR cut would leave behind, walked in the original tree's node ids
+/// without being built; see [`crate::search::masked`]. Both have to present
+/// the same start points and the same neighbour order, since the search's
+/// answer depends on both.
+pub(crate) trait Walk {
+    /// Size of the node id space, for the visited set.
+    fn id_space(&self) -> usize;
+    /// The spread start points, root first; [`start_points`] for a tree.
+    fn spread_starts(&self, n_starts: usize) -> Vec<u32>;
+    /// A node's children in arena order, then its parent.
+    fn neighbours(&self, node: u32, out: &mut Vec<u32>);
+}
+
+impl Walk for Tree {
+    fn id_space(&self) -> usize {
+        self.n_nodes()
+    }
+
+    fn spread_starts(&self, n_starts: usize) -> Vec<u32> {
+        start_points(self, n_starts)
+    }
+
+    fn neighbours(&self, node: u32, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend(neighbours(self, node));
+    }
+}
+
+/// [`place`] over anything the search can walk.
+///
+/// ### Params
+///
+/// * `walk` - The tree, or a view of one
+/// * `q` - Effective leaf summarising the node being attached
+/// * `eff` - Effective leaf of the whole tree seen from each node
+/// * `params` - Search parameters, or `None` for [`PlacementParams::default`]
+///
+/// ### Returns
+///
+/// As [`place`], with the node in the walk's own ids.
+pub(crate) fn place_walk<'a, T: BonsaiFloat, F, W: Walk>(
+    walk: &W,
+    q: EffLeaf<'_, T>,
+    eff: F,
+    params: Option<PlacementParams>,
+) -> Result<Placement, BonsaiErrors>
+where
+    F: Fn(u32) -> EffLeaf<'a, T>,
+{
     let params = params.unwrap_or_default();
     let p = q.m.len();
     let mut s = vec![0.0f64; p];
     let mut d = vec![0.0f64; p];
 
-    let mut visited = vec![false; tree.n_nodes()];
+    let mut visited = vec![false; walk.id_space()];
     let mut stack: Vec<u32> = Vec::new();
+    let mut around: Vec<u32> = Vec::new();
+    let spread = walk.spread_starts(params.n_starts);
     // The root is always the first start point and is therefore always scored,
     // so this placeholder is always overwritten before it is returned.
     let mut best = Placement {
-        node: tree.root(),
+        node: spread[0],
         branch: 0.0,
         loglik: f64::NEG_INFINITY,
         scored: 0,
     };
 
-    for start in start_points(tree, params.n_starts) {
+    for start in spread {
         if visited[start as usize] {
             continue;
         }
@@ -349,7 +380,8 @@ where
         stack.push(start);
 
         while let Some(a) = stack.pop() {
-            for nb in neighbours(tree, a) {
+            walk.neighbours(a, &mut around);
+            for &nb in &around {
                 if visited[nb as usize] {
                     continue;
                 }
@@ -634,7 +666,10 @@ mod tests {
                     &fix.tree,
                     q,
                     |a| fix.eff(a),
-                    Some(PlacementParams::new(f64::INFINITY, 3)),
+                    Some(PlacementParams {
+                        tolerance: f64::INFINITY,
+                        n_starts: 3,
+                    }),
                 )
                 .expect("placement");
                 assert_eq!(got.node, node);
@@ -679,14 +714,20 @@ mod tests {
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(0.0, 1)),
+                Some(PlacementParams {
+                    tolerance: 0.0,
+                    n_starts: 1,
+                }),
             )
             .expect("placement");
             let many = place(
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(0.0, 8)),
+                Some(PlacementParams {
+                    tolerance: 0.0,
+                    n_starts: 8,
+                }),
             )
             .expect("placement");
             assert!(
@@ -760,7 +801,10 @@ mod tests {
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(tolerance, 4)),
+                Some(PlacementParams {
+                    tolerance,
+                    n_starts: 4,
+                }),
             )
             .expect("placement");
             if let Some(prev) = previous {
@@ -798,7 +842,10 @@ mod tests {
             &fix.tree,
             q,
             |a| fix.eff(a),
-            Some(PlacementParams::new(0.0, 1)),
+            Some(PlacementParams {
+                tolerance: 0.0,
+                n_starts: 1,
+            }),
         )
         .expect("placement");
         assert!(greedy.scored < fix.tree.n_nodes());
@@ -831,7 +878,10 @@ mod tests {
             &fix.tree,
             q,
             |a| fix.eff(a),
-            Some(PlacementParams::new(f64::INFINITY, 2)),
+            Some(PlacementParams {
+                tolerance: f64::INFINITY,
+                n_starts: 2,
+            }),
         )
         .expect("placement");
         assert_eq!(exhaustive.scored, 3);
@@ -855,7 +905,10 @@ mod tests {
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(f64::INFINITY, 1)),
+                Some(PlacementParams {
+                    tolerance: f64::INFINITY,
+                    n_starts: 1,
+                }),
             )
             .expect("placement");
             assert_eq!(got.scored, 7);
@@ -908,7 +961,10 @@ mod tests {
             &fix.tree,
             q,
             |a| fix.eff(a),
-            Some(PlacementParams::new(f64::INFINITY, 1)),
+            Some(PlacementParams {
+                tolerance: f64::INFINITY,
+                n_starts: 1,
+            }),
         )
         .expect("placement");
         for n_starts in [2usize, 5, 31, 1000] {
@@ -916,7 +972,10 @@ mod tests {
                 &fix.tree,
                 q,
                 |a| fix.eff(a),
-                Some(PlacementParams::new(f64::INFINITY, n_starts)),
+                Some(PlacementParams {
+                    tolerance: f64::INFINITY,
+                    n_starts,
+                }),
             )
             .expect("placement");
             assert_eq!(got.node, reference.node);

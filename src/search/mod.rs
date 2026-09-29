@@ -11,6 +11,8 @@ use std::collections::VecDeque;
 
 pub mod bounds;
 pub mod candidates;
+pub(crate) mod live;
+pub(crate) mod masked;
 pub mod nni;
 pub mod polytomy;
 pub mod spr;
@@ -170,7 +172,43 @@ pub(crate) fn split_fingerprint(tree: &Tree) -> u64 {
 /// ### Returns
 ///
 /// The fingerprint.
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn split_fingerprint_with(tree: &Tree, word: &[u64]) -> u64 {
+    split_fingerprint_counted(tree, word, &leaves_below(tree))
+}
+
+/// One split's term in [`split_fingerprint_with`].
+///
+/// The split's leaf word canonicalised against its complement, so either side
+/// names it, then mixed. The fingerprint is the wrapping sum of these over the
+/// tree's distinct non-trivial splits, so a caller that knows which splits a
+/// move adds can update a fingerprint without walking the new tree.
+///
+/// ### Params
+///
+/// * `here` - Leaf word of one side of the split
+/// * `total` - Leaf word of every leaf
+///
+/// ### Returns
+///
+/// The split's term.
+#[inline]
+pub(crate) fn split_hash(here: u64, total: u64) -> u64 {
+    SplitMix64::new(here.min(total.wrapping_sub(here))).next_u64()
+}
+
+/// [`split_fingerprint_with`] over leaf counts the caller has as well.
+///
+/// ### Params
+///
+/// * `tree` - Tree to fingerprint
+/// * `word` - Its [`leaf_words`]
+/// * `below` - Its [`leaves_below`]
+///
+/// ### Returns
+///
+/// The fingerprint.
+pub(crate) fn split_fingerprint_counted(tree: &Tree, word: &[u64], below: &[usize]) -> u64 {
     let root = tree.root();
     let total = word[root as usize];
     let root_kids = tree.children(root);
@@ -180,8 +218,6 @@ pub(crate) fn split_fingerprint_with(tree: &Tree, word: &[u64]) -> u64 {
         crate::tree::NO_NODE
     };
 
-    // Leaf counts, to drop the splits that carry no information.
-    let below = leaves_below(tree);
     let n_leaves = tree.n_leaves();
 
     tree.internal_postorder()
@@ -196,9 +232,7 @@ pub(crate) fn split_fingerprint_with(tree: &Tree, word: &[u64]) -> u64 {
             here >= 2 && n_leaves - here >= 2
         })
         .fold(0u64, |acc, node| {
-            let here = word[node as usize];
-            let split = here.min(total.wrapping_sub(here));
-            acc.wrapping_add(SplitMix64::new(split).next_u64())
+            acc.wrapping_add(split_hash(word[node as usize], total))
         })
 }
 

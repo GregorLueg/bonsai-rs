@@ -58,11 +58,11 @@ first call to cap it; after that it's fixed.
 
 ## Large datasets
 
-The largest run measured is 10,000 cells by 2,767 genes of Sanity-preprocessed
-Baron pancreas in 210 seconds; see the [comparison](https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md).
+On a ten-core laptop the search takes 72 seconds on 10,000 cells by 2,767 genes
+of Sanity-preprocessed Baron pancreas and 208 seconds on 25,000 by 2,846; a
+synthetic 65,536 cells by 1,000 features takes 226 seconds. See the
+[comparison](https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md).
 
-Beyond that, `backbone` reconstructs on a random subset (`backbone_cells`,
-default 2048), places every other cell onto it and refines the whole tree.
 
 ## The start tree
 
@@ -76,3 +76,17 @@ build the best tree.
 Tell you your data isn't a tree. A cycle gets cut somewhere and drawn as two
 branches with confident lengths. Look at the data before you believe the
 picture.
+
+## Plotting
+
+`BonsaiResult.plot` draws the radial layout with matplotlib, needing the
+`plot` extra (`pip install bonsai-rs[plot]`):
+
+```python
+res = bs.bonsai(sim.means, sim.sds)
+fig, ax = res.plot(colours=cluster_labels)
+```
+
+`colours` is one value per leaf, in leaf order; numeric arrays go through a
+colormap, anything else gets a discrete palette. For a custom layout or
+figure, call `layout` directly and draw it yourself.

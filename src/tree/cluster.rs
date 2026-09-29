@@ -87,7 +87,7 @@ pub const ROOT_SPLIT: f64 = 0.5;
 // Clustering //
 ////////////////
 
-/// A partition of the leaves into clusters, and what it cost.
+/// A partition of the leaves into clusters.
 ///
 /// Clusters are numbered by decreasing leaf count, ties broken by the smallest
 /// leaf index they contain, so the numbering is a function of the tree alone.
@@ -101,66 +101,7 @@ pub struct Clustering {
     pub centres: Vec<u32>,
     /// Leaf count of each cluster.
     pub sizes: Vec<usize>,
-    /// Nodes whose upstream branch was cut, in the order they were cut. One
-    /// shorter than the cluster count.
-    pub cuts: Vec<u32>,
-    /// Summed within-cluster pairwise leaf distance, the quantity the cutting
-    /// minimises.
-    pub objective: f64,
 }
-
-impl Clustering {
-    /// Number of clusters.
-    ///
-    /// ### Returns
-    ///
-    /// The cluster count, always at least one.
-    #[inline]
-    pub fn n_clusters(&self) -> usize {
-        self.centres.len()
-    }
-}
-
-///////////////////
-// The objective //
-///////////////////
-
-/// Summed pairwise distance between every pair of leaves of a tree.
-///
-/// The `a * b` form derived in the module docs, so one pass over the arena
-/// rather than the `O(n^2)` double loop over leaf pairs.
-///
-/// ### Params
-///
-/// * `tree` - Tree to measure
-///
-/// ### Returns
-///
-/// `sum_{i < j} d(i, j)` over the leaves, zero for a tree with one leaf.
-pub fn summed_leaf_distance(tree: &Tree) -> f64 {
-    let n_nodes = tree.n_nodes();
-    let n_leaves = tree.n_leaves();
-    let mut below = vec![0u32; n_nodes];
-    for (i, slot) in below.iter_mut().enumerate() {
-        *slot = u32::from(i < n_leaves);
-    }
-    // Ascending index order is a post-order (module docs of `crate::tree`), so
-    // one forward scan settles every count and accumulates the sum on the way.
-    let mut total = 0.0f64;
-    for v in 0..n_nodes {
-        let Some(p) = tree.parent(v as u32) else {
-            continue;
-        };
-        let a = f64::from(below[v]);
-        total += tree.branch(v as u32) * a * (n_leaves as f64 - a);
-        below[p as usize] += below[v];
-    }
-    total
-}
-
-////////////////
-// Clustering //
-////////////////
 
 /// Cluster the leaves by iteratively cutting branches.
 ///
@@ -187,7 +128,7 @@ pub fn summed_leaf_distance(tree: &Tree) -> f64 {
 pub fn cluster(tree: &Tree, n_clusters: usize) -> Clustering {
     let n_leaves = tree.n_leaves();
     let wanted = n_clusters.clamp(1, n_leaves);
-    let (pieces, cuts) = cut_greedily(tree, wanted);
+    let pieces = cut_greedily(tree, wanted);
 
     // Order clusters by decreasing size, ties by the smallest leaf they hold.
     // Both keys are functions of the tree alone, so the numbering is too.
@@ -201,7 +142,6 @@ pub fn cluster(tree: &Tree, n_clusters: usize) -> Clustering {
     let mut leaf_cluster = vec![0u32; n_leaves];
     let mut centres = Vec::with_capacity(keyed.len());
     let mut sizes = Vec::with_capacity(keyed.len());
-    let mut objective = 0.0f64;
     for (slot, &(size, _, i)) in keyed.iter().enumerate() {
         let piece = &pieces[i];
         for &v in &piece.nodes {
@@ -211,30 +151,13 @@ pub fn cluster(tree: &Tree, n_clusters: usize) -> Clustering {
         }
         centres.push(piece.centre);
         sizes.push(size);
-        objective += piece.objective;
     }
 
     Clustering {
         leaf_cluster,
         centres,
         sizes,
-        cuts,
-        objective,
     }
-}
-
-/// Nodes spread over the tree by the cutting procedure, one per cluster.
-///
-/// ### Params
-///
-/// * `tree` - Tree to spread points over
-/// * `n_centres` - Requested number of centres, clamped into `1..=n_leaves`
-///
-/// ### Returns
-///
-/// The centres, largest cluster first. Never empty, and never repeats a node.
-pub fn cluster_centres(tree: &Tree, n_centres: usize) -> Vec<u32> {
-    cluster(tree, n_centres).centres
 }
 
 ////////////////////
@@ -516,8 +439,6 @@ struct Piece {
     best: Option<(u32, f64)>,
     /// Node minimising the summed distance to the piece's leaves.
     centre: u32,
-    /// Summed pairwise distance between the leaves it holds.
-    objective: f64,
 }
 
 impl Piece {
@@ -551,12 +472,10 @@ impl Piece {
             first_leaf: u32::MAX,
             best: None,
             centre,
-            objective: 0.0,
         }
     }
 
-    /// Measure the piece: its leaf count, its objective, its centre and its
-    /// best cut.
+    /// Measure the piece: its leaf count, its centre and its best cut.
     ///
     /// Two linear passes over the piece's nodes. Ascending order is a post-order
     /// so the first settles the leaf counts `a` and the downward distance sums
@@ -613,7 +532,6 @@ impl Piece {
             .copied()
             .filter(|&v| v < n_leaves)
             .unwrap_or(u32::MAX);
-        self.objective = 0.0;
         self.best = None;
         let mut centre = top;
         let mut centre_total = f64::INFINITY;
@@ -633,7 +551,6 @@ impl Piece {
             if a == 0.0 || b == 0.0 {
                 continue;
             }
-            self.objective += tree.branch(v) * a * b;
             let up = s.total[v as usize] - s.down[v as usize];
             let cross = b * s.down[v as usize] + a * up;
             if self.best.is_none_or(|(_, seen)| cross > seen) {
@@ -658,14 +575,13 @@ impl Piece {
 ///
 /// ### Returns
 ///
-/// The pieces, measured, and the cut nodes in the order they were cut.
-fn cut_greedily(tree: &Tree, n_clusters: usize) -> (Vec<Piece>, Vec<u32>) {
+/// The pieces, measured.
+fn cut_greedily(tree: &Tree, n_clusters: usize) -> Vec<Piece> {
     let mut scratch = Scratch::new(tree.n_nodes());
     let mut pieces = vec![Piece::whole(tree)];
     pieces[0].analyse(tree, &mut scratch);
 
     let mut cut = vec![false; tree.n_nodes()];
-    let mut cuts = Vec::with_capacity(n_clusters.saturating_sub(1));
     while pieces.len() < n_clusters {
         let mut chosen: Option<(usize, u32, f64)> = None;
         for (i, piece) in pieces.iter().enumerate() {
@@ -685,13 +601,12 @@ fn cut_greedily(tree: &Tree, n_clusters: usize) -> (Vec<Piece>, Vec<u32>) {
         };
 
         cut[node as usize] = true;
-        cuts.push(node);
         let mut below = split_off(tree, &mut pieces[i], node, &cut, &mut scratch);
         pieces[i].analyse(tree, &mut scratch);
         below.analyse(tree, &mut scratch);
         pieces.push(below);
     }
-    (pieces, cuts)
+    pieces
 }
 
 /// Split the subtree below `node` out of a piece.
@@ -751,6 +666,68 @@ mod tests {
     use crate::utils::rng::splitmix64_at;
     use approx::assert_relative_eq;
     use std::collections::BTreeSet;
+
+    /// Summed pairwise distance between every pair of leaves of a tree.
+    ///
+    /// The `a * b` form of the module docs, one pass over the arena.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - Tree to measure
+    ///
+    /// ### Returns
+    ///
+    /// `sum_{i < j} d(i, j)` over the leaves, zero for a tree with one leaf.
+    fn summed_leaf_distance(tree: &Tree) -> f64 {
+        let n_nodes = tree.n_nodes();
+        let n_leaves = tree.n_leaves();
+        let mut below: Vec<u32> = (0..n_nodes).map(|i| u32::from(i < n_leaves)).collect();
+        let mut total = 0.0f64;
+        for v in 0..n_nodes {
+            let Some(p) = tree.parent(v as u32) else {
+                continue;
+            };
+            let a = f64::from(below[v]);
+            total += tree.branch(v as u32) * a * (n_leaves as f64 - a);
+            below[p as usize] += below[v];
+        }
+        total
+    }
+
+    /// Summed within-cluster pairwise leaf distance of a clustering, the
+    /// quantity the cutting minimises.
+    ///
+    /// The same `a * b` form per cluster: a path between two leaves of one
+    /// cluster crosses a branch once for each such pair split by it.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - Tree the clustering came from
+    /// * `c` - The clustering
+    ///
+    /// ### Returns
+    ///
+    /// The objective.
+    fn objective(tree: &Tree, c: &Clustering) -> f64 {
+        let n_nodes = tree.n_nodes();
+        let k = c.sizes.len();
+        let mut below = vec![0u32; n_nodes * k];
+        for (leaf, &g) in c.leaf_cluster.iter().enumerate() {
+            below[leaf * k + g as usize] = 1;
+        }
+        let mut total = 0.0f64;
+        for v in 0..n_nodes {
+            let Some(p) = tree.parent(v as u32) else {
+                continue;
+            };
+            for g in 0..k {
+                let a = f64::from(below[v * k + g]);
+                total += tree.branch(v as u32) * a * (c.sizes[g] as f64 - a);
+                below[p as usize * k + g] += below[v * k + g];
+            }
+        }
+        total
+    }
 
     /// Every leaf-to-leaf distance, the honest `O(n^2)` way.
     ///
@@ -900,8 +877,9 @@ mod tests {
                         }
                     }
                 }
-                assert_relative_eq!(c.objective, slow, max_relative = 1e-12, epsilon = 1e-12);
-                assert!(c.objective <= summed_leaf_distance(&tree) + 1e-9, "{name}");
+                let got = objective(&tree, &c);
+                assert_relative_eq!(got, slow, max_relative = 1e-12, epsilon = 1e-12);
+                assert!(got <= summed_leaf_distance(&tree) + 1e-9, "{name}");
             }
         }
     }
@@ -912,13 +890,13 @@ mod tests {
             let mut previous = f64::INFINITY;
             for k in 1..=tree.n_leaves() {
                 let c = cluster(&tree, k);
-                assert_eq!(c.n_clusters(), k, "{name} at k = {k}");
+                assert_eq!(c.sizes.len(), k, "{name} at k = {k}");
+                let now = objective(&tree, &c);
                 assert!(
-                    c.objective <= previous + 1e-9,
-                    "{name}: objective rose from {previous} to {} at k = {k}",
-                    c.objective
+                    now <= previous + 1e-9,
+                    "{name}: objective rose from {previous} to {now} at k = {k}"
                 );
-                previous = c.objective;
+                previous = now;
             }
             // Every leaf on its own leaves no pair inside any cluster.
             assert_relative_eq!(previous, 0.0, epsilon = 1e-12);
@@ -931,7 +909,6 @@ mod tests {
             let n_leaves = tree.n_leaves();
             for k in 1..=n_leaves {
                 let c = cluster(&tree, k);
-                assert_eq!(c.cuts.len(), k - 1, "{name}: k - 1 cuts");
                 assert_eq!(c.sizes.len(), k);
                 assert_eq!(c.sizes.iter().sum::<usize>(), n_leaves, "{name}");
                 assert!(c.sizes.iter().all(|&s| s > 0), "{name}: an empty cluster");
@@ -977,32 +954,8 @@ mod tests {
         }
         let found: BTreeSet<BTreeSet<u32>> = found.into_iter().collect();
 
-        println!(
-            "planted clades: sizes {:?}, centres {:?}, cuts {:?}",
-            c.sizes, c.centres, c.cuts
-        );
-        println!(
-            "objective: {:.3} at k = 1, {:.3} at k = 4, {:.3} at k = 8",
-            summed_leaf_distance(&tree),
-            c.objective,
-            cluster(&tree, 8).objective
-        );
         assert_eq!(found, planted, "recovered partition is not the planted one");
         assert_eq!(c.sizes, vec![8, 8, 8, 8]);
-        // The cuts are not necessarily the four long branches themselves: the
-        // branch above the pair {clade 0, clade 1} carries sixteen leaves at
-        // forty apart on either side, which crosses more than any single clade
-        // branch does, so the greedy split is the top branch first and one
-        // clade branch inside each half. What must hold is that every cut
-        // separates whole clades, never splitting one.
-        for &node in &c.cuts {
-            let below = leaves_below(&tree, node);
-            assert_eq!(below.len() % 8, 0, "cut {node} split a clade");
-            assert!(
-                below.iter().all(|&l| below.contains(&(l - l % 8))),
-                "cut {node} split a clade: {below:?}"
-            );
-        }
     }
 
     /// Leaves of the subtree below a node.
@@ -1091,7 +1044,6 @@ mod tests {
             for _ in 0..3 {
                 let again = cluster(&tree, 5);
                 assert_eq!(first.leaf_cluster, again.leaf_cluster, "{name}");
-                assert_eq!(first.cuts, again.cuts, "{name}");
                 assert_eq!(first.centres, again.centres, "{name}");
             }
             let edge = root_edge(&tree).expect("a tree with branches");
@@ -1102,11 +1054,15 @@ mod tests {
                     "{name}"
                 );
             }
-            assert_eq!(
-                Some(&edge),
-                first.cuts.first(),
-                "{name}: root is the first cut"
-            );
+            // The root is the first cut, so the leaves below it are one of the
+            // two clusters.
+            let two = cluster(&tree, 2);
+            let below = leaves_below(&tree, edge);
+            let g = two.leaf_cluster[*below.first().expect("a branch has a leaf below") as usize];
+            let side: BTreeSet<u32> = (0..tree.n_leaves() as u32)
+                .filter(|&l| two.leaf_cluster[l as usize] == g)
+                .collect();
+            assert_eq!(side, below, "{name}: root is the first cut");
         }
     }
 
@@ -1117,9 +1073,9 @@ mod tests {
         let total = summed_leaf_distance(&tree);
         assert!(total.is_finite() && total > 0.0);
         let c = cluster(&tree, 8);
-        assert_eq!(c.n_clusters(), 8);
+        assert_eq!(c.sizes.len(), 8);
         assert_eq!(c.sizes.iter().sum::<usize>(), 100_000);
-        assert!(c.objective < total);
+        assert!(objective(&tree, &c) < total);
         let rerooted = reroot_for_display(&tree).expect("a tree with branches");
         assert_eq!(rerooted.n_leaves(), 100_000);
         assert_relative_eq!(summed_leaf_distance(&rerooted), total, max_relative = 1e-12);
@@ -1133,11 +1089,11 @@ mod tests {
 
         let one = cluster(&tree, 1);
         assert_eq!(one.sizes, vec![2]);
-        assert_relative_eq!(one.objective, 2.0, max_relative = 1e-12);
+        assert_relative_eq!(objective(&tree, &one), 2.0, max_relative = 1e-12);
 
         let two = cluster(&tree, 2);
         assert_eq!(two.sizes, vec![1, 1]);
-        assert_relative_eq!(two.objective, 0.0, epsilon = 1e-15);
+        assert_relative_eq!(objective(&tree, &two), 0.0, epsilon = 1e-15);
         assert_eq!(two.leaf_cluster.len(), 2);
         assert_ne!(two.leaf_cluster[0], two.leaf_cluster[1]);
         // A singleton is represented by its own leaf.
@@ -1160,8 +1116,12 @@ mod tests {
         let branch = vec![1.0, 5.0, 2.0, 4.0, 3.0, 6.0, 0.0];
         let tree = Tree::from_parents(parent, branch, 6).expect("star");
         let c = cluster(&tree, 4);
-        assert_eq!(c.cuts, vec![5, 1, 3]);
         assert_eq!(c.sizes, vec![3, 1, 1, 1]);
+        // The three longest spokes are cut off on their own.
+        for leaf in [5usize, 1, 3] {
+            let g = c.leaf_cluster[leaf] as usize;
+            assert_eq!(c.sizes[g], 1, "leaf {leaf} was not cut off");
+        }
         assert_eq!(root_edge(&tree).expect("a tree with branches"), 5);
     }
 
@@ -1175,7 +1135,7 @@ mod tests {
         );
         let c = cluster(&tree, 3);
         assert_eq!(c.sizes.iter().sum::<usize>(), 9);
-        assert_eq!(c.cuts.len(), 2);
+        assert_eq!(c.sizes.len(), 3);
         let rerooted = reroot_for_display(&tree).expect("a tree with branches");
         // The old root had three children, so nothing was suppressed and the
         // new root is an extra node.
@@ -1193,11 +1153,10 @@ mod tests {
         jitter(&mut tree, 5);
         for asked in [8usize, 9, 100, usize::MAX] {
             let c = cluster(&tree, asked);
-            assert_eq!(c.n_clusters(), 8);
             assert_eq!(c.sizes, vec![1; 8]);
-            assert_relative_eq!(c.objective, 0.0, epsilon = 1e-12);
+            assert_eq!(c.centres.len(), 8);
+            assert_relative_eq!(objective(&tree, &c), 0.0, epsilon = 1e-12);
         }
-        assert_eq!(cluster_centres(&tree, 1000).len(), 8);
     }
 
     #[test]
@@ -1206,12 +1165,10 @@ mod tests {
         jitter(&mut tree, 6);
         for asked in [0usize, 1] {
             let c = cluster(&tree, asked);
-            assert_eq!(c.n_clusters(), 1);
-            assert!(c.cuts.is_empty());
             assert_eq!(c.sizes, vec![8]);
             assert_eq!(c.leaf_cluster, vec![0; 8]);
             assert_relative_eq!(
-                c.objective,
+                objective(&tree, &c),
                 summed_leaf_distance(&tree),
                 max_relative = 1e-12
             );
@@ -1224,7 +1181,7 @@ mod tests {
             let n_leaves = tree.n_leaves();
             let d_all = brute_distances_from_all(&tree);
             let c = cluster(&tree, 3.min(n_leaves));
-            assert_eq!(c.centres.len(), c.n_clusters());
+            assert_eq!(c.centres.len(), c.sizes.len());
             let mut seen = BTreeSet::new();
             for (g, &centre) in c.centres.iter().enumerate() {
                 assert!(seen.insert(centre), "{name}: centre {centre} repeated");
@@ -1349,7 +1306,7 @@ mod tests {
         let tree = Tree::from_parents(vec![NO_NODE], vec![0.0], 1).expect("one leaf is a tree");
         assert_relative_eq!(summed_leaf_distance(&tree), 0.0, epsilon = 1e-15);
         let c = cluster(&tree, 4);
-        assert_eq!(c.n_clusters(), 1);
+        assert_eq!(c.sizes.len(), 1);
         assert_eq!(c.centres, vec![0]);
         assert!(matches!(
             root_edge(&tree),

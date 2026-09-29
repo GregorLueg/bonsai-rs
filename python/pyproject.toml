@@ -25,6 +25,8 @@ Changelog = "https://github.com/GregorLueg/bonsai-rs/blob/main/python/CHANGELOG.
 [project.optional-dependencies]
 # Sparse counts for `sanity` / `bonsai_from_counts`. Dense counts need numpy only.
 sparse = ["scipy>=1.9"]
+# `BonsaiResult.plot`. Everything else needs numpy only.
+plot = ["matplotlib>=3.5"]
 
 [dependency-groups]
 dev = [

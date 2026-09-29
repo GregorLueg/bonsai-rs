@@ -39,7 +39,6 @@ fn _bonsai_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run::from_sanity, m)?)?;
     m.add_function(wrap_pyfunction!(run::bonsai, m)?)?;
     m.add_function(wrap_pyfunction!(run::bonsai_from_counts, m)?)?;
-    m.add_function(wrap_pyfunction!(run::backbone, m)?)?;
     m.add_function(wrap_pyfunction!(run::simulate, m)?)?;
 
     m.add_function(wrap_pyfunction!(tree::to_newick, m)?)?;

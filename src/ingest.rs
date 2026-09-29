@@ -27,9 +27,9 @@
 //! `transformed_` fields are the only ones that are transformed.
 //! [`PreparedData::restore_scale`] is the way back.
 
-use crate::errors::BonsaiErrors;
+use crate::prelude::*;
 use crate::utils::kernels::edge_newton;
-use crate::utils::traits::{BonsaiFloat, narrow, wide};
+use crate::utils::traits::{narrow, wide};
 use rayon::prelude::*;
 
 ///////////////
@@ -1445,7 +1445,16 @@ mod sanity_tests {
         let (n, p) = (sim.n_leaves, sim.n_features);
         let lik = from_sanity_output(out, None).unwrap();
         let n_kept = lik.features.len();
-        let res = bonsai(&lik.means, &lik.sds, n, n_kept, Some(&lik.variances), None).unwrap();
+        let res = bonsai(
+            &lik.means,
+            &lik.sds,
+            n,
+            n_kept,
+            Some(&lik.variances),
+            None,
+            crate::prelude::Verbosity::Quiet,
+        )
+        .unwrap();
         (
             robinson_foulds(&res.tree, &sim.tree).unwrap(),
             distance_recovery(&res.tree, &sim.truth, p, MAX_PAIRS, 0),

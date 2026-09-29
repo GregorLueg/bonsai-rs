@@ -16,7 +16,7 @@
 //! `<dir>` holds `ours/means.csv`, `ours/sds.csv` (transformed units) and
 //! `truth.nwk` with leaves labelled `cell<i>`. Variants:
 //!
-//! * `base` - step 6 at the defaults, then step 7; prints the per-round trace
+//! * `base` - step 6 at the defaults, then step 7
 //! * `random <n> [seed]` - `NniParams::n_random` set
 //! * `mingain <g>` - `StarParams::min_gain` on the interchange star
 //! * `reopt` - step 4 again between steps 5 and 6
@@ -25,23 +25,21 @@
 //! Every variant reports the loglikelihood after step 7 and the RF to the
 //! generating tree, which are the gate.
 
-use bonsai_rs::bonsai::BonsaiParams;
-use bonsai_rs::bonsai::StartTree;
 use bonsai_rs::model::global::optimise_branch_lengths;
 use bonsai_rs::model::likelihood::NodeState;
+use bonsai_rs::prelude::*;
 use bonsai_rs::search::Leaves;
 use bonsai_rs::search::bounds::EllipsoidBounds;
 use bonsai_rs::search::candidates::KnnCandidates;
-use bonsai_rs::search::nni::{NniParams, NniResult, nni, nni_random};
+use bonsai_rs::search::nni::{NniResult, nni, nni_random};
 use bonsai_rs::search::polytomy::resolve_polytomies;
 use bonsai_rs::search::spr::spr;
 use bonsai_rs::search::star::{Star, star_tree_with};
+use bonsai_rs::tree::NO_NODE;
 use bonsai_rs::tree::linkage::linkage_tree;
-use bonsai_rs::tree::newick::{parse_newick, write_newick};
 use bonsai_rs::tree::simulate::{
     SimulationParams, robinson_foulds, simulate_binary, simulate_unbalanced,
 };
-use bonsai_rs::tree::{NO_NODE, Tree};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -297,8 +295,7 @@ fn through_step_five(fx: &Fixture, params: &BonsaiParams) -> (Tree, Tree) {
             let mut state = NodeState::new(star.n_nodes(), fx.p, leaves.means, leaves.precisions)
                 .expect("state");
             optimise_branch_lengths(&mut star, &mut state, Some(params.branch)).expect("branch");
-            let mut candidates =
-                EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)), Some(params.bounds));
+            let mut candidates = EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)));
             star_tree_with(
                 Star {
                     means: leaves.means,
@@ -308,6 +305,7 @@ fn through_step_five(fx: &Fixture, params: &BonsaiParams) -> (Tree, Tree) {
                 },
                 Some(params.star),
                 &mut candidates,
+                Verbosity::Quiet,
             )
             .expect("merge")
             .0
@@ -336,7 +334,7 @@ fn through_step_five(fx: &Fixture, params: &BonsaiParams) -> (Tree, Tree) {
     save_tree(&path4, &tree);
     let t4 = tree.clone();
     let t0 = Instant::now();
-    let out = spr(&tree, leaves, Some(params.spr)).expect("spr");
+    let out = spr(&tree, leaves, Some(params.spr), Verbosity::Quiet).expect("spr");
     println!(
         "step 5: {:.1} s  loglik {:.3}  rf {}  moves {} rounds {}  (load {})",
         t0.elapsed().as_secs_f64(),
@@ -350,37 +348,8 @@ fn through_step_five(fx: &Fixture, params: &BonsaiParams) -> (Tree, Tree) {
     (t4, out.tree)
 }
 
-fn print_trace(out: &NniResult) {
-    let t = &out.trace;
-    let sum =
-        |f: fn(&bonsai_rs::search::nni::NniRound) -> usize| -> usize { t.iter().map(f).sum() };
-    println!(
-        "nni: {} moves over {} rounds; totals eligible {} proposed {} changed {} improving {}",
-        out.n_moves,
-        out.rounds,
-        sum(|r| r.eligible),
-        sum(|r| r.proposed),
-        sum(|r| r.changed),
-        sum(|r| r.improving)
-    );
-    let show: Vec<usize> = if t.len() <= 12 {
-        (0..t.len()).collect()
-    } else {
-        (0..6).chain(t.len() - 6..t.len()).collect()
-    };
-    println!("round  eligible  proposed  changed  improving  best_gain");
-    for i in show {
-        let r = &t[i];
-        println!(
-            "{:>5}  {:>8}  {:>8}  {:>7}  {:>9}  {:>10.3}",
-            i + 1,
-            r.eligible,
-            r.proposed,
-            r.changed,
-            r.improving,
-            r.best_gain
-        );
-    }
+fn print_moves(out: &NniResult) {
+    println!("nni: {} moves over {} rounds", out.n_moves, out.rounds);
 }
 
 fn finish(label: &str, mut tree: Tree, fx: &Fixture, params: &BonsaiParams, secs: f64) {
@@ -475,9 +444,9 @@ fn main() {
                 _ => {}
             }
             let t0 = Instant::now();
-            let out = nni(&start, leaves, Some(params.nni)).expect("nni");
+            let out = nni(&start, leaves, Some(params.nni), Verbosity::Quiet).expect("nni");
             let secs = t0.elapsed().as_secs_f64();
-            print_trace(&out);
+            print_moves(&out);
             println!(
                 "nni: loglik {:.3} rf {}  ({:.1} s)",
                 out.loglik,
@@ -501,7 +470,7 @@ fn main() {
                 if reopt {
                     optimise(&mut tree, leaves, &params);
                 }
-                let out = nni(&tree, leaves, Some(params.nni)).expect("nni");
+                let out = nni(&tree, leaves, Some(params.nni), Verbosity::Quiet).expect("nni");
                 let nni_moves = out.n_moves;
                 tree = out.tree;
                 println!(
@@ -514,7 +483,7 @@ fn main() {
                 if reopt {
                     optimise(&mut tree, leaves, &params);
                 }
-                let out = spr(&tree, leaves, Some(params.spr)).expect("spr");
+                let out = spr(&tree, leaves, Some(params.spr), Verbosity::Quiet).expect("spr");
                 let spr_moves = out.gains.len();
                 tree = out.tree;
                 println!(
@@ -557,7 +526,13 @@ fn main() {
                 moved.loglik,
                 moved.loglik - before
             );
-            let climbed = nni(&moved.tree, leaves, Some(NniParams::default())).expect("nni");
+            let climbed = nni(
+                &moved.tree,
+                leaves,
+                Some(NniParams::default()),
+                Verbosity::Quiet,
+            )
+            .expect("nni");
             println!(
                 "perturb: climbed with {} moves -> loglik {:.3} rf {}",
                 climbed.n_moves,
@@ -589,14 +564,14 @@ fn main() {
             );
             let l = optimise(&mut tree, leaves, &params);
             println!("foreign after step 7: loglik {l:.3}");
-            let out = nni(&tree, leaves, Some(params.nni)).expect("nni");
-            print_trace(&out);
+            let out = nni(&tree, leaves, Some(params.nni), Verbosity::Quiet).expect("nni");
+            print_moves(&out);
             println!(
                 "foreign after our nni: loglik {:.3} rf {}",
                 out.loglik,
                 robinson_foulds(&out.tree, &fx.truth).expect("rf")
             );
-            let out = spr(&out.tree, leaves, Some(params.spr)).expect("spr");
+            let out = spr(&out.tree, leaves, Some(params.spr), Verbosity::Quiet).expect("spr");
             println!(
                 "foreign after our spr: loglik {:.3} rf {} moves {}",
                 out.loglik,
@@ -611,7 +586,7 @@ fn main() {
             // than only the three the star primitive creates? Every binary
             // interchange, spliced by hand and handed to step 4.
             let mut tree = t5.clone();
-            let out = nni(&tree, leaves, Some(params.nni)).expect("nni");
+            let out = nni(&tree, leaves, Some(params.nni), Verbosity::Quiet).expect("nni");
             tree = out.tree;
             let base = optimise(&mut tree, leaves, &params);
             println!("neighbours: from the step 7 tree at loglik {base:.3}");
@@ -663,7 +638,7 @@ fn main() {
         }
         "spr-from-4" => {
             // Sanity check of the cache: step 5 again from the step 4 tree.
-            let out = spr(&t4, leaves, Some(params.spr)).expect("spr");
+            let out = spr(&t4, leaves, Some(params.spr), Verbosity::Quiet).expect("spr");
             println!(
                 "spr from step 4: loglik {:.3} rf {} moves {}",
                 out.loglik,

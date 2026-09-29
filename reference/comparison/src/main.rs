@@ -9,6 +9,9 @@
 //!   the per-feature scale transform, through the crate's own ingest.
 //! * `ours` runs the eight search steps over the CSV one at a time, timing each,
 //!   and emits a Newick string, a wall time and a per-step table.
+//! * `refine-tree` runs steps 3 to 8 from a Newick tree, timing each; `rf`
+//!   compares two trees; `sanity-rs` preprocesses raw counts through
+//!   `sanity-sc-rs` when the original Sanity binary is not to hand.
 //! * `score` loads every Newick it can find for a configuration, puts them all
 //!   on the same leaf indexing, and reports distance recovery, Robinson-Foulds
 //!   and loglikelihood, plus one layout CSV per tree. A Newick named
@@ -31,22 +34,28 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use bonsai_rs::bonsai::BonsaiParams;
-use bonsai_rs::ingest::{IngestParams, PreparedData, from_sanity, prepare};
+use bonsai_rs::ingest::{IngestParams, PreparedData, from_sanity, from_sanity_output, prepare};
 use bonsai_rs::model::global::optimise_branch_lengths;
 use bonsai_rs::model::likelihood::NodeState;
+use bonsai_rs::prelude::Verbosity;
 use bonsai_rs::search::Leaves;
 use bonsai_rs::search::bounds::EllipsoidBounds;
 use bonsai_rs::search::candidates::KnnCandidates;
-use bonsai_rs::search::nni::nni;
+use bonsai_rs::search::nni::{NniSearch, nni};
 use bonsai_rs::search::polytomy::resolve_polytomies;
-use bonsai_rs::search::spr::spr;
+use bonsai_rs::search::spr::{PruneOrder, SprSearch, spr};
 use bonsai_rs::search::star::{Star, star_tree_with};
 use bonsai_rs::tree::distance::{MAX_PAIRS, distance_recovery};
 use bonsai_rs::tree::export::layout_csv;
 use bonsai_rs::tree::layout::equal_angle;
 use bonsai_rs::tree::newick::{parse_newick, write_newick};
-use bonsai_rs::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
+use bonsai_rs::tree::simulate::{
+    SimulationParams, robinson_foulds, simulate_binary, simulate_binary_random_branches,
+    simulate_unbalanced,
+};
 use bonsai_rs::tree::{NO_NODE, Tree};
+use sanity_sc_rs::input::CountMatrix;
+use sanity_sc_rs::sanity;
 
 /// Seed for the leaf-pair sample inside distance recovery. Fixed so that the
 /// two implementations are scored on exactly the same pairs.
@@ -77,9 +86,12 @@ fn run() -> Fallible<()> {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("gen") => {
-            if args.len() != 7 {
-                return Err("usage: harness gen <dir> <n_leaves> <n_features> <noise_sd> <seed>"
-                    .into());
+            if args.len() != 7 && args.len() != 8 {
+                return Err(
+                    "usage: harness gen <dir> <n_leaves> <n_features> <noise_sd> <seed> \
+                            [balanced|random|unbalanced]"
+                        .into(),
+                );
             }
             generate(
                 Path::new(&args[2]),
@@ -87,7 +99,14 @@ fn run() -> Fallible<()> {
                 args[4].parse()?,
                 args[5].parse()?,
                 args[6].parse()?,
+                args.get(7).map_or("balanced", String::as_str),
             )
+        }
+        Some("sanity-rs") => {
+            if args.len() != 4 {
+                return Err("usage: harness sanity-rs <sim_dir> <out_dir>".into());
+            }
+            sanity_rs(Path::new(&args[2]), Path::new(&args[3]))
         }
         Some("prep") => {
             if args.len() != 3 {
@@ -113,7 +132,31 @@ fn run() -> Fallible<()> {
             }
             score_tree(Path::new(&args[2]), Path::new(&args[3]))
         }
-        _ => Err("usage: harness <gen|prep|ours|score|score-tree> ...".into()),
+        Some("rf") => {
+            if args.len() != 5 {
+                return Err("usage: harness rf <dir> <a.nwk> <b.nwk>".into());
+            }
+            let (_, n_cells, _) = read_csv(&Path::new(&args[2]).join("ours").join("means.csv"))?;
+            let labels = cell_labels(n_cells);
+            let index_of: HashMap<&str, usize> = labels
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.as_str(), i))
+                .collect();
+            let a = load_tree(Path::new(&args[3]), &index_of)?;
+            let b = load_tree(Path::new(&args[4]), &index_of)?;
+            println!("rf\t{}", robinson_foulds(&a, &b)?);
+            Ok(())
+        }
+        Some("refine-tree") => {
+            if args.len() != 4 {
+                return Err("usage: harness refine-tree <dir> <newick>".into());
+            }
+            refine_tree(Path::new(&args[2]), Path::new(&args[3]))
+        }
+        _ => Err(
+            "usage: harness <gen|prep|sanity-rs|ours|refine-tree|score|score-tree|rf> ...".into(),
+        ),
     }
 }
 
@@ -200,14 +243,23 @@ fn cell_labels(n: usize) -> Vec<String> {
 
 /// Simulate one dataset and write it as CSV.
 ///
-/// Layout under `dir`:
+/// `shape` picks the generator: `balanced` ([`simulate_binary`]), `random`
+/// (balanced with random branch lengths) or `unbalanced` (random leaf
+/// splits). Layout under `dir`:
 ///
 /// * `ours/means.csv`, `ours/sds.csv`, `ours/truth.csv` - comma separated,
 ///   cells as rows and features as columns, no header
 /// * `truth.nwk` - the generating tree
 /// * `meta.tsv` - the parameters, for the results table
-fn generate(dir: &Path, n_leaves: usize, n_features: usize, noise_sd: f64, seed: u64) -> Fallible<()> {
-    let data = simulate_binary::<f64>(Some(SimulationParams {
+fn generate(
+    dir: &Path,
+    n_leaves: usize,
+    n_features: usize,
+    noise_sd: f64,
+    seed: u64,
+    shape: &str,
+) -> Fallible<()> {
+    let params = Some(SimulationParams {
         n_leaves,
         n_features,
         branch_length: BRANCH_LENGTH,
@@ -215,7 +267,13 @@ fn generate(dir: &Path, n_leaves: usize, n_features: usize, noise_sd: f64, seed:
         noise_spread: NOISE_SPREAD,
         feature_mean_sd: 0.0,
         seed,
-    }))?;
+    });
+    let data = match shape {
+        "balanced" => simulate_binary::<f64>(params)?,
+        "random" => simulate_binary_random_branches::<f64>(params)?,
+        "unbalanced" => simulate_unbalanced::<f64>(params)?,
+        other => return Err(format!("unknown shape {other}").into()),
+    };
 
     let our_dir = dir.join("ours");
     fs::create_dir_all(&our_dir)?;
@@ -234,15 +292,22 @@ fn generate(dir: &Path, n_leaves: usize, n_features: usize, noise_sd: f64, seed:
         matrix_text(&data.truth, n_leaves, n_features, ','),
     )?;
 
-    fs::write(dir.join("truth.nwk"), write_newick(&data.tree, &labels)? + "\n")?;
+    fs::write(
+        dir.join("truth.nwk"),
+        write_newick(&data.tree, &labels)? + "\n",
+    )?;
     fs::write(
         dir.join("meta.tsv"),
         format!(
             "n_leaves\t{n_leaves}\nn_features\t{n_features}\nnoise_sd\t{noise_sd}\n\
-             noise_spread\t{NOISE_SPREAD}\nbranch_length\t{BRANCH_LENGTH}\nseed\t{seed}\n"
+             noise_spread\t{NOISE_SPREAD}\nbranch_length\t{BRANCH_LENGTH}\nseed\t{seed}\n\
+             shape\t{shape}\n"
         ),
     )?;
-    println!("gen: {n_leaves} cells by {n_features} features into {}", dir.display());
+    println!(
+        "gen: {n_leaves} cells by {n_features} features into {}",
+        dir.display()
+    );
     Ok(())
 }
 
@@ -270,11 +335,9 @@ fn read_sanity_matrix(path: &Path, n_genes: usize, n_cells: usize) -> Fallible<V
                 continue;
             }
             if c >= n_cells {
-                return Err(format!(
-                    "{}: row {g} has more than {n_cells} fields",
-                    path.display()
-                )
-                .into());
+                return Err(
+                    format!("{}: row {g} has more than {n_cells} fields", path.display()).into(),
+                );
             }
             out[c * n_genes + g] = field
                 .parse()
@@ -307,6 +370,138 @@ fn read_vector(path: &Path) -> Fallible<Vec<f64>> {
         .collect()
 }
 
+/// Counts to `out/ours/{means,sds}.csv` through `sanity-sc-rs`, for when the
+/// original Sanity binary is not to hand.
+///
+/// Reads `sim/counts.mtx` (genes by cells, 1-based), runs Sanity in `f32` on
+/// the CPU, converts with `from_sanity_output`, and selects features in
+/// `prepare` at the default signal-to-noise threshold. Writes the kept gene
+/// indices (0-based, into the simulation's gene axis) to `out/features.txt` and
+/// their Sanity variances to `out/variances.txt`, which is what the truth
+/// matrix needs, plus `prep.tsv` and a copy of `truth.nwk`. `ours/truth.csv` is
+/// left to numpy, which reads `truth_ltq.npy`.
+fn sanity_rs(sim: &Path, out: &Path) -> Fallible<()> {
+    let t0 = Instant::now();
+    let text = fs::read_to_string(sim.join("counts.mtx"))?;
+    let mut lines = text.lines().filter(|l| !l.starts_with('%'));
+    let header: Vec<usize> = lines
+        .next()
+        .ok_or("counts.mtx is empty")?
+        .split_whitespace()
+        .map(|x| x.parse())
+        .collect::<Result<_, _>>()?;
+    let (n_genes, n_cells, nnz) = (header[0], header[1], header[2]);
+    let mut entries: Vec<(u32, u32, u32)> = Vec::with_capacity(nnz);
+    for line in lines {
+        let mut f = line.split_whitespace();
+        let g: u32 = f.next().ok_or("short line")?.parse()?;
+        let c: u32 = f.next().ok_or("short line")?.parse()?;
+        let v: u32 = f.next().ok_or("short line")?.parse()?;
+        entries.push((g - 1, c - 1, v));
+    }
+    entries.sort_unstable();
+    let mut indptr = vec![0usize; n_genes + 1];
+    let mut cell_totals = vec![0.0f64; n_cells];
+    for &(g, c, v) in &entries {
+        indptr[g as usize + 1] += 1;
+        cell_totals[c as usize] += v as f64;
+    }
+    // Sanity refuses a gene with no counts, so those are dropped here and
+    // `present` maps Sanity's gene axis back to the simulation's.
+    let present: Vec<usize> = (0..n_genes).filter(|&g| indptr[g + 1] > 0).collect();
+    let mut indptr: Vec<usize> = std::iter::once(0)
+        .chain(present.iter().map(|&g| indptr[g + 1]))
+        .collect();
+    for g in 0..present.len() {
+        indptr[g + 1] += indptr[g];
+    }
+    let indices: Vec<u32> = entries.iter().map(|e| e.1).collect();
+    let values: Vec<u32> = entries.iter().map(|e| e.2).collect();
+    drop(entries);
+    drop(text);
+    let counts = CountMatrix::new(indices, values, indptr, n_cells)?;
+    let read_secs = t0.elapsed().as_secs_f64();
+    println!(
+        "sanity-rs: read {n_genes} genes by {n_cells} cells, {nnz} counts in {read_secs:.1} s"
+    );
+
+    let t0 = Instant::now();
+    let post = sanity::<f32>(&counts, &cell_totals, None)?;
+    let sanity_secs = t0.elapsed().as_secs_f64();
+    println!("sanity-rs: Sanity in {sanity_secs:.1} s");
+
+    let t0 = Instant::now();
+    let loose = IngestParams {
+        min_signal_to_noise: f64::NEG_INFINITY,
+        ..Default::default()
+    };
+    let lik = from_sanity_output(&post, Some(loose))?;
+    drop(post);
+    let k_all = lik.features.len();
+    let prepared: PreparedData<f32> = prepare(
+        &lik.means,
+        &lik.sds,
+        n_cells,
+        k_all,
+        Some(&lik.variances),
+        None,
+    )?;
+    let k = prepared.n_features();
+    let features: Vec<usize> = prepared
+        .features
+        .iter()
+        .map(|&i| present[lik.features[i]])
+        .collect();
+    let variances: Vec<f64> = prepared
+        .features
+        .iter()
+        .map(|&i| lik.variances[i])
+        .collect();
+    let ingest_secs = t0.elapsed().as_secs_f64();
+
+    let our_dir = out.join("ours");
+    fs::create_dir_all(&our_dir)?;
+    let means: Vec<f64> = prepared
+        .transformed_means
+        .iter()
+        .map(|&x| x as f64)
+        .collect();
+    let sds: Vec<f64> = prepared
+        .transformed_precisions
+        .iter()
+        .map(|&w| 1.0 / (w as f64).sqrt())
+        .collect();
+    fs::write(
+        our_dir.join("means.csv"),
+        matrix_text(&means, n_cells, k, ','),
+    )?;
+    fs::write(our_dir.join("sds.csv"), matrix_text(&sds, n_cells, k, ','))?;
+    let join = |v: Vec<String>| v.join("\n") + "\n";
+    fs::write(
+        out.join("features.txt"),
+        join(features.iter().map(|x| x.to_string()).collect()),
+    )?;
+    fs::write(
+        out.join("variances.txt"),
+        join(variances.iter().map(|x| format!("{x:e}")).collect()),
+    )?;
+    fs::copy(sim.join("truth.nwk"), out.join("truth.nwk"))?;
+    fs::write(
+        out.join("prep.tsv"),
+        format!(
+            "n_cells\t{n_cells}\nn_genes_in\t{n_genes}\nn_features_ours\t{k}\n\
+             dropped_ill_conditioned\t{}\nsanity\tsanity-sc-rs f32 cpu\nread_seconds\t{read_secs:.2}\n\
+             sanity_seconds\t{sanity_secs:.2}\ningest_seconds\t{ingest_secs:.2}\n",
+            lik.dropped.len()
+        ),
+    )?;
+    println!(
+        "sanity-rs: {k} of {n_genes} genes kept ({} ill-conditioned dropped), ingest {ingest_secs:.1} s",
+        lik.dropped.len()
+    );
+    Ok(())
+}
+
 /// Convert `dir/sanity_sel` into `dir/ours/means.csv` and `dir/ours/sds.csv`,
 /// in the transformed units `PreparedData` holds, so that `ours` and `score`
 /// run unchanged on this track.
@@ -324,7 +519,9 @@ fn prep(dir: &Path) -> Fallible<()> {
     let cells = read_lines(&sel.join("cellID.txt"))?;
     let (n_genes, n_cells) = (genes.len(), cells.len());
     if cells != cell_labels(n_cells) {
-        return Err("cellID.txt is not cell0..cell{n-1} in order; the scorer relies on that".into());
+        return Err(
+            "cellID.txt is not cell0..cell{n-1} in order; the scorer relies on that".into(),
+        );
     }
     let t0 = Instant::now();
     let delta = read_sanity_matrix(&sel.join("delta.txt"), n_genes, n_cells)?;
@@ -471,6 +668,7 @@ fn ours(dir: &Path) -> Fallible<()> {
     if let Some(v) = env_f64("SPR_MIN_GAIN")? {
         params.spr.star.min_gain = v;
     }
+    spr_recheck_from_env(&mut params);
     let tag = env::var("OURS_TAG").ok().filter(|t| !t.is_empty());
     let named = |base: &str, ext: &str| match &tag {
         Some(t) => format!("{base}_{t}.{ext}"),
@@ -499,7 +697,7 @@ fn ours(dir: &Path) -> Fallible<()> {
     // (`StartTree::Linkage`); anything else is the greedy merge.
     let use_linkage = env::var("START").map(|s| s == "linkage").unwrap_or(false);
 
-    let mut tree: Tree = if use_linkage {
+    let tree: Tree = if use_linkage {
         let t0 = Instant::now();
         let tree = bonsai_rs::tree::linkage::linkage_tree(leaves.means, n_cells, p, None)?;
         let secs = t0.elapsed().as_secs_f64();
@@ -522,8 +720,7 @@ fn ours(dir: &Path) -> Fallible<()> {
         // Step 2: greedy merging under the kNN restriction and ellipsoid
         // bounds, the same composition `bonsai_prepared` uses.
         let t0 = Instant::now();
-        let mut candidates =
-            EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)), Some(params.bounds));
+        let mut candidates = EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)));
         let (tree, _) = star_tree_with(
             Star {
                 means: leaves.means,
@@ -533,6 +730,7 @@ fn ours(dir: &Path) -> Fallible<()> {
             },
             Some(params.star),
             &mut candidates,
+            Verbosity::Quiet,
         )?;
         let secs = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
@@ -542,9 +740,89 @@ fn ours(dir: &Path) -> Fallible<()> {
     };
     let after_merge = tree.clone();
 
+    let r = refine_steps(tree, leaves, &params, &mut record)?;
+    let (tree, loglik) = (r.tree, r.loglik);
+    let (after_spr, after_nni) = (r.after_spr, r.after_nni);
+
+    let labels = cell_labels(n_cells);
+    // Trees at the stage boundaries, so that ours can be scored stage by stage.
+    let stages_dir = dir.join(match &tag {
+        Some(t) => format!("ours_stages_{t}"),
+        None => "ours_stages".to_string(),
+    });
+    fs::create_dir_all(&stages_dir)?;
+    for (name, t) in [
+        ("2_merge", &after_merge),
+        ("5_spr", &after_spr),
+        ("6_nni", &after_nni),
+    ] {
+        fs::write(
+            stages_dir.join(format!("{name}.nwk")),
+            write_newick(t, &labels)? + "\n",
+        )?;
+    }
+    fs::write(
+        dir.join(named("ours", "nwk")),
+        write_newick(&tree, &labels)? + "\n",
+    )?;
+    fs::write(dir.join(named("ours_seconds", "txt")), format!("{total}\n"))?;
+    fs::write(dir.join(named("steps", "tsv")), &table)?;
+    fs::write(
+        dir.join(named("moves", "tsv")),
+        format!(
+            "spr_moves\t{}\nspr_rounds\t{}\nnni_moves\t{}\nnni_rounds\t{}\nnni_n_random\t{}\n\
+             nni_max_rounds\t{}\nnni_min_gain\t{:e}\n",
+            r.spr_moves,
+            r.spr_rounds,
+            r.nni_moves,
+            r.nni_rounds,
+            params.nni.n_random,
+            params.nni.max_rounds,
+            params.nni.star.min_gain
+        ),
+    )?;
+    println!("ours: {n_cells} cells by {p} features in {total:.2} s, loglik {loglik:.1}");
+    Ok(())
+}
+
+/// A refined tree plus what the search steps did, for the `ours` and
+/// `refine-tree` subcommands.
+struct Refined {
+    /// The finished tree.
+    tree: Tree,
+    /// Its loglikelihood.
+    loglik: f64,
+    /// The tree after step 5.
+    after_spr: Tree,
+    /// The tree after step 6.
+    after_nni: Tree,
+    /// SPR moves accepted.
+    spr_moves: usize,
+    /// SPR rounds run.
+    spr_rounds: usize,
+    /// NNI moves performed.
+    nni_moves: usize,
+    /// NNI greedy rounds run.
+    nni_rounds: usize,
+}
+
+/// Steps 3 to 8 of `bonsai_prepared`, one at a time, each timed through
+/// `record(step, seconds, loglik, loglik_seconds)`.
+fn refine_steps(
+    mut tree: Tree,
+    leaves: Leaves<'_, f64>,
+    params: &BonsaiParams,
+    record: &mut impl FnMut(&str, f64, f64, f64),
+) -> Fallible<Refined> {
+    let p = leaves.n_features;
     // Step 3.
     let t0 = Instant::now();
-    tree = resolve_polytomies(&tree, leaves, Some(params.star))?.tree;
+    let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
+    println!(
+        "polytomy: {} polytomies, {} resolved, {} sweeps",
+        resolved.n_polytomies, resolved.n_resolved, resolved.sweeps
+    );
+    tree = resolved.tree;
     let secs = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
     let loglik = tree_loglik(&tree, leaves)?;
@@ -558,7 +836,7 @@ fn ours(dir: &Path) -> Fallible<()> {
 
     // Step 5.
     let t0 = Instant::now();
-    let spr_result = spr(&tree, leaves, Some(params.spr))?;
+    let spr_result = spr(&tree, leaves, Some(params.spr), Verbosity::Quiet)?;
     tree = spr_result.tree;
     let secs = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
@@ -573,7 +851,7 @@ fn ours(dir: &Path) -> Fallible<()> {
 
     // Step 6.
     let t0 = Instant::now();
-    let nni_result = nni(&tree, leaves, Some(params.nni))?;
+    let nni_result = nni(&tree, leaves, Some(params.nni), Verbosity::Quiet)?;
     tree = nni_result.tree;
     let secs = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
@@ -591,43 +869,82 @@ fn ours(dir: &Path) -> Fallible<()> {
     let loglik = optimise_branch_lengths(&mut tree, &mut state, Some(params.branch))?;
     record("7 branch", t0.elapsed().as_secs_f64(), loglik, 0.0);
 
-    // Step 8, the crate's deviation: collapse the internal zero-length edges
-    // steps 4 to 7 leave behind, then reoptimise. Step 3 is the only other
-    // collapse and it runs before step 4, so nothing else removes these.
+    // Step 8, the crate's deviation, through the crate's own function so the
+    // sequence cannot drift from `refine_from`.
     let t0 = Instant::now();
-    tree = resolve_polytomies(&tree, leaves, Some(params.star))?.tree;
-    let mut state = NodeState::new(tree.n_nodes(), p, leaves.means, leaves.precisions)?;
-    let loglik = optimise_branch_lengths(&mut tree, &mut state, Some(params.branch))?;
+    let (resolved, loglik) = bonsai_rs::bonsai::collapse_step(&tree, leaves, params)?;
+    println!(
+        "polytomy: {} polytomies, {} resolved, {} sweeps",
+        resolved.n_polytomies, resolved.n_resolved, resolved.sweeps
+    );
+    tree = resolved.tree;
     record("8 collapse", t0.elapsed().as_secs_f64(), loglik, 0.0);
 
-    let labels = cell_labels(n_cells);
-    // Trees at the stage boundaries, so that ours can be scored stage by stage.
-    let stages_dir = dir.join(match &tag {
-        Some(t) => format!("ours_stages_{t}"),
-        None => "ours_stages".to_string(),
-    });
-    fs::create_dir_all(&stages_dir)?;
-    for (name, t) in [("2_merge", &after_merge), ("5_spr", &after_spr), ("6_nni", &after_nni)] {
-        fs::write(stages_dir.join(format!("{name}.nwk")), write_newick(t, &labels)? + "\n")?;
+    Ok(Refined {
+        tree,
+        loglik,
+        after_spr,
+        after_nni,
+        spr_moves: spr_result.gains.len(),
+        spr_rounds: spr_result.rounds,
+        nni_moves: nni_result.n_moves,
+        nni_rounds: nni_result.rounds,
+    })
+}
+
+/// `SPR_RECHECK=0` or `1` switches `SprApprox::recheck` for the approximate
+/// SPR; `SPR_SEED=<n>` visits subtrees in a random order from that seed.
+/// Unset leaves the defaults.
+fn spr_recheck_from_env(params: &mut BonsaiParams) {
+    if let (Ok(v), SprSearch::Approximate(mut a)) = (env::var("SPR_RECHECK"), params.spr.search) {
+        a.recheck = v != "0";
+        params.spr.search = SprSearch::Approximate(a);
     }
-    fs::write(dir.join(named("ours", "nwk")), write_newick(&tree, &labels)? + "\n")?;
-    fs::write(dir.join(named("ours_seconds", "txt")), format!("{total}\n"))?;
-    fs::write(dir.join(named("steps", "tsv")), &table)?;
-    fs::write(
-        dir.join(named("moves", "tsv")),
-        format!(
-            "spr_moves\t{}\nspr_rounds\t{}\nnni_moves\t{}\nnni_rounds\t{}\nnni_n_random\t{}\n\
-             nni_max_rounds\t{}\nnni_min_gain\t{:e}\n",
-            spr_result.gains.len(),
-            spr_result.rounds,
-            nni_result.n_moves,
-            nni_result.rounds,
-            params.nni.n_random,
-            params.nni.max_rounds,
-            params.nni.star.min_gain
-        ),
-    )?;
-    println!("ours: {n_cells} cells by {p} features in {total:.2} s, loglik {loglik:.1}");
+    if let Some(seed) = env::var("SPR_SEED").ok().and_then(|v| v.parse().ok()) {
+        params.spr.order = PruneOrder::Random;
+        params.spr.seed = seed;
+    }
+    // SEARCH=exact runs SPR and NNI as SPEC 9.3 and 9.4 specify them.
+    if env::var("SEARCH").is_ok_and(|v| v == "exact") {
+        params.spr.search = SprSearch::Exact;
+        params.nni.search = NniSearch::Exact;
+    }
+}
+
+/// Run steps 3 to 8 over a Newick tree and print each step's timing. What the
+/// refinement costs from a given start, for instance one already converged.
+fn refine_tree(dir: &Path, nwk: &Path) -> Fallible<()> {
+    let (means, n_cells, p) = read_csv(&dir.join("ours").join("means.csv"))?;
+    let (sds, _, _) = read_csv(&dir.join("ours").join("sds.csv"))?;
+    let precisions: Vec<f64> = sds.iter().map(|&s| 1.0 / (s * s)).collect();
+    let labels = cell_labels(n_cells);
+    let index_of: HashMap<&str, usize> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+    let tree = load_tree(nwk, &index_of)?;
+    let leaves = Leaves {
+        means: &means,
+        precisions: &precisions,
+        n_features: p,
+    };
+    let mut total = 0.0f64;
+    let mut record = |step: &str, secs: f64, loglik: f64, _: f64| {
+        total += secs;
+        println!("refine: {step:<10} {secs:>9.2} s   loglik {loglik:>16.2}");
+    };
+    let mut params = BonsaiParams::default();
+    spr_recheck_from_env(&mut params);
+    let r = refine_steps(tree, leaves, &params, &mut record)?;
+    println!(
+        "refine: {total:.2} s, spr moves {} rounds {}, nni moves {}",
+        r.spr_moves, r.spr_rounds, r.nni_moves
+    );
+    // REFINE_OUT names a file for the refined tree, to compare two builds.
+    if let Ok(out) = env::var("REFINE_OUT") {
+        fs::write(out, write_newick(&r.tree, &labels)? + "\n")?;
+    }
     Ok(())
 }
 
@@ -641,16 +958,26 @@ fn score_tree(dir: &Path, nwk: &Path) -> Fallible<()> {
     let (truth, _, _) = read_csv(&dir.join("ours").join("truth.csv"))?;
     let precisions: Vec<f64> = sds.iter().map(|&s| 1.0 / (s * s)).collect();
     let labels = cell_labels(n_cells);
-    let index_of: HashMap<&str, usize> =
-        labels.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let index_of: HashMap<&str, usize> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
     let truth_tree = load_tree(&dir.join("truth.nwk"), &index_of)?;
     let tree = load_tree(nwk, &index_of)?;
     let recovery = distance_recovery(&tree, &truth, p, MAX_PAIRS, PAIR_SEED);
     let rf = robinson_foulds(&tree, &truth_tree)?;
     let mut state = NodeState::new(tree.n_nodes(), p, &means, &precisions)?;
     let loglik = state.prune(&tree);
+    // The same topology with its branch lengths fitted to this data by our
+    // global solve (search steps 4 and 7). Another implementation's lengths
+    // were fitted to its own preprocessing, so `loglik` mixes topology with
+    // that mismatch; `loglik_refit` compares topologies alone.
+    let mut refit = tree.clone();
+    let mut refit_state = NodeState::new(refit.n_nodes(), p, &means, &precisions)?;
+    let loglik_refit = optimise_branch_lengths(&mut refit, &mut refit_state, None)?;
     println!(
-        "{}\tloglik\t{loglik:.3}\trf\t{rf}\trecovery\t{recovery:.6}\tnodes\t{}",
+        "{}\tloglik\t{loglik:.3}\tloglik_refit\t{loglik_refit:.3}\trf\t{rf}\trecovery\t{recovery:.6}\tnodes\t{}",
         nwk.display(),
         tree.n_nodes()
     );
@@ -700,8 +1027,8 @@ fn relabel(tree: &Tree, labels: &[String], index_of: &HashMap<&str, usize>) -> F
 /// Load a Newick file and put it on the canonical leaf indexing.
 fn load_tree(path: &Path, index_of: &HashMap<&str, usize>) -> Fallible<Tree> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (tree, labels) =
-        parse_newick(&text).map_err(|e| format!("{}: parse_newick refused it: {e}", path.display()))?;
+    let (tree, labels) = parse_newick(&text)
+        .map_err(|e| format!("{}: parse_newick refused it: {e}", path.display()))?;
     relabel(&tree, &labels, index_of).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
@@ -738,7 +1065,11 @@ fn measure(
     let layout = equal_angle(tree, None)?;
     fs::write(out_csv, layout_csv(tree, &layout, labels)?)?;
 
-    Ok(Metrics { recovery, rf, loglik })
+    Ok(Metrics {
+        recovery,
+        rf,
+        loglik,
+    })
 }
 
 /// Score every tree present for a configuration.
@@ -752,8 +1083,11 @@ fn score(dir: &Path) -> Fallible<()> {
     let precisions: Vec<f64> = sds.iter().map(|&s| 1.0 / (s * s)).collect();
 
     let labels = cell_labels(n_cells);
-    let index_of: HashMap<&str, usize> =
-        labels.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let index_of: HashMap<&str, usize> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
 
     let truth_tree = load_tree(&dir.join("truth.nwk"), &index_of)?;
 
@@ -823,7 +1157,14 @@ fn score(dir: &Path) -> Fallible<()> {
             continue;
         };
         let m = measure(
-            tree, &truth_tree, &truth, &means, &precisions, p, csv, &labels,
+            tree,
+            &truth_tree,
+            &truth,
+            &means,
+            &precisions,
+            p,
+            csv,
+            &labels,
         )?;
         let secs = fs::read_to_string(secs_path)
             .ok()
@@ -849,7 +1190,10 @@ fn score(dir: &Path) -> Fallible<()> {
             m.recovery, m.rf, m.loglik
         );
     }
-    println!("score: maximum possible RF for {n_cells} leaves is {}", 2 * (n_cells - 3));
+    println!(
+        "score: maximum possible RF for {n_cells} leaves is {}",
+        2 * (n_cells - 3)
+    );
 
     fs::write(dir.join("metrics.tsv"), &table)?;
     println!("score: wrote {}", dir.join("metrics.tsv").display());

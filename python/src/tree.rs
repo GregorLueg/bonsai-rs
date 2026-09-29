@@ -88,7 +88,7 @@ pub fn layout<'py>(
     let tree = tree_in(&parent, &branch, n_leaves)?;
     let lay = py
         .detach(|| match kind {
-            "daylight" => Ok(equal_daylight(&tree, None).map(|(l, _)| l)),
+            "daylight" => Ok(equal_daylight(&tree, None)),
             "angle" => Ok(equal_angle(&tree, None)),
             "dendrogram" => Ok(dendrogram(&tree, None)),
             _ => Err(kind.to_string()),

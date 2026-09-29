@@ -469,6 +469,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#plotting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Plotting
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -768,6 +779,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#plotting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Plotting
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -834,10 +856,10 @@ bitwise the same loglikelihood.</p>
 <p>Rayon's global pool, sized to the machine. Set <code>RAYON_NUM_THREADS</code> before the
 first call to cap it; after that it's fixed.</p>
 <h2 id="large-datasets">Large datasets<a class="headerlink" href="#large-datasets" title="Permanent link">&para;</a></h2>
-<p>The largest run measured is 10,000 cells by 2,767 genes of Sanity-preprocessed
-Baron pancreas in 210 seconds; see the <a href="https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md">comparison</a>.</p>
-<p>Beyond that, <code>backbone</code> reconstructs on a random subset (<code>backbone_cells</code>,
-default 2048), places every other cell onto it and refines the whole tree.</p>
+<p>On a ten-core laptop the search takes 72 seconds on 10,000 cells by 2,767 genes
+of Sanity-preprocessed Baron pancreas and 208 seconds on 25,000 by 2,846; a
+synthetic 65,536 cells by 1,000 features takes 226 seconds. See the
+<a href="https://github.com/GregorLueg/bonsai-rs/blob/main/docs/COMPARISON.md">comparison</a>.</p>
 <h2 id="the-start-tree">The start tree<a class="headerlink" href="#the-start-tree" title="Permanent link">&para;</a></h2>
 <p><code>start="linkage"</code> (default) is Ward linkage over a neighbour graph.
 <code>start="greedy"</code> is the paper's greedy merge. On real data it chains and the
@@ -847,6 +869,15 @@ build the best tree.</p>
 <p>Tell you your data isn't a tree. A cycle gets cut somewhere and drawn as two
 branches with confident lengths. Look at the data before you believe the
 picture.</p>
+<h2 id="plotting">Plotting<a class="headerlink" href="#plotting" title="Permanent link">&para;</a></h2>
+<p><code>BonsaiResult.plot</code> draws the radial layout with matplotlib, needing the
+<code>plot</code> extra (<code>pip install bonsai-rs[plot]</code>):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">res</span> <span class="o">=</span> <span class="n">bs</span><span class="o">.</span><span class="n">bonsai</span><span class="p">(</span><span class="n">sim</span><span class="o">.</span><span class="n">means</span><span class="p">,</span> <span class="n">sim</span><span class="o">.</span><span class="n">sds</span><span class="p">)</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="n">fig</span><span class="p">,</span> <span class="n">ax</span> <span class="o">=</span> <span class="n">res</span><span class="o">.</span><span class="n">plot</span><span class="p">(</span><span class="n">colours</span><span class="o">=</span><span class="n">cluster_labels</span><span class="p">)</span>
+</code></pre></div>
+<p><code>colours</code> is one value per leaf, in leaf order; numeric arrays go through a
+colormap, anything else gets a discrete palette. For a custom layout or
+figure, call <code>layout</code> directly and draw it yourself.</p>
 
 
 

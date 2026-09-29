@@ -4,8 +4,9 @@
 
 Vendors `bonsai-rs` 0.2.1 and `sanity-sc-rs` 0.2.1.
 
-- Sanity runs silently again. `sanity-sc-rs` 0.2 prints progress by default,
-  and `verbose` covers the tree search only, as documented.
+- `verbose` reaches Sanity as well as the tree search: `1` prints a header and
+  progress over the genes, `2` adds the per-batch stage split on the GPU. `sanity`
+  takes it too. `0`, the default, prints nothing.
 
 ## 0.2.0
 

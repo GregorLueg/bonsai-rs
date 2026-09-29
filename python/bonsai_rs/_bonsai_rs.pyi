@@ -25,6 +25,7 @@ def sanity(
     fixed_variance: float | None,
     double: bool,
     gpu: bool,
+    verbose: int,
     /,
 ) -> dict[str, Any]: ...
 def from_sanity(

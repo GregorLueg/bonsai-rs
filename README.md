@@ -144,7 +144,7 @@ xy = bs.layout(res.tree)
 
 `verbose` is `0`, `1` or `2`, as `Quiet`, `Normal` and `Detailed` above. It
 prints from Rust to the process's stdout, so in a notebook it lands in the
-kernel's terminal, not the cell. It covers the tree search, not Sanity.
+kernel's terminal, not the cell. It covers both Sanity and the tree search.
 
 Docs at [gregorlueg.github.io/bonsai-rs](https://gregorlueg.github.io/bonsai-rs/).
 Bindings live in `python/` and version separately.

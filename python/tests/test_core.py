@@ -82,6 +82,17 @@ def test_sanity_shapes(counts):
     assert post.variance.shape == (counts.counts.shape[1],)
 
 
+def test_verbose_reaches_sanity(counts, capfd):
+    bs.sanity(counts.counts, cell_totals=counts.cell_totals, verbose=0)
+    assert capfd.readouterr().out == ""
+
+    bs.sanity(counts.counts, cell_totals=counts.cell_totals, verbose=1)
+    assert "Sanity (CPU)" in capfd.readouterr().out
+
+    bs.bonsai_from_counts(counts.counts, cell_totals=counts.cell_totals, verbose=0)
+    assert capfd.readouterr().out == ""
+
+
 def test_rejects_non_integer_counts(counts):
     with pytest.raises(ValueError, match="raw non-negative integers"):
         bs.sanity(np.log1p(counts.counts))

@@ -55,6 +55,7 @@ def sanity(
     fixed_variance: float | None = None,
     dtype: type[np.float32] | type[np.float64] = np.float32,
     gpu: bool = False,
+    verbose: int = 0,
 ) -> SanityResult:
     """Posterior log expression and error bars from raw UMI counts.
 
@@ -77,6 +78,9 @@ def sanity(
             ``float32`` whatever ``dtype`` says, since wgpu has no ``float64``.
             Check `gpu_available` first; asking for it where that is ``False``
             raises rather than falling back to the CPU.
+        verbose: ``0`` prints nothing, ``1`` a header and progress at every
+            tenth of the genes, ``2`` adds a per-batch stage split on the GPU.
+            Printed from Rust to the process's stdout.
 
     Returns:
         The posteriors, cells x genes.
@@ -97,6 +101,7 @@ def sanity(
         fixed_variance,
         dtype is np.float64,
         gpu,
+        verbose,
     )
     return SanityResult(
         log_fold_changes=d["log_fold_changes"].T,
@@ -248,7 +253,7 @@ def bonsai_from_counts(
         min_signal_to_noise: As `bonsai`.
         max_amplification: As `from_sanity`.
         reroot: As `bonsai`.
-        verbose: As `bonsai`. Covers the tree search, not Sanity.
+        verbose: As `bonsai` for the tree search, and as `sanity` for Sanity.
 
     Returns:
         As `bonsai`, with ``features`` and ``dropped`` indexing the genes of

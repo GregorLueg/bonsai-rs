@@ -164,6 +164,9 @@ pub struct StepReport {
     /// should surface as a visible negative here rather than as a panic
     /// crossing an FFI boundary.
     pub gain: f64,
+    /// Wall time of the step in seconds, including the loglikelihood
+    /// evaluation that closes it.
+    pub seconds: f64,
 }
 
 //////////////////
@@ -242,12 +245,15 @@ fn record(
     started: Instant,
 ) {
     let gain = steps.last().map_or(0.0, |last| loglik - last.loglik);
-    steps.push(StepReport { step, loglik, gain });
+    let elapsed = started.elapsed();
+    steps.push(StepReport {
+        step,
+        loglik,
+        gain,
+        seconds: elapsed.as_secs_f64(),
+    });
     if verbosity.normal_verbosity() {
-        println!(
-            "  loglik {loglik:.6e}, gain {gain:+.3e} ({:.2?})",
-            started.elapsed()
-        );
+        println!("  loglik {loglik:.6e}, gain {gain:+.3e} ({elapsed:.2?})");
     }
 }
 

@@ -151,9 +151,9 @@ impl BonsaiSimd for f32 {
     }
 }
 
-////////////////////
+/////////////////////
 // Private helpers //
-////////////////////
+/////////////////////
 
 /// Load eight consecutive `f32` into a vector register.
 ///
@@ -194,9 +194,9 @@ fn load4(s: &[f64]) -> f64x4 {
     f64x4::from([s[0], s[1], s[2], s[3]])
 }
 
-///////////////////////
-// Public functions  //
-///////////////////////
+//////////////////////
+// Public functions //
+//////////////////////
 
 /// One Newton evaluation of the branch-length stationarity condition,
 /// vectorised.

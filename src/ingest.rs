@@ -42,8 +42,8 @@ const VARIANCE_TOL: f64 = 1e-12;
 /// The paper's threshold (SPEC.md section 3.3). `S[g]` is the mean ratio of
 /// posterior signal variance to measurement error variance. Small or noisy
 /// datasets lose informative features at `1`; pass a lower value through
-/// [`IngestParams::min_signal_to_noise`] to keep them (`0.25` sat above the 95th
-/// percentile of pure-noise scores in `simulate_binary` runs, 2026-09-25).
+/// [`IngestParams::min_signal_to_noise`] to keep them (`0.25` sat above the
+/// 95th percentile of pure-noise scores in `simulate_binary` runs, 2026-09-25).
 pub const DEFAULT_MIN_SIGNAL_TO_NOISE: f64 = 1.0;
 
 /// Largest variance amplification `v / (v - eps^2)` [`from_sanity`] converts.
@@ -537,10 +537,11 @@ fn score_features<T: BonsaiFloat>(
 ///
 /// The transformed data and everything needed to map it back, or an error:
 /// `EmptyInput` for an empty dataset, `NoFeaturesRetained` for a threshold that
-/// keeps nothing, `ShapeMismatch` for disagreeing lengths, `NonPositiveSd` for a
-/// standard deviation that is not strictly positive and finite, `NonFiniteMean`
-/// for a non-finite mean, `NonPositiveVariance` for a supplied variance that is
-/// not positive, and `RootFindDiverged` if the variance solve fails to converge.
+/// keeps nothing, `ShapeMismatch` for disagreeing lengths, `NonPositiveSd` for
+/// a standard deviation that is not strictly positive and finite,
+/// `NonFiniteMean` for a non-finite mean, `NonPositiveVariance` for a supplied
+/// variance that is not positive, and `RootFindDiverged` if the variance solve
+/// fails to converge.
 pub fn prepare<T: BonsaiFloat>(
     means: &[T],
     sds: &[T],

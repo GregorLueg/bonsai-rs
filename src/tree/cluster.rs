@@ -1,8 +1,9 @@
 //! Unsupervised clustering by iterative branch cutting.
 //!
-//! Cutting `k - 1` branches splits the tree into `k` pieces. Each cut is chosen
-//! greedily to minimise the summed within-piece pairwise leaf distance, where
-//! distances are sums of branch lengths along the tree path (SPEC.md section 14).
+//! Cutting `k - 1` branches splits the tree into `k` pieces. Each cut is
+//! chosen greedily to minimise the summed within-piece pairwise leaf distance,
+//! where distances are sums of branch lengths along the tree path (SPEC.md
+//! section 14).
 //!
 //! ### The `a * b` edge weighting
 //!
@@ -473,7 +474,6 @@ fn relabel_from(
     }
     Tree::from_parents(new_parent, new_branch, n_leaves)
 }
-
 
 /// The branch the clustering would cut first, identified by its lower node.
 ///

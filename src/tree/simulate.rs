@@ -18,8 +18,8 @@
 //! (divided by `sqrt(v[g])`), which is what
 //! [`crate::model::likelihood::NodeState`] consumes; `v[g]` is returned in
 //! [`SimulatedData::variances`]. In these units the rescaling of SI.E.2.1
-//! becomes rescaling to unit variance, so Brownian steps are drawn with variance
-//! `t` rather than `t * v[g]`.
+//! becomes rescaling to unit variance, so Brownian steps are drawn with
+//! variance `t` rather than `t * v[g]`.
 //!
 //! Rescaling multiplies feature `g` by `1 / sd_g`, so the effective branch
 //! lengths seen by each feature differ by `1 / sd_g^2`. Topology recovery is
@@ -28,9 +28,9 @@
 //! ### Determinism
 //!
 //! [`crate::utils::rng::SplitMix64`] gives byte-identical output on every
-//! platform and thread count. Draws are consumed in a fixed order: `v[g]`, target
-//! means, topology, node positions, measurement noise. Reordering changes every
-//! fixture in the crate.
+//! platform and thread count. Draws are consumed in a fixed order: `v[g]`,
+//! target means, topology, node positions, measurement noise. Reordering
+//! changes every fixture in the crate.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};

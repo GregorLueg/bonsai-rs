@@ -3,9 +3,9 @@
 //! Replaces the greedy merge start of SPEC.md section 9.1 and is the default
 //! ([`crate::bonsai::StartTree`]). On real Sanity-preprocessed input it wins on
 //! loglikelihood and Robinson-Foulds and is several times faster;
-//! `docs/PERFORMANCE.md` has the table. The specified merge score chains on real
-//! data because of the size bias [`crate::bonsai::StartTree::GreedyMerge`] sets
-//! out. Nothing here is scored with the model.
+//! `docs/PERFORMANCE.md` has the table. The specified merge score chains on
+//! real data because of the size bias [`crate::bonsai::StartTree::GreedyMerge`]
+//! sets out. Nothing here is scored with the model.
 //!
 //! ### Why Ward and not the merge score
 //!
@@ -20,10 +20,10 @@
 //!
 //! Each round needs the nearest live cluster to every live cluster. A
 //! neighbour graph over the cells answers that only approximately for clusters,
-//! so each merge inherits the union of the children's neighbour lists (rewritten
-//! symmetrically, else the merged cluster is invisible to its neighbours and
-//! lists run dry), and the graph is rebuilt over the live centroids when the
-//! live count has halved (as SPEC.md section 11, see
+//! so each merge inherits the union of the children's neighbour lists
+//! (rewritten symmetrically, else the merged cluster is invisible to its
+//! neighbours and lists run dry), and the graph is rebuilt over the live
+//! centroids when the live count has halved (as SPEC.md section 11, see
 //! [`crate::search::candidates`]).
 //!
 //! ### Rounds, not a chain
@@ -126,9 +126,9 @@ impl Default for LinkageParams {
     }
 }
 
-////////////////////
+/////////////////////
 // Private helpers //
-////////////////////
+/////////////////////
 
 /// Pick a backend from the problem size.
 ///

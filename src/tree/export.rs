@@ -28,9 +28,9 @@ fn escape(label: &str) -> String {
 
 /// Write a tree and a layout as one CSV table.
 ///
-/// Columns: `node`, `parent`, `is_leaf`, `label`, `branch`, `x`, `y`. The root's
-/// `parent` is empty and its `branch` is zero. Internal nodes have an empty
-/// `label` unless one was supplied.
+/// Columns: `node`, `parent`, `is_leaf`, `label`, `branch`, `x`, `y`. The
+/// root's `parent` is empty and its `branch` is zero. Internal nodes have an
+/// empty `label` unless one was supplied.
 ///
 /// ### Params
 ///

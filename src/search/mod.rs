@@ -18,6 +18,10 @@ pub mod polytomy;
 pub mod spr;
 pub mod star;
 
+////////////
+// Leaves //
+////////////
+
 /// The leaf data a search step scores its trees against.
 ///
 /// Both blocks are row-major `[leaf][feature]` in the transformed units of

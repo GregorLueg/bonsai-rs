@@ -2,9 +2,9 @@
 //!
 //! Written rooted at [`Tree::root`]; the placement is a display choice, as the
 //! likelihood is root-independent (SPEC.md section 2, S14). Both directions are
-//! iterative, so deep ladders do not overflow the stack. Labels live outside the
-//! arena: the writer takes them indexed by leaf, the parser returns them the
-//! same way.
+//! iterative, so deep ladders do not overflow the stack. Labels live outside
+//! the arena: the writer takes them indexed by leaf, the parser returns them
+//! the same way.
 //!
 //! ### Deviations from strict Newick
 //!
@@ -16,8 +16,8 @@
 //!   section 1, `t[i]`).
 //! * A lone leaf is refused by the writer, as its Newick form (a bare label) is
 //!   rejected by this and every other parser.
-//! * Empty labels are legal, so `"(a,b,);"` is a three-leaf tree with an unnamed
-//!   leaf and a trailing-comma typo is not an error. Pinned by
+//! * Empty labels are legal, so `"(a,b,);"` is a three-leaf tree with an
+//!   unnamed leaf and a trailing-comma typo is not an error. Pinned by
 //!   `test_a_trailing_comma_is_an_unnamed_leaf`.
 
 use std::fmt::Write as _;
@@ -47,7 +47,8 @@ const PLAIN_DECIMAL_MAX: f64 = 1e15;
 /// likelihood unchanged (SPEC.md section 9.2).
 const DEFAULT_BRANCH_LENGTH: f64 = 0.0;
 
-/// Largest node count the arena can address (`u32` indices, [`NO_NODE`] reserved).
+/// Largest node count the arena can address (`u32` indices, [`NO_NODE`]
+/// reserved).
 const MAX_NODES: usize = NO_NODE as usize;
 
 /////////////

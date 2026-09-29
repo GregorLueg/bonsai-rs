@@ -43,10 +43,10 @@ const INITIAL_STAR_BRANCH: f64 = 1.0;
 
 /// How the initial topology is built.
 ///
-/// Search steps 1 and 2, or a linkage in their place; steps 3 to 7 are identical
-/// either way. The linkage is the default: on real Sanity-preprocessed input it
-/// beats the specified start on loglikelihood and Robinson-Foulds and is several
-/// times faster (`docs/PERFORMANCE.md`).
+/// Search steps 1 and 2, or a linkage in their place; steps 3 to 7 are
+/// identical either way. The linkage is the default: on real
+/// Sanity-preprocessed input it beats the specified start on loglikelihood and
+/// Robinson-Foulds and is several times faster (`docs/PERFORMANCE.md`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StartTree {
     /// The star of SPEC.md section 9.1, agglomerated by the merge score.

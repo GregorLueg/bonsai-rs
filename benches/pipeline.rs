@@ -15,10 +15,8 @@
 //! cargo bench --bench pipeline
 //! ```
 
-use bonsai_rs::bonsai::bonsai_prepared;
-use bonsai_rs::ingest::PreparedData;
+use bonsai_rs::prelude::*;
 use bonsai_rs::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
-use bonsai_rs::utils::verbosity::Verbosity;
 use std::time::Instant;
 
 /// Leaf counts swept, powers of two for the binary generator.

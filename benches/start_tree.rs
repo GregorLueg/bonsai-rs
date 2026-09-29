@@ -29,12 +29,11 @@
 //!
 //! Plain `main`, no harness.
 
-use bonsai_rs::bonsai::refine;
-use bonsai_rs::ingest::PreparedData;
 use bonsai_rs::model::global::{collapse_onto_every_node, optimise_branch_lengths};
 use bonsai_rs::model::likelihood::NodeState;
 use bonsai_rs::model::merge::EffLeaf;
 use bonsai_rs::model::place::place;
+use bonsai_rs::prelude::*;
 use bonsai_rs::search::Leaves;
 use bonsai_rs::search::bounds::EllipsoidBounds;
 use bonsai_rs::search::candidates::KnnCandidates;
@@ -42,13 +41,12 @@ use bonsai_rs::search::nni::nni;
 use bonsai_rs::search::polytomy::resolve_polytomies;
 use bonsai_rs::search::spr::spr;
 use bonsai_rs::search::star::{Star, star_tree_with};
+use bonsai_rs::tree::NO_NODE;
 use bonsai_rs::tree::linkage::{KnnBackend, LinkageParams, linkage_tree as graph_linkage};
 use bonsai_rs::tree::simulate::{
     SimulatedData, SimulationParams, robinson_foulds, simulate_binary, simulate_unbalanced,
 };
-use bonsai_rs::tree::{NO_NODE, Tree};
 use bonsai_rs::utils::rng::splitmix64_at;
-use bonsai_rs::utils::verbosity::Verbosity;
 use rayon::prelude::*;
 use std::time::Instant;
 

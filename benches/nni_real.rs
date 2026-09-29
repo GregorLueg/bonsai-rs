@@ -25,24 +25,21 @@
 //! Every variant reports the loglikelihood after step 7 and the RF to the
 //! generating tree, which are the gate.
 
-use bonsai_rs::bonsai::BonsaiParams;
-use bonsai_rs::bonsai::StartTree;
 use bonsai_rs::model::global::optimise_branch_lengths;
 use bonsai_rs::model::likelihood::NodeState;
+use bonsai_rs::prelude::*;
 use bonsai_rs::search::Leaves;
 use bonsai_rs::search::bounds::EllipsoidBounds;
 use bonsai_rs::search::candidates::KnnCandidates;
-use bonsai_rs::search::nni::{NniParams, NniResult, nni, nni_random};
+use bonsai_rs::search::nni::{NniResult, nni, nni_random};
 use bonsai_rs::search::polytomy::resolve_polytomies;
 use bonsai_rs::search::spr::spr;
 use bonsai_rs::search::star::{Star, star_tree_with};
+use bonsai_rs::tree::NO_NODE;
 use bonsai_rs::tree::linkage::linkage_tree;
-use bonsai_rs::tree::newick::{parse_newick, write_newick};
 use bonsai_rs::tree::simulate::{
     SimulationParams, robinson_foulds, simulate_binary, simulate_unbalanced,
 };
-use bonsai_rs::tree::{NO_NODE, Tree};
-use bonsai_rs::utils::verbosity::Verbosity;
 use std::collections::HashMap;
 use std::env;
 use std::fs;

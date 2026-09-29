@@ -27,21 +27,19 @@
 
 use std::time::Instant;
 
-use crate::ingest::{IngestParams, PreparedData, prepare};
 use crate::model::global::{GlobalBranchParams, collapse_onto_every_node, optimise_branch_lengths};
 use crate::model::likelihood::NodeState;
 use crate::prelude::*;
 use crate::search::bounds::EllipsoidBounds;
 use crate::search::candidates::{KnnCandidates, KnnCandidatesParams};
-use crate::search::nni::{NniParams, nni};
+use crate::search::nni::nni;
 use crate::search::polytomy::resolve_polytomies;
-use crate::search::spr::{SprParams, spr};
+use crate::search::spr::spr;
 use crate::search::star::{Star, StarParams, star_tree_with};
 use crate::search::{Leaves, tree_loglik};
-use crate::tree::Tree;
 use crate::tree::cluster::reroot_for_display;
 use crate::tree::linkage::{LinkageParams, linkage_tree};
-use crate::utils::traits::{BonsaiFloat, narrow};
+use crate::utils::traits::narrow;
 
 ////////////
 // Consts //

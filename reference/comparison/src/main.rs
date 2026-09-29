@@ -37,6 +37,7 @@ use bonsai_rs::bonsai::BonsaiParams;
 use bonsai_rs::ingest::{IngestParams, PreparedData, from_sanity, from_sanity_output, prepare};
 use bonsai_rs::model::global::optimise_branch_lengths;
 use bonsai_rs::model::likelihood::NodeState;
+use bonsai_rs::prelude::Verbosity;
 use bonsai_rs::search::Leaves;
 use bonsai_rs::search::bounds::EllipsoidBounds;
 use bonsai_rs::search::candidates::KnnCandidates;
@@ -729,7 +730,7 @@ fn ours(dir: &Path) -> Fallible<()> {
             },
             Some(params.star),
             &mut candidates,
-            bonsai_rs::utils::verbosity::Verbosity::Quiet,
+            Verbosity::Quiet,
         )?;
         let secs = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
@@ -835,7 +836,7 @@ fn refine_steps(
 
     // Step 5.
     let t0 = Instant::now();
-    let spr_result = spr(&tree, leaves, Some(params.spr), bonsai_rs::utils::verbosity::Verbosity::Quiet)?;
+    let spr_result = spr(&tree, leaves, Some(params.spr), Verbosity::Quiet)?;
     tree = spr_result.tree;
     let secs = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
@@ -850,7 +851,7 @@ fn refine_steps(
 
     // Step 6.
     let t0 = Instant::now();
-    let nni_result = nni(&tree, leaves, Some(params.nni), bonsai_rs::utils::verbosity::Verbosity::Quiet)?;
+    let nni_result = nni(&tree, leaves, Some(params.nni), Verbosity::Quiet)?;
     tree = nni_result.tree;
     let secs = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();

@@ -29,7 +29,7 @@
 
 use crate::prelude::*;
 use crate::utils::kernels::edge_newton;
-use crate::utils::traits::{BonsaiFloat, narrow, wide};
+use crate::utils::traits::{narrow, wide};
 use rayon::prelude::*;
 
 ///////////////

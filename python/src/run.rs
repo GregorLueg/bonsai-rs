@@ -5,15 +5,13 @@
 //! generic over it, so `float32` in means `float32` storage all the way down.
 //! Reductions are `f64` either way; that is the core's policy, not ours.
 
-use bonsai_rs::bonsai::{BonsaiParams, StartTree, bonsai as bonsai_run};
-use bonsai_rs::ingest::{IngestParams, from_sanity as s5, from_sanity_output};
-use bonsai_rs::search::nni::{NniParams, NniSearch};
-use bonsai_rs::search::spr::{SprParams, SprSearch};
+// Aliased: this file's `bonsai` and `from_sanity` are the Python entry points.
+use bonsai_rs::bonsai::bonsai as bonsai_run;
+use bonsai_rs::ingest::from_sanity as s5;
+use bonsai_rs::prelude::*;
 use bonsai_rs::tree::simulate::{
     SimulationParams, simulate_binary, simulate_binary_random_branches, simulate_unbalanced,
 };
-use bonsai_rs::utils::traits::BonsaiFloat;
-use bonsai_rs::utils::verbosity::{Verbosity, parse_verbosity_level};
 use numpy::{Element, IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;

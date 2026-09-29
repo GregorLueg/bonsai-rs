@@ -65,6 +65,7 @@
 
 use bonsai_rs::model::global::optimise_branch_lengths;
 use bonsai_rs::model::likelihood::NodeState;
+use bonsai_rs::prelude::*;
 use bonsai_rs::search::Leaves;
 use bonsai_rs::search::bounds::EllipsoidBounds;
 use bonsai_rs::search::candidates::KnnCandidates;
@@ -72,9 +73,7 @@ use bonsai_rs::search::nni::nni;
 use bonsai_rs::search::polytomy::resolve_polytomies;
 use bonsai_rs::search::spr::spr;
 use bonsai_rs::search::star::{Star, star_tree_with};
-use bonsai_rs::tree::Tree;
 use bonsai_rs::tree::simulate::{SimulationParams, simulate_binary};
-use bonsai_rs::utils::verbosity::Verbosity;
 use std::time::Instant;
 
 fn main() {

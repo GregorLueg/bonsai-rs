@@ -5,8 +5,8 @@
 //! [`Tree::from_parents`] takes, so nothing but the root sentinel is
 //! translated.
 
-use bonsai_rs::bonsai::BonsaiResult;
-use bonsai_rs::tree::{NO_NODE, Tree};
+use bonsai_rs::prelude::*;
+use bonsai_rs::tree::NO_NODE;
 use numpy::{
     Element, IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };

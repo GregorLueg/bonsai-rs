@@ -42,11 +42,9 @@
 //! cargo bench --bench recovery
 //! ```
 
-use bonsai_rs::bonsai::bonsai_prepared;
-use bonsai_rs::ingest::PreparedData;
+use bonsai_rs::prelude::*;
 use bonsai_rs::tree::distance::{MAX_PAIRS, distance_recovery};
 use bonsai_rs::tree::simulate::{SimulationParams, robinson_foulds, simulate_binary};
-use bonsai_rs::utils::verbosity::Verbosity;
 
 fn main() {
     println!(

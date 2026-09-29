@@ -139,16 +139,14 @@ class BonsaiResult:
         edge_width = 0.5 if n_leaves <= 1000 else 0.2
         ax.add_collection(
             LineCollection(
-                edges, colors="0.6", linewidths=edge_width, alpha=0.6, zorder=1
+                list(edges), colors="0.6", linewidths=edge_width, alpha=0.6, zorder=1
             )
         )
 
         marker_size = 10 if n_leaves <= 1000 else (3 if n_leaves <= 6000 else 1.5)
         leaf_xy = coords[:n_leaves]
-        scatter_kwargs = {"s": marker_size, "linewidths": 0, "zorder": 2}
-        if colours is None:
-            ax.scatter(leaf_xy[:, 0], leaf_xy[:, 1], **scatter_kwargs)
-        else:
+        c, cmap = None, None
+        if colours is not None:
             values = np.asarray(colours)
             if values.ndim != 1 or len(values) != n_leaves:
                 raise ValueError(
@@ -156,20 +154,21 @@ class BonsaiResult:
                     f"{values.shape}"
                 )
             if values.dtype.kind in "iuf":
-                ax.scatter(
-                    leaf_xy[:, 0],
-                    leaf_xy[:, 1],
-                    c=values,
-                    cmap="viridis",
-                    **scatter_kwargs,
-                )
+                c, cmap = values, "viridis"
             else:
                 categories, codes = np.unique(values, return_inverse=True)
-                cmap = plt.get_cmap("tab10" if len(categories) <= 10 else "tab20")
-                palette = np.array([cmap(i % cmap.N) for i in range(len(categories))])
-                ax.scatter(
-                    leaf_xy[:, 0], leaf_xy[:, 1], c=palette[codes], **scatter_kwargs
-                )
+                tab = plt.get_cmap("tab10" if len(categories) <= 10 else "tab20")
+                palette = np.array([tab(i % tab.N) for i in range(len(categories))])
+                c = palette[codes]
+        ax.scatter(
+            leaf_xy[:, 0],
+            leaf_xy[:, 1],
+            c=c,
+            cmap=cmap,
+            s=marker_size,
+            linewidths=0,
+            zorder=2,
+        )
 
         if kind != "dendrogram":
             ax.set_aspect("equal")

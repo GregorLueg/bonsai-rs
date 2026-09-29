@@ -1,54 +1,36 @@
 //! Ground-truth simulated datasets (SPEC.md section 13.1).
 //!
-//! Three generators, all producing a known tree together with data drawn on it,
-//! so that structural tests elsewhere in the crate can check *correctness*
-//! against a known answer rather than merely self-consistency.
+//! Each generator returns a known tree with data drawn on it, for correctness
+//! tests against a known answer.
 //!
 //! * [`simulate_binary`] - balanced binary tree, constant branch lengths
 //!   (SI.E.2.1)
-//! * [`simulate_binary_random_branches`] - the same topology with `log t`
-//!   uniform on `[log 0.5, log 2]` per child (SI.E.2.2)
-//! * [`simulate_unbalanced`] - grown by repeatedly splitting a randomly chosen
-//!   leaf (SI.E.2.3)
+//! * [`simulate_binary_random_branches`] - same topology, `log t` uniform on
+//!   `[log 0.5, log 2]` per child (SI.E.2.2)
+//! * [`simulate_unbalanced`] - grown by repeatedly splitting a random leaf
+//!   (SI.E.2.3)
 //!
 //! [`robinson_foulds`] compares a recovered topology against the ground truth.
 //!
-//! ### Units, which matter and are easy to get wrong
+//! ### Units
 //!
-//! **Everything returned by this module is in the transformed units of SPEC.md
-//! section 3.1**, that is, already divided by `sqrt(v[g])`. That is what
-//! [`crate::model::likelihood::NodeState`] consumes, so simulated data feeds
-//! straight in with no further work. The per-feature variances `v[g]` are
-//! returned alongside so a caller who wants the untransformed scale can
-//! multiply by `sqrt(v[g])`; see [`SimulatedData::variances`].
+//! Everything returned is in the transformed units of SPEC.md section 3.1
+//! (divided by `sqrt(v[g])`), which is what
+//! [`crate::model::likelihood::NodeState`] consumes; `v[g]` is returned in
+//! [`SimulatedData::variances`]. In these units the rescaling of SI.E.2.1
+//! becomes rescaling to unit variance, so Brownian steps are drawn with
+//! variance `t` rather than `t * v[g]`.
 //!
-//! A consequence worth stating outright: the rescaling step of SI.E.2.1
-//! ("rescale to variance `v[g]`") becomes "rescale to unit variance" once
-//! divided by `sqrt(v[g])`, so `v[g]` cancels out of the transformed data
-//! entirely, except through the per-feature target means. The generator
-//! therefore draws its Brownian steps directly in transformed units, with step
-//! variance `t` rather than `t * v[g]`. The two are algebraically identical.
-//!
-//! ### What the rescaling costs
-//!
-//! Centring and rescaling each feature multiplies feature `g` by its own factor
-//! `1 / sd_g`. The topology is untouched, but the *effective* branch lengths
-//! seen by feature `g` are the generating ones times `1 / sd_g^2`, and that
-//! factor differs from feature to feature. So the returned tree's branch
-//! lengths are the values the walk was generated with, and the data is exactly
-//! Brownian on that tree only up to a per-feature scale. Topology recovery is
+//! Rescaling multiplies feature `g` by `1 / sd_g`, so the effective branch
+//! lengths seen by each feature differ by `1 / sd_g^2`. Topology recovery is
 //! unaffected; branch-length recovery tests should expect a common offset.
 //!
 //! ### Determinism
 //!
-//! The random stream is deliberately fixed. [`crate::utils::rng::SplitMix64`]
-//! is used rather than `rand`, so the output is byte-identical on every
-//! platform and independent of thread count. Normal variates come from
-//! Box-Muller on two uniforms and exponentials from the inverse transform, both
-//! exactly reproducible. Draws are consumed in one fixed order: `v[g]`, then
-//! the target means, then the topology, then node positions, then measurement
-//! noise. Changing that order changes every fixture in the crate, so do not
-//! reorder it casually.
+//! [`crate::utils::rng::SplitMix64`] gives byte-identical output on every
+//! platform and thread count. Draws are consumed in a fixed order: `v[g]`,
+//! target means, topology, node positions, measurement noise. Reordering
+//! changes every fixture in the crate.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};
@@ -60,25 +42,18 @@ use rustc_hash::FxHashSet;
 // Constants //
 ///////////////
 
-/// Mean of the exponential distribution the per-feature variances `v[g]` are
-/// drawn from (SPEC.md section 13.1: "drawn from an exponential distribution
-/// with mean 2, which is what they observed in real data").
+/// Mean of the exponential the per-feature variances `v[g]` are drawn from
+/// (SPEC.md section 13.1).
 const VARIANCE_MEAN: f64 = 2.0;
 
-/// Lower end of the random branch length range (SPEC.md section 13.1,
-/// SI.E.2.2: `log(t)` uniform on `[log 0.5, log 2]`).
+/// Lower end of the random branch length range (SI.E.2.2).
 const RANDOM_BRANCH_LO: f64 = 0.5;
 
-/// Upper end of the random branch length range (SPEC.md section 13.1,
-/// SI.E.2.2).
+/// Upper end of the random branch length range (SI.E.2.2).
 const RANDOM_BRANCH_HI: f64 = 2.0;
 
-/// Smallest per-feature variance that is rescaled rather than left alone.
-///
-/// Below this the feature is constant across cells to within rounding and
-/// dividing by its standard deviation would manufacture noise. Our value, not
-/// the paper's; it only guards a degenerate case that a well-formed simulation
-/// never reaches.
+/// Smallest per-feature variance that is rescaled; below it the feature is
+/// constant to within rounding. Our value, guards a degenerate case only.
 const MIN_FEATURE_VARIANCE: f64 = 1e-300;
 
 ////////////////
@@ -87,14 +62,10 @@ const MIN_FEATURE_VARIANCE: f64 = 1e-300;
 
 /// Everything the three generators can be steered by.
 ///
-/// `n_leaves` is interpreted differently by the balanced generators, which
-/// require a power of two and derive the generation count from it, and by
-/// [`simulate_unbalanced`], which accepts any count of at least two.
 #[derive(Clone, Copy, Debug)]
 pub struct SimulationParams {
-    /// Number of cells, that is, leaves of the ground-truth tree. The balanced
-    /// generators require a power of two of at least two, and take the number
-    /// of generations to be its base-two logarithm.
+    /// Number of leaves. The balanced generators require a power of two of at
+    /// least two; [`simulate_unbalanced`] accepts any count of at least two.
     pub n_leaves: usize,
     /// Number of features.
     pub n_features: usize,
@@ -102,33 +73,23 @@ pub struct SimulationParams {
     /// [`simulate_unbalanced`]. Ignored by
     /// [`simulate_binary_random_branches`].
     pub branch_length: f64,
-    /// Measurement noise level, in transformed units. Since the true positions
-    /// are rescaled to unit variance per feature, this is directly the
-    /// noise-to-signal ratio: `0.1` means an error bar a tenth of the spread of
-    /// the data. Must be strictly positive, because a zero standard deviation
-    /// is an infinite precision and the pruning recursion cannot carry it.
+    /// Measurement noise level in transformed units, i.e. the noise-to-signal
+    /// ratio. Must be strictly positive (zero SD is infinite precision).
     pub noise_sd: f64,
-    /// Spread of the per-cell per-feature error bars about `noise_sd`. Each
-    /// standard deviation is multiplied by a log-uniform draw on
-    /// `[1 / noise_spread, noise_spread]`, so `1.0` is homoscedastic and values
-    /// below `1.0` are rejected. Real data is not homoscedastic and the
-    /// precision-weighted machinery deserves to be exercised, so the default is
-    /// not `1.0`.
+    /// Spread of the error bars about `noise_sd`: each SD is multiplied by a
+    /// log-uniform draw on `[1 / noise_spread, noise_spread]`. `1.0` is
+    /// homoscedastic; values below `1.0` are rejected.
     pub noise_spread: f64,
-    /// Standard deviation of the per-feature target means `mu[g]` of SPEC.md
-    /// section 13.1, in *untransformed* units. The tree loglikelihood depends
-    /// only on differences of means within a feature, so this shifts the data
-    /// without changing any score; it defaults to zero and exists so that the
-    /// generator is faithful to the specification.
+    /// Standard deviation of the per-feature target means `mu[g]` (SPEC.md
+    /// section 13.1), untransformed units. Shifts the data without changing any
+    /// score.
     pub feature_mean_sd: f64,
     /// Seed for the splitmix64 stream.
     pub seed: u64,
 }
 
 impl Default for SimulationParams {
-    /// A small, fast fixture: 64 cells by 200 features on unit branches, with
-    /// error bars a tenth of the data spread and a factor-of-two spread on
-    /// them.
+    /// A small fixture: 64 cells by 200 features on unit branches.
     ///
     /// ### Returns
     ///
@@ -152,10 +113,9 @@ impl Default for SimulationParams {
 
 /// One simulated dataset with its ground truth.
 ///
-/// All three matrices are row-major `[leaf][feature]`, the layout
-/// [`crate::model::likelihood::NodeState::new`] expects, and all three are in
-/// the transformed units of SPEC.md section 3.1. Multiply column `g` by
-/// `variances[g].sqrt()` to recover the untransformed scale.
+/// All three matrices are row-major `[leaf][feature]` in transformed units
+/// (SPEC.md section 3.1); multiply column `g` by `variances[g].sqrt()` to
+/// untransform.
 #[derive(Clone, Debug)]
 pub struct SimulatedData<T> {
     /// The tree the data was generated on, with the generating branch lengths.
@@ -167,8 +127,7 @@ pub struct SimulatedData<T> {
     pub means: Vec<T>,
     /// Observed standard deviations on those means, `[leaf][feature]`.
     pub sds: Vec<T>,
-    /// Per-feature total variances `v[g]`, on the *untransformed* scale. These
-    /// are what the transform of SPEC.md section 3.1 divided out.
+    /// Per-feature variances `v[g]`, untransformed scale.
     pub variances: Vec<f64>,
     /// Number of leaves.
     pub n_leaves: usize,
@@ -200,9 +159,7 @@ impl<T: BonsaiFloat> SimulatedData<T> {
 
 /// Validate a parameter set and open its random stream.
 ///
-/// Draws the per-feature variances and target means, which come first in the
-/// stream for every generator so that the three agree on those quantities for a
-/// given seed.
+/// Draws the per-feature variances and target means first, for every generator.
 ///
 /// ### Params
 ///
@@ -230,7 +187,6 @@ fn open_stream(
             ),
         });
     }
-    // `is_finite` first, so a NaN is rejected without a negated comparison.
     if !params.noise_sd.is_finite() || params.noise_sd <= 0.0 {
         return Err(BonsaiErrors::NonPositiveSd {
             value: params.noise_sd,
@@ -241,9 +197,8 @@ fn open_stream(
     if !params.noise_spread.is_finite() || params.noise_spread < 1.0 {
         return Err(BonsaiErrors::MalformedTree {
             reason: format!(
-                "noise_spread {} is below 1; the error bars are multiplied by a log-uniform \
-                 draw on [1 / noise_spread, noise_spread], so the spread factor is the upper \
-                 end of that interval and cannot be less than one",
+                "noise_spread {} is below 1; it is the upper end of the log-uniform error bar \
+                 multiplier interval and cannot be less than one",
                 params.noise_spread
             ),
         });
@@ -253,8 +208,7 @@ fn open_stream(
     let variances: Vec<f64> = (0..params.n_features)
         .map(|_| rng.exponential(VARIANCE_MEAN))
         .collect();
-    // Drawn unconditionally, even when the spread is zero, so that the stream
-    // position after this point does not depend on `feature_mean_sd`.
+    // Drawn even when `feature_mean_sd` is zero, to keep the stream position fixed.
     let offsets: Vec<f64> = variances
         .iter()
         .map(|&v| params.feature_mean_sd * rng.normal() / v.sqrt())
@@ -264,9 +218,7 @@ fn open_stream(
 
 /// Parent array of a balanced binary tree over `n_leaves` leaves.
 ///
-/// Built bottom-up by pairing, which is exactly the numbering the arena
-/// invariant wants: leaves occupy `0..n_leaves` and every internal node is
-/// allocated after both of its children.
+/// Built bottom-up by pairing, which satisfies the arena numbering.
 ///
 /// ### Params
 ///
@@ -306,12 +258,8 @@ fn balanced_parents(n_leaves: usize) -> Result<Vec<u32>, BonsaiErrors> {
 /// Grow an unbalanced topology by repeatedly splitting a random leaf
 /// (SPEC.md section 13.1, SI.E.2.3).
 ///
-/// The construction numbers the root zero and appends children, which is the
-/// reverse of what the arena wants, so the result is relabelled: leaves take
-/// `0..n_leaves` in construction order and internal nodes are sorted by height
-/// above the leaves. A parent's height strictly exceeds every child's, so that
-/// ordering satisfies the "parents have larger indices" requirement of
-/// [`Tree::from_parents`].
+/// Relabelled into arena numbering: leaves take `0..n_leaves` in construction
+/// order, internal nodes follow sorted by height.
 ///
 /// ### Params
 ///
@@ -322,8 +270,7 @@ fn balanced_parents(n_leaves: usize) -> Result<Vec<u32>, BonsaiErrors> {
 ///
 /// The parent array in arena numbering.
 fn unbalanced_parents(rng: &mut SplitMix64, n_leaves: usize) -> Vec<u32> {
-    // Construction numbering: node 0 is the root, children are appended, so a
-    // child's index always exceeds its parent's.
+    // Construction numbering: root is 0, children are appended.
     let mut built = vec![NO_NODE];
     let mut open: Vec<u32> = vec![0];
     for _ in 0..n_leaves - 1 {
@@ -345,8 +292,7 @@ fn unbalanced_parents(rng: &mut SplitMix64, n_leaves: usize) -> Vec<u32> {
         }
     }
 
-    // Children have larger construction indices, so a descending scan settles
-    // every child before its parent.
+    // Descending scan settles children before parents.
     let mut height = vec![0u32; n_nodes];
     for node in (1..n_nodes).rev() {
         let par = built[node] as usize;
@@ -381,10 +327,8 @@ fn unbalanced_parents(rng: &mut SplitMix64, n_leaves: usize) -> Vec<u32> {
 
 /// Walk the tree from the root, centre and rescale, then add measurement noise.
 ///
-/// Shared tail of all three generators. Positions are drawn in transformed
-/// units, so the Brownian step along a branch of length `t` has variance `t`
-/// rather than `t * v[g]`; see the module documentation for why those are the
-/// same thing once the rescaling step is applied.
+/// Shared tail of all three generators; Brownian steps have variance `t` in
+/// transformed units (see the module docs).
 ///
 /// ### Params
 ///
@@ -411,8 +355,7 @@ fn assemble<T: BonsaiFloat>(
     let p = params.n_features;
     let n_nodes = parent.len();
 
-    // Descending index order is a valid pre-order: the arena invariant puts
-    // every parent above its children, and the root is the last node.
+    // Descending index order is a pre-order (root last, parents above children).
     let mut pos = vec![0.0f64; n_nodes * p];
     for node in (0..n_nodes - 1).rev() {
         let par = parent[node] as usize;
@@ -423,9 +366,7 @@ fn assemble<T: BonsaiFloat>(
         }
     }
 
-    // Per feature: centre across cells, then rescale to variance `v[g]`. In
-    // transformed units that target variance is one, since the whole feature
-    // has already been divided by `sqrt(v[g])`.
+    // Centre and rescale per feature; the target variance is one in transformed units.
     let n = n_leaves as f64;
     let mut truth = vec![0.0f64; n_leaves * p];
     for g in 0..p {
@@ -476,11 +417,9 @@ fn assemble<T: BonsaiFloat>(
 /// Simulate on a balanced binary tree with constant branch lengths
 /// (SPEC.md section 13.1, SI.E.2.1).
 ///
-/// The root sits at the origin in `p` dimensions and each child adds a
-/// per-feature Gaussian step of variance `t * v[g]`, which is variance `t` in
-/// the transformed units this returns. `n_leaves` must be a power of two; its
-/// base-two logarithm is the generation count, and only the last generation is
-/// kept as data.
+/// The root sits at the origin and each child adds a Gaussian step of variance
+/// `t` per feature (transformed units). `n_leaves` must be a power of two; only
+/// the last generation is kept as data.
 ///
 /// ### Params
 ///
@@ -549,11 +488,8 @@ pub fn simulate_binary_random_branches<T: BonsaiFloat>(
 /// Simulate on an unbalanced tree grown by splitting random leaves
 /// (SPEC.md section 13.1, SI.E.2.3).
 ///
-/// Starts from a single node and repeats `n_leaves - 1` times: pick a leaf
-/// uniformly at random, give it two children, and replace it in the leaf list
-/// with them. Any `n_leaves` of at least two works. The specification says
-/// nothing about branch lengths here, so `params.branch_length` is used
-/// throughout, as in [`simulate_binary`].
+/// Any `n_leaves` of at least two works. The specification gives no branch
+/// lengths here, so `params.branch_length` is used throughout.
 ///
 /// ### Params
 ///
@@ -587,13 +523,9 @@ pub fn simulate_unbalanced<T: BonsaiFloat>(
 
 /// The set of non-trivial splits of a tree, each as a sorted leaf-index list.
 ///
-/// The arena holds an unrooted tree in a rooted representation, and the
-/// loglikelihood does not depend on where the root sits (SPEC.md section 2,
-/// S14), so the comparison must be over unrooted splits. Each internal node
-/// below the root induces a bipartition of the leaves; it is canonicalised to
-/// whichever side does not contain leaf zero, so that a tree and any rerooting
-/// of it produce the same set. Splits with fewer than two leaves on either side
-/// are trivial, present in every tree over the leaf set, and dropped.
+/// Unrooted, as the likelihood is root-independent (SPEC.md section 2, S14):
+/// each split is canonicalised to the side without leaf zero, so rerootings agree.
+/// Trivial splits (fewer than two leaves on a side) are dropped.
 ///
 /// ### Params
 ///
@@ -606,8 +538,6 @@ pub(crate) fn splits(tree: &Tree) -> FxHashSet<Vec<u32>> {
     let n_leaves = tree.n_leaves();
     let n_nodes = tree.n_nodes();
 
-    // Ascending index order is a post-order, so a node's children are settled
-    // by the time it is reached.
     let mut clade: Vec<Vec<u32>> = Vec::with_capacity(n_nodes);
     for node in 0..n_nodes {
         if node < n_leaves {
@@ -626,7 +556,6 @@ pub(crate) fn splits(tree: &Tree) -> FxHashSet<Vec<u32>> {
     let mut present = vec![false; n_leaves];
     for node in n_leaves..n_nodes {
         let below = &clade[node];
-        // Take the side without leaf zero, so a rerooting maps to the same key.
         let side: Vec<u32> = if below.first() == Some(&0) {
             for f in present.iter_mut() {
                 *f = false;
@@ -649,14 +578,9 @@ pub(crate) fn splits(tree: &Tree) -> FxHashSet<Vec<u32>> {
 
 /// Robinson-Foulds distance between two trees over the same leaf set.
 ///
-/// The size of the symmetric difference of the two sets of non-trivial splits.
-/// Zero means the two topologies are identical as unrooted trees; the maximum
-/// for two binary trees over `n` leaves is `2 * (n - 3)`. Branch lengths are
-/// ignored.
-///
-/// Leaves are matched by index, which is what makes this usable against the
-/// simulator: [`Tree::from_parents`] relabels internal nodes but never leaves,
-/// so a recovered tree indexes cells the same way the ground truth does.
+/// The size of the symmetric difference of the two non-trivial split sets; the
+/// maximum for two binary trees over `n` leaves is `2 * (n - 3)`. Branch lengths
+/// are ignored. Leaves are matched by index.
 ///
 /// ### Params
 ///

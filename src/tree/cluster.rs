@@ -1,46 +1,26 @@
 //! Unsupervised clustering by iterative branch cutting.
 //!
-//! Cut a branch and the tree falls into two pieces; cut `k - 1` branches and it
-//! falls into `k`. The clustering of the Methods picks those branches greedily,
-//! each cut chosen to minimise the sum, over the pieces that result, of the
-//! pairwise distances between the leaves within a piece. Distances are always
-//! sums of branch lengths along the tree path (SPEC.md section 14), never
-//! anything geometric.
+//! Cutting `k - 1` branches splits the tree into `k` pieces. Each cut is
+//! chosen greedily to minimise the summed within-piece pairwise leaf distance,
+//! where distances are sums of branch lengths along the tree path (SPEC.md
+//! section 14).
 //!
 //! ### The `a * b` edge weighting
 //!
-//! Written out, the objective looks quadratic in the leaf count:
-//!
-//! ```text
-//! S(T) = sum_{i < j} d(i, j)
-//! ```
-//!
-//! It is not. `d(i, j)` is the sum of the lengths of the branches on the path
-//! from `i` to `j`, so exchanging the order of summation counts each branch
-//! once per leaf pair whose path crosses it. Deleting a branch splits the
-//! leaves into `a` on one side and `b` on the other, and a path crosses that
-//! branch exactly when it joins one side to the other, which happens for `a * b`
-//! of the pairs. So
+//! `S(T) = sum_{i < j} d(i, j)` looks quadratic, but each branch is crossed by
+//! `a * b` leaf pairs, where `a` and `b` are the leaf counts either side of it:
 //!
 //! ```text
 //! S(T) = sum_{branches e} len(e) * a(e) * b(e)
 //! ```
 //!
-//! which is one pass over the edges. This is the whole reason the procedure is
-//! usable: it turns an `O(n^2)` sum into an `O(n)` one, and `a(e)` is just the
-//! leaf count below `e`, settled by a single ascending scan of the arena.
-//!
-//! Note what the weighting is *not*: it is not the sum of branch lengths. A
-//! branch in the middle of a tree carries far more leaf-to-leaf paths than one
-//! at a tip, and `a * b` is exactly how much more.
+//! One pass over the edges, with `a(e)` from a single ascending scan.
 //!
 //! ### Which branch to cut
 //!
 //! Splitting a piece into `A` and `B` leaves
-//! `S(A) + S(B) = S(A u B) - sum_{i in A, j in B} d(i, j)`, since the pairs that
-//! stop being counted are exactly the crossing ones. So *minimising* what is
-//! left is *maximising* the crossing sum, and the crossing sum has the same
-//! rearrangement:
+//! `S(A) + S(B) = S(A u B) - sum_{i in A, j in B} d(i, j)`, so minimising the
+//! remainder is maximising the crossing sum
 //!
 //! ```text
 //! cross(e) = b * D(v) + a * U(v)
@@ -48,29 +28,18 @@
 //!
 //! where `v` is the lower end of `e`, `a` and `b` are the leaf counts below and
 //! above it, `D(v)` is the summed distance from `v` down to the leaves below it
-//! and `U(v)` the summed distance from `v` out to the leaves above it. `D` comes
-//! from an ascending scan and `U` from the descending one that follows, so every
-//! branch of a piece is scored in two linear passes.
-//!
-//! Only branches with a leaf on both sides are candidates, which is what keeps
-//! every cluster non-empty and makes `k` clusters reachable for any
-//! `k <= n_leaves`.
+//! and `U(v)` the summed distance from `v` to the leaves above it. `D` comes
+//! from an ascending scan and `U` from a descending one. Only branches with a
+//! leaf on both sides are candidates, so every cluster is non-empty.
 //!
 //! ### The root
 //!
-//! [`root_edge`] is the branch this procedure would cut first and [`reroot`]
-//! puts a new node on it. **This changes nothing about the model.** The
-//! loglikelihood does not depend on where the root sits (SPEC.md section 2,
-//! S14); the root is a bookkeeping choice that fixes what "downstream" means,
-//! and moving it is a display decision and nothing more. A reader who assumes
-//! otherwise will go looking for a likelihood change that is not there.
+//! [`root_edge`] is the branch cut first and [`reroot`] puts a new node on it.
+//! The loglikelihood does not depend on the root (SPEC.md section 2, S14), so
+//! this is a display decision only.
 //!
-//! ### Depth
-//!
-//! Every traversal here is a flat scan over the arena or an explicit stack.
-//! Bonsai trees can be deep and laddery ([`Tree::ladder`] exists to exercise
-//! that), and a recursive version would overflow the stack on a real dataset,
-//! which is the same reason [`crate::tree::layout`] is written the way it is.
+//! Every traversal is a flat scan or uses an explicit stack, so deep ladders do
+//! not overflow.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};
@@ -103,19 +72,270 @@ pub struct Clustering {
     pub sizes: Vec<usize>,
 }
 
+///////////////////////
+// The greedy cutter //
+///////////////////////
+
+/// Buffers the per-piece sweeps reuse, sized once for the whole tree.
+struct Scratch {
+    /// Leaves of the piece below each node.
+    count: Vec<u32>,
+    /// Summed distance from a node down to the piece's leaves below it.
+    down: Vec<f64>,
+    /// Summed distance from a node to every leaf of its piece.
+    total: Vec<f64>,
+    /// Membership flag, set only while a piece is being split.
+    mark: Vec<bool>,
+}
+
+impl Scratch {
+    /// Allocate for a tree of `n_nodes` nodes.
+    ///
+    /// ### Params
+    ///
+    /// * `n_nodes` - Node count of the tree
+    ///
+    /// ### Returns
+    ///
+    /// Zeroed buffers.
+    fn new(n_nodes: usize) -> Self {
+        Self {
+            count: vec![0; n_nodes],
+            down: vec![0.0; n_nodes],
+            total: vec![0.0; n_nodes],
+            mark: vec![false; n_nodes],
+        }
+    }
+}
+
+/// A connected piece of the tree left by the cuts made so far.
+struct Piece {
+    /// Its nodes, ascending. The last is its top (the ancestor-most node is the
+    /// highest-numbered).
+    nodes: Vec<u32>,
+    /// Original leaves it holds, which is what a cluster is.
+    n_leaves: usize,
+    /// Smallest leaf index it holds, or `u32::MAX` if none; tie break for numbering.
+    first_leaf: u32,
+    /// Best cut: the node whose upstream branch to cut and the reduction it
+    /// buys. `None` if no cut leaves a leaf on both sides.
+    best: Option<(u32, f64)>,
+    /// Node minimising the summed distance to the piece's leaves.
+    centre: u32,
+}
+
+impl Piece {
+    /// The piece covering an entire tree, before any cut.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - Tree to cover
+    ///
+    /// ### Returns
+    ///
+    /// The piece, unanalysed.
+    fn whole(tree: &Tree) -> Self {
+        Self::new((0..tree.n_nodes() as u32).collect())
+    }
+
+    /// A piece over a node list, with its measurements left unset.
+    ///
+    /// ### Params
+    ///
+    /// * `nodes` - Its nodes, ascending
+    ///
+    /// ### Returns
+    ///
+    /// The piece, which [`Piece::analyse`] must fill in before use.
+    fn new(nodes: Vec<u32>) -> Self {
+        let centre = nodes.first().copied().unwrap_or(0);
+        Self {
+            nodes,
+            n_leaves: 0,
+            first_leaf: u32::MAX,
+            best: None,
+            centre,
+        }
+    }
+
+    /// Measure the piece: its leaf count, its centre and its best cut.
+    ///
+    /// Two passes: ascending (post-order) settles `a` and `D`, descending turns
+    /// `D` into the summed distance to every leaf, giving `U` by subtraction;
+    /// `cross = b * D + a * U` then scores every branch (module docs).
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - Tree the piece belongs to
+    /// * `s` - Scratch buffers, whose contents are not preserved
+    fn analyse(&mut self, tree: &Tree, s: &mut Scratch) {
+        let Some(&top) = self.nodes.last() else {
+            return;
+        };
+        let n_leaves = tree.n_leaves() as u32;
+
+        for &v in &self.nodes {
+            s.count[v as usize] = u32::from(v < n_leaves);
+            s.down[v as usize] = 0.0;
+        }
+        for &v in &self.nodes {
+            if v == top {
+                continue;
+            }
+            let Some(p) = tree.parent(v) else {
+                continue;
+            };
+            let a = f64::from(s.count[v as usize]);
+            s.count[p as usize] += s.count[v as usize];
+            s.down[p as usize] += s.down[v as usize] + a * tree.branch(v);
+        }
+
+        let m = f64::from(s.count[top as usize]);
+        for &v in self.nodes.iter().rev() {
+            if v == top {
+                s.total[v as usize] = s.down[v as usize];
+                continue;
+            }
+            let Some(p) = tree.parent(v) else {
+                continue;
+            };
+            // Moving from `p` to `v` approaches the `a` leaves below, leaves `m - a`.
+            let a = f64::from(s.count[v as usize]);
+            s.total[v as usize] = s.total[p as usize] + tree.branch(v) * (m - 2.0 * a);
+        }
+
+        self.n_leaves = s.count[top as usize] as usize;
+        self.first_leaf = self
+            .nodes
+            .first()
+            .copied()
+            .filter(|&v| v < n_leaves)
+            .unwrap_or(u32::MAX);
+        self.best = None;
+        let mut centre = top;
+        let mut centre_total = f64::INFINITY;
+        for &v in &self.nodes {
+            // Strict comparison on an ascending scan: ties go to the smallest index.
+            if s.total[v as usize] < centre_total {
+                centre_total = s.total[v as usize];
+                centre = v;
+            }
+            if v == top {
+                continue;
+            }
+            let a = f64::from(s.count[v as usize]);
+            let b = m - a;
+            if a == 0.0 || b == 0.0 {
+                continue;
+            }
+            let up = s.total[v as usize] - s.down[v as usize];
+            let cross = b * s.down[v as usize] + a * up;
+            if self.best.is_none_or(|(_, seen)| cross > seen) {
+                self.best = Some((v, cross));
+            }
+        }
+        self.centre = centre;
+    }
+}
+
+/// Cut the tree greedily into `n_clusters` pieces.
+///
+/// Each round takes the best cut over all pieces, splits that piece and
+/// remeasures only the two halves.
+///
+/// ### Params
+///
+/// * `tree` - Tree to cut
+/// * `n_clusters` - Number of pieces wanted, at least one
+///
+/// ### Returns
+///
+/// The pieces, measured.
+fn cut_greedily(tree: &Tree, n_clusters: usize) -> Vec<Piece> {
+    let mut scratch = Scratch::new(tree.n_nodes());
+    let mut pieces = vec![Piece::whole(tree)];
+    pieces[0].analyse(tree, &mut scratch);
+
+    let mut cut = vec![false; tree.n_nodes()];
+    while pieces.len() < n_clusters {
+        let mut chosen: Option<(usize, u32, f64)> = None;
+        for (i, piece) in pieces.iter().enumerate() {
+            let Some((node, cross)) = piece.best else {
+                continue;
+            };
+            let better = match chosen {
+                None => true,
+                Some((_, seen, best)) => cross > best || (cross == best && node < seen),
+            };
+            if better {
+                chosen = Some((i, node, cross));
+            }
+        }
+        let Some((i, node, _)) = chosen else {
+            break;
+        };
+
+        cut[node as usize] = true;
+        let mut below = split_off(tree, &mut pieces[i], node, &cut, &mut scratch);
+        pieces[i].analyse(tree, &mut scratch);
+        below.analyse(tree, &mut scratch);
+        pieces.push(below);
+    }
+    pieces
+}
+
+/// Split the subtree below `node` out of a piece.
+///
+/// The partition keeps both halves ascending, preserving "top is last".
+///
+/// ### Params
+///
+/// * `tree` - Tree the piece belongs to
+/// * `piece` - Piece to split, left holding everything above the cut
+/// * `node` - Node whose upstream branch has just been cut
+/// * `cut` - Which branches are cut, indexed by their lower node
+/// * `s` - Scratch buffers; `mark` is left as it was found
+///
+/// ### Returns
+///
+/// The piece below the cut, unanalysed.
+fn split_off(tree: &Tree, piece: &mut Piece, node: u32, cut: &[bool], s: &mut Scratch) -> Piece {
+    let mut stack = vec![node];
+    while let Some(u) = stack.pop() {
+        s.mark[u as usize] = true;
+        for &c in tree.children(u) {
+            if !cut[c as usize] {
+                stack.push(c);
+            }
+        }
+    }
+
+    let mut below = Vec::new();
+    let mut above = Vec::with_capacity(piece.nodes.len());
+    for &v in &piece.nodes {
+        if s.mark[v as usize] {
+            below.push(v);
+        } else {
+            above.push(v);
+        }
+    }
+    for &v in &below {
+        s.mark[v as usize] = false;
+    }
+    piece.nodes = above;
+    Piece::new(below)
+}
+
+/////////////////
+// Entry point //
+/////////////////
+
 /// Cluster the leaves by iteratively cutting branches.
 ///
-/// The procedure of the module docs: `n_clusters - 1` cuts, each the branch
-/// that minimises the summed within-piece pairwise leaf distance over the
-/// pieces it produces. Every cut keeps at least one leaf on each side, so no
-/// cluster is empty and the request is always met exactly.
-///
-/// Deterministic: ties on the objective are broken by the smaller node index,
-/// and nothing here is parallel or randomised.
-///
-/// Cost is `O(n_nodes * n_clusters)` in the worst case, since a cut recomputes
-/// only the two pieces it created and those can be as lopsided as the tree is.
-/// On a balanced tree it is closer to `O(n_nodes * log n_clusters)`.
+/// `n_clusters - 1` greedy cuts as in the module docs; no cluster is empty.
+/// Deterministic: ties go to the smaller node index. Worst case
+/// `O(n_nodes * n_clusters)`, closer to `O(n_nodes * log n_clusters)` on a
+/// balanced tree.
 ///
 /// ### Params
 ///
@@ -130,8 +350,7 @@ pub fn cluster(tree: &Tree, n_clusters: usize) -> Clustering {
     let wanted = n_clusters.clamp(1, n_leaves);
     let pieces = cut_greedily(tree, wanted);
 
-    // Order clusters by decreasing size, ties by the smallest leaf they hold.
-    // Both keys are functions of the tree alone, so the numbering is too.
+    // Decreasing size, ties by smallest leaf: numbering depends on the tree alone.
     let mut keyed: Vec<(usize, u32, usize)> = pieces
         .iter()
         .enumerate()
@@ -164,6 +383,98 @@ pub fn cluster(tree: &Tree, n_clusters: usize) -> Clustering {
 // Root selection //
 ////////////////////
 
+/// Renumber a rerooted parent array into the arena's ordering and build a tree.
+///
+/// [`Tree::from_parents`] checks rather than fixes that every parent index
+/// exceeds its children's. A breadth-first walk from the new root lists parents
+/// first, so numbering internal nodes in reverse of it satisfies that. Leaves
+/// keep their indices.
+///
+/// ### Params
+///
+/// * `parent` - Parent of each node in the rerooted tree, `NO_NODE` for the root
+/// * `branch` - Length of the branch above each node, same indexing
+/// * `n_leaves` - Leaf count; leaves occupy `0..n_leaves` in both indexings
+/// * `new_root` - Index of the root in the incoming arrays
+/// * `dead` - Node dropped by degree-two suppression, if any
+///
+/// ### Returns
+///
+/// The tree, or `MalformedTree` if the arrays do not describe one connected
+/// tree over the surviving nodes.
+fn relabel_from(
+    parent: Vec<u32>,
+    branch: Vec<f64>,
+    n_leaves: usize,
+    new_root: u32,
+    dead: Option<u32>,
+) -> Result<Tree, BonsaiErrors> {
+    let total = parent.len();
+    let live = total - usize::from(dead.is_some());
+
+    let mut ptr = vec![0u32; total + 1];
+    for v in 0..total {
+        if Some(v as u32) == dead || parent[v] == NO_NODE {
+            continue;
+        }
+        ptr[parent[v] as usize + 1] += 1;
+    }
+    for i in 0..total {
+        ptr[i + 1] += ptr[i];
+    }
+    let mut cursor = ptr.clone();
+    let mut kids = vec![0u32; ptr[total] as usize];
+    for v in 0..total {
+        if Some(v as u32) == dead || parent[v] == NO_NODE {
+            continue;
+        }
+        let p = parent[v] as usize;
+        kids[cursor[p] as usize] = v as u32;
+        cursor[p] += 1;
+    }
+
+    let mut order = Vec::with_capacity(live);
+    order.push(new_root);
+    let mut head = 0usize;
+    while head < order.len() {
+        let u = order[head] as usize;
+        head += 1;
+        order.extend_from_slice(&kids[ptr[u] as usize..ptr[u + 1] as usize]);
+    }
+    if order.len() != live {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!(
+                "rerooting reached {} of {live} nodes, so the parent array is not connected",
+                order.len()
+            ),
+        });
+    }
+
+    let mut relabel = vec![NO_NODE; total];
+    for (i, slot) in relabel.iter_mut().take(n_leaves).enumerate() {
+        *slot = i as u32;
+    }
+    let mut next = n_leaves as u32;
+    for &u in order.iter().rev() {
+        if (u as usize) >= n_leaves {
+            relabel[u as usize] = next;
+            next += 1;
+        }
+    }
+
+    let mut new_parent = vec![NO_NODE; live];
+    let mut new_branch = vec![0.0f64; live];
+    for &u in &order {
+        let i = relabel[u as usize] as usize;
+        new_parent[i] = match parent[u as usize] {
+            NO_NODE => NO_NODE,
+            p => relabel[p as usize],
+        };
+        new_branch[i] = branch[u as usize];
+    }
+    Tree::from_parents(new_parent, new_branch, n_leaves)
+}
+
 /// The branch the clustering would cut first, identified by its lower node.
 ///
 /// ### Params
@@ -192,14 +503,9 @@ pub fn root_edge(tree: &Tree) -> Result<u32, BonsaiErrors> {
 
 /// Rebuild a tree with a fresh root sitting on one branch.
 ///
-/// The branch above `edge` is replaced by two, meeting at a new node that
-/// becomes the root; [`ROOT_SPLIT`] says where along it they meet. The two
-/// halves sum to the original, so every leaf-to-leaf path length is unchanged
-/// and so, by S14, is the loglikelihood.
-///
-/// **Leaf indices are preserved.** Only internal nodes are renumbered, so any
-/// per-leaf data the caller holds, a [`crate::model::likelihood::NodeState`]
-/// included, indexes the result unchanged.
+/// The branch above `edge` is split at [`ROOT_SPLIT`] by a new root node. Path
+/// lengths, and by S14 the loglikelihood, are unchanged. Leaf indices are
+/// preserved; only internal nodes are renumbered.
 ///
 /// ### Params
 ///
@@ -289,369 +595,6 @@ pub fn reroot(tree: &Tree, edge: u32) -> Result<Tree, BonsaiErrors> {
 /// The rerooted tree, or `MalformedTree` if the tree is a single leaf.
 pub fn reroot_for_display(tree: &Tree) -> Result<Tree, BonsaiErrors> {
     reroot(tree, root_edge(tree)?)
-}
-
-/// Renumber a rerooted parent array into the arena's ordering and build a tree.
-///
-/// [`Tree::from_parents`] relabels internal nodes into level order but *checks*
-/// rather than fixes the requirement that every parent index exceed its
-/// children's, so a rerooted array has to be brought into that shape first. A
-/// breadth-first walk from the new root lists parents before children;
-/// numbering the internal nodes in the reverse of that order therefore puts
-/// every parent above its children. Leaves keep their indices, which is what
-/// lets caller-held per-leaf data survive a reroot.
-///
-/// ### Params
-///
-/// * `parent` - Parent of each node in the rerooted tree, `NO_NODE` for the root
-/// * `branch` - Length of the branch above each node, same indexing
-/// * `n_leaves` - Leaf count; leaves occupy `0..n_leaves` in both indexings
-/// * `new_root` - Index of the root in the incoming arrays
-/// * `dead` - Node dropped by degree-two suppression, if any
-///
-/// ### Returns
-///
-/// The tree, or `MalformedTree` if the arrays do not describe one connected
-/// tree over the surviving nodes.
-fn relabel_from(
-    parent: Vec<u32>,
-    branch: Vec<f64>,
-    n_leaves: usize,
-    new_root: u32,
-    dead: Option<u32>,
-) -> Result<Tree, BonsaiErrors> {
-    let total = parent.len();
-    let live = total - usize::from(dead.is_some());
-
-    let mut ptr = vec![0u32; total + 1];
-    for v in 0..total {
-        if Some(v as u32) == dead || parent[v] == NO_NODE {
-            continue;
-        }
-        ptr[parent[v] as usize + 1] += 1;
-    }
-    for i in 0..total {
-        ptr[i + 1] += ptr[i];
-    }
-    let mut cursor = ptr.clone();
-    let mut kids = vec![0u32; ptr[total] as usize];
-    for v in 0..total {
-        if Some(v as u32) == dead || parent[v] == NO_NODE {
-            continue;
-        }
-        let p = parent[v] as usize;
-        kids[cursor[p] as usize] = v as u32;
-        cursor[p] += 1;
-    }
-
-    let mut order = Vec::with_capacity(live);
-    order.push(new_root);
-    let mut head = 0usize;
-    while head < order.len() {
-        let u = order[head] as usize;
-        head += 1;
-        order.extend_from_slice(&kids[ptr[u] as usize..ptr[u + 1] as usize]);
-    }
-    if order.len() != live {
-        return Err(BonsaiErrors::MalformedTree {
-            reason: format!(
-                "rerooting reached {} of {live} nodes, so the parent array is not connected",
-                order.len()
-            ),
-        });
-    }
-
-    let mut relabel = vec![NO_NODE; total];
-    for (i, slot) in relabel.iter_mut().take(n_leaves).enumerate() {
-        *slot = i as u32;
-    }
-    let mut next = n_leaves as u32;
-    for &u in order.iter().rev() {
-        if (u as usize) >= n_leaves {
-            relabel[u as usize] = next;
-            next += 1;
-        }
-    }
-
-    let mut new_parent = vec![NO_NODE; live];
-    let mut new_branch = vec![0.0f64; live];
-    for &u in &order {
-        let i = relabel[u as usize] as usize;
-        new_parent[i] = match parent[u as usize] {
-            NO_NODE => NO_NODE,
-            p => relabel[p as usize],
-        };
-        new_branch[i] = branch[u as usize];
-    }
-    Tree::from_parents(new_parent, new_branch, n_leaves)
-}
-
-///////////////////////
-// The greedy cutter //
-///////////////////////
-
-/// Buffers the per-piece sweeps reuse, sized once for the whole tree.
-struct Scratch {
-    /// Leaves of the piece below each node.
-    count: Vec<u32>,
-    /// Summed distance from a node down to the piece's leaves below it.
-    down: Vec<f64>,
-    /// Summed distance from a node to every leaf of its piece.
-    total: Vec<f64>,
-    /// Membership flag, set only while a piece is being split.
-    mark: Vec<bool>,
-}
-
-impl Scratch {
-    /// Allocate for a tree of `n_nodes` nodes.
-    ///
-    /// ### Params
-    ///
-    /// * `n_nodes` - Node count of the tree
-    ///
-    /// ### Returns
-    ///
-    /// Zeroed buffers.
-    fn new(n_nodes: usize) -> Self {
-        Self {
-            count: vec![0; n_nodes],
-            down: vec![0.0; n_nodes],
-            total: vec![0.0; n_nodes],
-            mark: vec![false; n_nodes],
-        }
-    }
-}
-
-/// A connected piece of the tree left by the cuts made so far.
-struct Piece {
-    /// Its nodes, ascending. The last is its top: every parent sits above its
-    /// children in the arena, so the ancestor-most node of a connected piece is
-    /// also its highest-numbered one.
-    nodes: Vec<u32>,
-    /// Original leaves it holds, which is what a cluster is.
-    n_leaves: usize,
-    /// Smallest leaf index it holds, or `u32::MAX` if it holds none. Only a tie
-    /// break for the cluster numbering.
-    first_leaf: u32,
-    /// Best cut inside it: the node whose upstream branch to cut, and the
-    /// reduction in the objective it buys. `None` when nothing inside it can be
-    /// cut with a leaf left on both sides.
-    best: Option<(u32, f64)>,
-    /// Node minimising the summed distance to the piece's leaves.
-    centre: u32,
-}
-
-impl Piece {
-    /// The piece covering an entire tree, before any cut.
-    ///
-    /// ### Params
-    ///
-    /// * `tree` - Tree to cover
-    ///
-    /// ### Returns
-    ///
-    /// The piece, unanalysed.
-    fn whole(tree: &Tree) -> Self {
-        Self::new((0..tree.n_nodes() as u32).collect())
-    }
-
-    /// A piece over a node list, with its measurements left unset.
-    ///
-    /// ### Params
-    ///
-    /// * `nodes` - Its nodes, ascending
-    ///
-    /// ### Returns
-    ///
-    /// The piece, which [`Piece::analyse`] must fill in before use.
-    fn new(nodes: Vec<u32>) -> Self {
-        let centre = nodes.first().copied().unwrap_or(0);
-        Self {
-            nodes,
-            n_leaves: 0,
-            first_leaf: u32::MAX,
-            best: None,
-            centre,
-        }
-    }
-
-    /// Measure the piece: its leaf count, its centre and its best cut.
-    ///
-    /// Two linear passes over the piece's nodes. Ascending order is a post-order
-    /// so the first settles the leaf counts `a` and the downward distance sums
-    /// `D`; descending order visits parents first so the second turns `D` into
-    /// the summed distance to *every* leaf of the piece, from which the outward
-    /// sum `U` follows by subtraction. `cross = b * D + a * U` then scores every
-    /// branch, as derived in the module docs.
-    ///
-    /// ### Params
-    ///
-    /// * `tree` - Tree the piece belongs to
-    /// * `s` - Scratch buffers, whose contents are not preserved
-    fn analyse(&mut self, tree: &Tree, s: &mut Scratch) {
-        let Some(&top) = self.nodes.last() else {
-            return;
-        };
-        let n_leaves = tree.n_leaves() as u32;
-
-        for &v in &self.nodes {
-            s.count[v as usize] = u32::from(v < n_leaves);
-            s.down[v as usize] = 0.0;
-        }
-        for &v in &self.nodes {
-            if v == top {
-                continue;
-            }
-            let Some(p) = tree.parent(v) else {
-                continue;
-            };
-            let a = f64::from(s.count[v as usize]);
-            s.count[p as usize] += s.count[v as usize];
-            s.down[p as usize] += s.down[v as usize] + a * tree.branch(v);
-        }
-
-        let m = f64::from(s.count[top as usize]);
-        for &v in self.nodes.iter().rev() {
-            if v == top {
-                s.total[v as usize] = s.down[v as usize];
-                continue;
-            }
-            let Some(p) = tree.parent(v) else {
-                continue;
-            };
-            // Moving the vantage point from `p` to `v` walks towards the `a`
-            // leaves below `v` and away from the other `m - a`.
-            let a = f64::from(s.count[v as usize]);
-            s.total[v as usize] = s.total[p as usize] + tree.branch(v) * (m - 2.0 * a);
-        }
-
-        self.n_leaves = s.count[top as usize] as usize;
-        self.first_leaf = self
-            .nodes
-            .first()
-            .copied()
-            .filter(|&v| v < n_leaves)
-            .unwrap_or(u32::MAX);
-        self.best = None;
-        let mut centre = top;
-        let mut centre_total = f64::INFINITY;
-        for &v in &self.nodes {
-            // Strict comparisons with an ascending scan send every tie to the
-            // smallest node index, which is what makes the whole module
-            // deterministic.
-            if s.total[v as usize] < centre_total {
-                centre_total = s.total[v as usize];
-                centre = v;
-            }
-            if v == top {
-                continue;
-            }
-            let a = f64::from(s.count[v as usize]);
-            let b = m - a;
-            if a == 0.0 || b == 0.0 {
-                continue;
-            }
-            let up = s.total[v as usize] - s.down[v as usize];
-            let cross = b * s.down[v as usize] + a * up;
-            if self.best.is_none_or(|(_, seen)| cross > seen) {
-                self.best = Some((v, cross));
-            }
-        }
-        self.centre = centre;
-    }
-}
-
-/// Cut the tree greedily into `n_clusters` pieces.
-///
-/// Each round takes the best cut over all pieces, splits the piece it belongs
-/// to, and remeasures only the two halves. A piece with a single leaf offers no
-/// cut, so the loop stops early if the tree runs out of separable leaves, which
-/// the clamp on `n_clusters` already rules out.
-///
-/// ### Params
-///
-/// * `tree` - Tree to cut
-/// * `n_clusters` - Number of pieces wanted, at least one
-///
-/// ### Returns
-///
-/// The pieces, measured.
-fn cut_greedily(tree: &Tree, n_clusters: usize) -> Vec<Piece> {
-    let mut scratch = Scratch::new(tree.n_nodes());
-    let mut pieces = vec![Piece::whole(tree)];
-    pieces[0].analyse(tree, &mut scratch);
-
-    let mut cut = vec![false; tree.n_nodes()];
-    while pieces.len() < n_clusters {
-        let mut chosen: Option<(usize, u32, f64)> = None;
-        for (i, piece) in pieces.iter().enumerate() {
-            let Some((node, cross)) = piece.best else {
-                continue;
-            };
-            let better = match chosen {
-                None => true,
-                Some((_, seen, best)) => cross > best || (cross == best && node < seen),
-            };
-            if better {
-                chosen = Some((i, node, cross));
-            }
-        }
-        let Some((i, node, _)) = chosen else {
-            break;
-        };
-
-        cut[node as usize] = true;
-        let mut below = split_off(tree, &mut pieces[i], node, &cut, &mut scratch);
-        pieces[i].analyse(tree, &mut scratch);
-        below.analyse(tree, &mut scratch);
-        pieces.push(below);
-    }
-    pieces
-}
-
-/// Split the subtree below `node` out of a piece.
-///
-/// The subtree is collected with an explicit stack that stops at branches
-/// already cut, then the piece's node list is partitioned in one pass, which
-/// keeps both halves in ascending order and so keeps the "top is last"
-/// invariant.
-///
-/// ### Params
-///
-/// * `tree` - Tree the piece belongs to
-/// * `piece` - Piece to split, left holding everything above the cut
-/// * `node` - Node whose upstream branch has just been cut
-/// * `cut` - Which branches are cut, indexed by their lower node
-/// * `s` - Scratch buffers; `mark` is left as it was found
-///
-/// ### Returns
-///
-/// The piece below the cut, unanalysed.
-fn split_off(tree: &Tree, piece: &mut Piece, node: u32, cut: &[bool], s: &mut Scratch) -> Piece {
-    let mut stack = vec![node];
-    while let Some(u) = stack.pop() {
-        s.mark[u as usize] = true;
-        for &c in tree.children(u) {
-            if !cut[c as usize] {
-                stack.push(c);
-            }
-        }
-    }
-
-    let mut below = Vec::new();
-    let mut above = Vec::with_capacity(piece.nodes.len());
-    for &v in &piece.nodes {
-        if s.mark[v as usize] {
-            below.push(v);
-        } else {
-            above.push(v);
-        }
-    }
-    for &v in &below {
-        s.mark[v as usize] = false;
-    }
-    piece.nodes = above;
-    Piece::new(below)
 }
 
 ///////////

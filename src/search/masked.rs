@@ -1,38 +1,22 @@
 //! The tree an SPR cut leaves behind, walked without building it.
 //!
-//! Three quarters of SPR's proposals put the subtree back where it came from
-//! and change no split. Building the remaining tree and the regrafted one to
-//! find that out was an arena assembly and a node-by-node row map each, `O(n)`
-//! per proposal and so `O(n^2)` per sweep. This module answers the same
-//! question in `O(depth p)`: the remaining tree differs from the current one
-//! only along the path above the cut, and the regrafted one only along the
-//! path above the attachment, so both are views that override those paths and
-//! read everything else off the current tree.
+//! Most SPR proposals put the subtree back where it came from. The remaining
+//! and regrafted trees differ from the current one only along the paths above
+//! the cut and the attachment, so both are views that override those paths and
+//! read the rest off the current tree: `O(depth p)` per proposal instead of an
+//! arena assembly.
 //!
-//! ### Why the views have to reproduce the arena
+//! The views reproduce the arena [`crate::search::spr`] would assemble (leaves
+//! by index, internal nodes by height then original index, children in that
+//! order), because the beam's start points are node indices and a row's bits
+//! depend on child summation order. A cut that suppresses a degree-two root, or
+//! a binary current root, is declined to the built path; SPR checks every
+//! answer against that path in debug builds.
 //!
-//! The beam search's answer depends on the arena, not just on the tree: its
-//! spread start points are node *indices*, and it visits children in arena
-//! order. And a row's bits depend on the order its children are summed in.
-//! So the views reproduce what [`crate::search::spr`]'s arena assembly would
-//! build: leaves first in index order, internal nodes by height and then by
-//! original index, children in that order. Start points are found by rank in
-//! that order without materialising it.
-//!
-//! What they cannot reproduce cheaply, they decline: a cut that suppresses a
-//! degree-two root, or a current tree whose root is binary, falls back to the
-//! built path. SPR checks every answer against that path in debug builds.
-//!
-//! ### Scoring and applying a move
-//!
-//! A move that changes a split is scored here too ([`score_move`]): the star
-//! resolution is spliced into the regrafted view and the loglikelihood is the
-//! current total less the terms of the nodes whose rows changed plus their
-//! new terms. Only an accepted move is applied ([`apply_move`]), in one
-//! relabel of the arena that lands on the numbering the built path's three
-//! assemblies would, because the next proposal's beam starts and child orders
-//! depend on it. Every assembly numbers a level by the order the nodes had
-//! before, so a move reorders only the nodes whose height it changed.
+//! [`score_move`] scores a split-changing move on the views: the current total
+//! less the terms of changed nodes plus their new terms. [`apply_move`] applies
+//! an accepted move in one relabel that lands on the numbering the built path
+//! would give.
 
 use crate::model::merge::EffLeaf;
 use crate::model::place::Walk;
@@ -752,10 +736,8 @@ pub(crate) enum Regraft<'a, T> {
 
 /// Build the regrafted tree's star and fingerprint without building the tree.
 ///
-/// Most proposals put the subtree back where it came from, onto a star of
-/// three members that needs no resolution, and the fingerprint alone says so.
-/// With `stop_if_unchanged` those return before the path's rows and the
-/// centre's up row are formed.
+/// With `stop_if_unchanged`, a regraft that changes no split and needs no
+/// resolution returns before any row is formed.
 ///
 /// ### Params
 ///
@@ -947,121 +929,6 @@ pub(crate) fn attach<'a, T: BonsaiFloat>(
     }))
 }
 
-/// A scored move's views, owned, so that accepting it recomputes nothing.
-pub(crate) struct MoveData<T> {
-    /// Parents the tree the move produces overrides, [`NO_NODE`] for a root.
-    parent: FxHashMap<u32, u32>,
-    /// Child lists it overrides, in its arena order.
-    children: FxHashMap<u32, Vec<u32>>,
-    /// Branches it overrides.
-    branch: FxHashMap<u32, f64>,
-    /// Heights it overrides.
-    height: FxHashMap<u32, u32>,
-    /// Heights the regrafted tree overrides, before any splice: the splice's
-    /// assembly numbers a level in the regrafted arena's order.
-    before_height: FxHashMap<u32, u32>,
-    /// Rows the views recomputed, nearest first: the splice's, the regraft's,
-    /// the cut's.
-    layers: [FxHashMap<u32, Settled<T>>; 3],
-    /// The parent the cut suppressed, if any.
-    suppressed: Option<u32>,
-    /// Split fingerprint of the tree the move produces.
-    print: u64,
-    /// Ancestors the splice made, `None` when there was no splice.
-    n_made: Option<usize>,
-}
-
-/// The loglikelihood of the tree a move produces, as a [`fixed`] total,
-/// without building it.
-///
-/// The built path splices the resolution into the regrafted tree, renumbers
-/// the arena and settles the nodes whose rows changed. Here the splice is
-/// applied to the view, and only the new ancestors, the centre and the path
-/// above it are settled, with children in the order the built arena would put
-/// them: by height, then by their order in the regrafted arena, the new
-/// ancestors last in the order they were made. The total is the current one
-/// less the terms of every node whose row changed or vanished plus the new
-/// terms, which [`fixed`] makes the same integer the built path sums.
-///
-/// ### Params
-///
-/// * `rows` - The pruned view's rows
-/// * `attached` - The regraft
-/// * `result` - The resolution of the regraft's star, `None` when the star was
-///   too small to need one
-/// * `base` - The current tree's [`fixed`] total
-/// * `print` - Split fingerprint of the tree the move produces
-///
-/// ### Returns
-///
-/// The total of the tree the move produces, and the views, for
-/// [`apply_move`].
-pub(crate) fn score_move<T: BonsaiFloat>(
-    rows: PrunedRows<'_, '_, T>,
-    attached: Attached<'_, T>,
-    result: Option<&StarResult<T>>,
-    base: i128,
-    print: u64,
-) -> (i128, MoveData<T>) {
-    let view = rows.view;
-    let tree = view.shape.tree;
-    let store = rows.down.store;
-    let (shape, spliced, before_height, n_made) = match result {
-        Some(result) => {
-            let (shape, spliced) = splice_rows(&rows, &attached, result);
-            let before = attached.shape.height.clone();
-            (
-                shape,
-                spliced,
-                before,
-                Some(result.parent.len() - result.n_members),
-            )
-        }
-        None => (
-            attached.shape.clone(),
-            FxHashMap::default(),
-            FxHashMap::default(),
-            None,
-        ),
-    };
-
-    let mut total = base;
-    let mut seen: FxHashSet<u32> = FxHashSet::default();
-    for layer in [&spliced, &attached.dirty, &rows.down.dirty] {
-        for (&v, row) in layer {
-            if seen.insert(v) {
-                total += fixed(row.2);
-                if (v as usize) < tree.id_space() {
-                    total -= fixed(store.contribution(v));
-                }
-            }
-        }
-    }
-    if let Some(sp) = view.suppressed {
-        total -= fixed(store.contribution(sp));
-    }
-    let suppressed = view.suppressed;
-    let Shape {
-        parent,
-        children,
-        branch,
-        height,
-        ..
-    } = shape;
-    let data = MoveData {
-        parent,
-        children,
-        branch,
-        height,
-        before_height,
-        layers: [spliced, attached.dirty, rows.down.dirty],
-        suppressed,
-        print,
-        n_made,
-    };
-    (total, data)
-}
-
 /// Apply a star resolution to the regrafted view and settle what it changed.
 ///
 /// ### Params
@@ -1168,6 +1035,118 @@ fn splice_rows<'a, T: BonsaiFloat>(
     down.settle(&shape, &order);
     let dirty = down.dirty;
     (shape, dirty)
+}
+
+/// A scored move's views, owned, so that accepting it recomputes nothing.
+pub(crate) struct MoveData<T> {
+    /// Parents the tree the move produces overrides, [`NO_NODE`] for a root.
+    parent: FxHashMap<u32, u32>,
+    /// Child lists it overrides, in its arena order.
+    children: FxHashMap<u32, Vec<u32>>,
+    /// Branches it overrides.
+    branch: FxHashMap<u32, f64>,
+    /// Heights it overrides.
+    height: FxHashMap<u32, u32>,
+    /// Heights the regrafted tree overrides, before any splice: the splice's
+    /// assembly numbers a level in the regrafted arena's order.
+    before_height: FxHashMap<u32, u32>,
+    /// Rows the views recomputed, nearest first: the splice's, the regraft's,
+    /// the cut's.
+    layers: [FxHashMap<u32, Settled<T>>; 3],
+    /// The parent the cut suppressed, if any.
+    suppressed: Option<u32>,
+    /// Split fingerprint of the tree the move produces.
+    print: u64,
+    /// Ancestors the splice made, `None` when there was no splice.
+    n_made: Option<usize>,
+}
+
+/// The loglikelihood of the tree a move produces, as a [`fixed`] total,
+/// without building it.
+///
+/// The splice is applied to the view and only the new ancestors, the centre
+/// and the path above it are settled, children ordered as the built arena
+/// would (height, then regrafted-arena order, new ancestors last). The total is
+/// the current one less the changed or vanished terms plus the new ones; the
+/// [`fixed`] integers make it identical to the built path's sum.
+///
+/// ### Params
+///
+/// * `rows` - The pruned view's rows
+/// * `attached` - The regraft
+/// * `result` - The resolution of the regraft's star, `None` when the star was
+///   too small to need one
+/// * `base` - The current tree's [`fixed`] total
+/// * `print` - Split fingerprint of the tree the move produces
+///
+/// ### Returns
+///
+/// The total of the tree the move produces, and the views, for
+/// [`apply_move`].
+pub(crate) fn score_move<T: BonsaiFloat>(
+    rows: PrunedRows<'_, '_, T>,
+    attached: Attached<'_, T>,
+    result: Option<&StarResult<T>>,
+    base: i128,
+    print: u64,
+) -> (i128, MoveData<T>) {
+    let view = rows.view;
+    let tree = view.shape.tree;
+    let store = rows.down.store;
+    let (shape, spliced, before_height, n_made) = match result {
+        Some(result) => {
+            let (shape, spliced) = splice_rows(&rows, &attached, result);
+            let before = attached.shape.height.clone();
+            (
+                shape,
+                spliced,
+                before,
+                Some(result.parent.len() - result.n_members),
+            )
+        }
+        None => (
+            attached.shape.clone(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+            None,
+        ),
+    };
+
+    let mut total = base;
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    for layer in [&spliced, &attached.dirty, &rows.down.dirty] {
+        for (&v, row) in layer {
+            if seen.insert(v) {
+                total += fixed(row.2);
+                if (v as usize) < tree.id_space() {
+                    total -= fixed(store.contribution(v));
+                }
+            }
+        }
+    }
+    if let Some(sp) = view.suppressed {
+        total -= fixed(store.contribution(sp));
+    }
+    let suppressed = view.suppressed;
+    let Shape {
+        parent,
+        children,
+        branch,
+        height,
+        ..
+    } = shape;
+    let data = MoveData {
+        parent,
+        children,
+        branch,
+        height,
+        before_height,
+        layers: [spliced, attached.dirty, rows.down.dirty],
+        suppressed,
+        print,
+        n_made,
+    };
+    (total, data)
 }
 
 /////////////////

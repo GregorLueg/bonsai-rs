@@ -1,12 +1,7 @@
 //! Writing trees and layouts out as CSV, for plotting elsewhere.
 //!
-//! This crate computes coordinates and stops there. Rendering belongs in
-//! whatever the caller already plots with, so the contract is a table rather
-//! than an image format.
-//!
-//! One row per node carries everything a plot needs: its position, its parent,
-//! and the branch length between them. Edges are the rows with a parent, so a
-//! self-join on `parent` gives the segments and no second file is needed.
+//! One row per node: position, parent and branch length. Edges are the rows
+//! with a parent, so a self-join on `parent` gives the segments.
 
 use std::fmt::Write as _;
 
@@ -15,10 +10,6 @@ use crate::tree::Tree;
 use crate::tree::layout::Layout;
 
 /// Quote a label for CSV if it needs it.
-///
-/// Cell barcodes are usually bare alphanumerics, but nothing stops a caller
-/// passing something with a comma or a quote in it, and silently writing a
-/// broken table is worse than the small cost of checking.
 ///
 /// ### Params
 ///
@@ -37,12 +28,9 @@ fn escape(label: &str) -> String {
 
 /// Write a tree and a layout as one CSV table.
 ///
-/// Columns: `node`, `parent`, `is_leaf`, `label`, `branch`, `x`, `y`. The root's
-/// `parent` is empty and its `branch` is zero. Internal nodes have an empty
-/// `label` unless one was supplied.
-///
-/// Plotting the edges is a self-join: every row with a `parent` is a segment
-/// from its own `(x, y)` to its parent's.
+/// Columns: `node`, `parent`, `is_leaf`, `label`, `branch`, `x`, `y`. The
+/// root's `parent` is empty and its `branch` is zero. Internal nodes have an
+/// empty `label` unless one was supplied.
 ///
 /// ### Params
 ///

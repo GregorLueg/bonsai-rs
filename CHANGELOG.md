@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.1
+
+**Features**
+
+- `ingest::sanity_gene_passes`: the ingest's two gene filters, the S5
+  conditioning check and the `min_signal_to_noise` cut, decided per gene from
+  Sanity's `f64` posteriors. Handed to `sanity_select` or `sanity_gpu_select`,
+  only the genes that would reach the tree are stored, so every gene can go in
+  with memory bounded by the survivors. In the prelude.
+- `BonsaiParams::skip_posteriors` leaves `node_means` and `node_sds` empty,
+  saving `2 * n_nodes * n_features` values. Off by default.
+- `StepReport::seconds`: the wall time of each search step.
+- `bonsai_rs::sanity_sc_rs` re-exports the Sanity crate under the `sanity`
+  feature, so downstream code builds the `SanityOutput` that
+  `from_sanity_output` takes.
+
+**Dependencies**
+
+- `sanity-sc-rs` 0.2.1, which adds `sanity_gpu_select`.
+- `ann-search-rs` 0.9.
+
 ## 0.2.0
 
 **Breaking**

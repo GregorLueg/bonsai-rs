@@ -13,18 +13,11 @@ use crate::utils::simd::edge_newton_simd as edge_newton;
 // Consts //
 ////////////
 
-/// Iteration budget for the safeguarded Newton solve.
-///
-/// The iteration is quadratically convergent inside the bracket and the bracket
-/// halves on every safeguarded step, so this is a runaway guard rather than a
-/// working limit. A bracket of any plausible width is exhausted by bisection
-/// alone in fewer than 60 halvings of `f64` precision.
+/// Iteration budget for the safeguarded Newton solve; a runaway guard, bisection
+/// alone exhausts any plausible bracket in under 60 halvings.
 const MAX_NEWTON_ITER: usize = 100;
 
 /// Relative convergence tolerance on the branch length.
-///
-/// Tightened well past what the search needs, because the stopping point of the
-/// inner solve should never be what limits agreement between two runs.
 const BRANCH_TOL: f64 = 1e-12;
 
 ///////////////
@@ -33,36 +26,13 @@ const BRANCH_TOL: f64 = 1e-12;
 
 /// Optimise one branch length given the edge's precomputed constants.
 ///
-/// The loglikelihood of an edge is unimodal in its length: SPEC.md section 6
-/// gives `dL/dt = -f(t)/2`, and for a single feature the stationary point sits
-/// at `s + t = d`, so each term of `f` changes sign exactly once. The solve is
-/// therefore a bracketed root find, with the bracket coming from `prep_edge`.
-///
-/// A safeguarded Newton is used rather than a plain one: the Newton step is
-/// taken when it lands inside the current bracket and makes progress, and a
-/// bisection step otherwise. That keeps the quadratic convergence where it
-/// applies without ever leaving the bracket, which matters because `f` is not
-/// globally monotone. Working directly in `t` rather than in `log t` keeps
-/// transcendentals out of the iteration entirely; positivity comes from the
-/// bracket rather than from a change of variable.
-///
-/// Two details decide the iteration count, which is the cost of every merge,
-/// placement and branch solve in the crate, and both are measured over the
-/// solves the SPR beam makes on a real search:
-///
-/// - **Where it starts.** `upper` is a maximum over features and sits an order
-///   of magnitude above the root, so from `upper / 2` the first three or four
-///   steps are bisections. The mean of `d - s` over features is the exact
-///   optimum when the features agree and lands inside Newton's basin when they
-///   do not. The neighbour's optimum, which the beam could hand down, was
-///   tried and is worse, by around half again as many iterations per solve.
-/// - **When it stops.** Convergence is tested on the Newton correction before
-///   the safeguard sees it. Near the root the correction points exactly at a
-///   bracket end, the safeguard refuses it as not strictly inside, and the loop
-///   would otherwise bisect a bracket already narrower than the tolerance, one
-///   full pass over the features per halving: seven wasted passes out of
-///   fifteen on a typical solve. 22.4 iterations per solve before, 10.9 after,
-///   5.8 with the mean start as well.
+/// The edge loglikelihood is unimodal in its length (SPEC.md section 6,
+/// `dL/dt = -f(t)/2`), so this is a bracketed root find on `f` with the bracket
+/// from `prep_edge`. A Newton step is taken when it lands strictly inside the
+/// bracket and at least halves the last step, bisection otherwise. The start is
+/// the mean of `d - s`, falling back to `upper / 2`. Convergence is tested on
+/// the Newton correction before the safeguard, so a bracket already narrower
+/// than the tolerance is not bisected further.
 ///
 /// ### Params
 ///
@@ -271,10 +241,7 @@ mod tests {
 
     #[test]
     fn test_a_non_finite_edge_is_an_error_and_not_a_branch_length() {
-        // Every comparison against a `NaN` is false, so a `NaN` used to skip
-        // the early return, then send `hi = t`
-        // on every iteration, and come back as `Ok(6.2e-25)`: a garbage branch
-        // length reported as a success.
+        // Every comparison against a `NaN` is false, so it must be rejected on input.
         for (s, d, upper) in [
             (vec![1.0, 1.0], vec![f64::NAN, 4.0], 3.0),
             (vec![f64::NAN, 1.0], vec![9.0, 4.0], 3.0),

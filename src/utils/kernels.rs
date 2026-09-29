@@ -1,15 +1,8 @@
 //! The inner kernels: every loop in this crate that runs over features.
 //!
-//! Each function here corresponds to one equation in `docs/SPEC.md` and is
-//! written as a single fused pass over the feature axis. They are deliberately
-//! sequential: parallelism in this crate lives one level up, over candidate
-//! pairs in a merge round, so a nested rayon fan-out here would only
-//! oversubscribe.
-//!
-//! Storage is `T`, accumulation is always `f64`. See `BonsaiFloat`.
-//!
-//! These are the scalar tiers and the reference the vector tiers in
-//! `utils::simd` are pinned against.
+//! Each function is a fused, sequential pass over the feature axis (parallelism
+//! lives one level up). Storage is `T`, accumulation is `f64`. These are the
+//! scalar tiers the vector tiers in `utils::simd` are pinned against.
 
 use crate::utils::traits::{BonsaiFloat, narrow, wide};
 
@@ -19,14 +12,8 @@ use crate::utils::traits::{BonsaiFloat, narrow, wide};
 
 /// Fused prune of a node with exactly two children, scalar tier.
 ///
-/// The dominant case: Bonsai trees are binary apart from polytomies that the
-/// search is actively removing. Computes the diffusion-corrected precisions,
-/// the parent's effective mean and precision, and the node's loglikelihood
-/// contribution in one pass over the features.
-///
 /// Implements the two-child case of SPEC.md sections 4 and 5, using the
-/// pairwise form of the quadratic term (identity S33) so that no large
-/// cancelling difference is ever formed:
+/// pairwise form of the quadratic term (identity S33):
 ///
 /// ```text
 /// wd_k    = w_k / (1 + t_k * w_k)
@@ -35,10 +22,6 @@ use crate::utils::traits::{BonsaiFloat, narrow, wide};
 /// m_out   = m_k + (m_l - m_k) * wd_l / w_out
 /// contrib = 1/2 * sum_g [ log reduced - reduced * (m_l - m_k)^2 ]
 /// ```
-///
-/// Two rewrites of the SI form matter and are explained at their use
-/// sites: the three logarithms collapse into one, and the effective mean is a
-/// convex combination rather than a ratio of sums.
 ///
 /// ### Params
 ///
@@ -82,19 +65,11 @@ pub fn prune_binary_scalar<T: BonsaiFloat>(
         let inv = 1.0 / wa;
 
         // One log, not three: log(a) + log(b) - log(a+b) = log(a*b/(a+b)).
-        // The argument is the pair's reduced precision, bounded above by
-        // min(wdk, wdl), so it is as well scaled as the inputs are and cannot
-        // manufacture an overflow the separate logs would have avoided.
         let reduced = (wdk * inv) * wdl;
         let diff = ml - mk;
         acc += reduced.ln() - reduced * diff * diff;
 
-        // The effective mean as a convex combination rather than
-        // `(wdk*mk + wdl*ml)/wa`. Algebraically the same, but `wdl*inv` lies in
-        // `[0, 1]` so the result is pinned between the two child means and
-        // cannot cancel when they differ in sign. That matters: the mean feeds
-        // straight back into the recursion, so an error here compounds up the
-        // tree.
+        // Convex combination: pinned between the child means, no cancellation.
         m_out[g] = narrow(diff.mul_add(wdl * inv, mk));
         w_out[g] = narrow(wa);
     }
@@ -103,11 +78,8 @@ pub fn prune_binary_scalar<T: BonsaiFloat>(
 
 /// Prune of a node with an arbitrary number of children.
 ///
-/// The polytomy case. Two passes over the features: one to accumulate the
-/// effective precision and mean, one for the quadratic term. The second pass
-/// uses the direct form `sum_k wd_k * (m_a - m_k)^2` rather than the algebraic
-/// shortcut `sum_k wd_k * m_k^2 - w_a * m_a^2`, because the shortcut differences
-/// two large similar numbers.
+/// Two passes: effective precision and mean, then the quadratic term in the
+/// direct form `sum_k wd_k * (m_a - m_k)^2`, not `sum wd_k m_k^2 - w_a m_a^2`.
 ///
 /// ### Params
 ///
@@ -134,10 +106,7 @@ pub fn prune_general<T: BonsaiFloat>(
 
     let mut acc = 0.0f64;
 
-    // Pass one: diffusion-corrected precisions, effective precision and mean.
-    // The mean accumulates as a running weighted average rather than a ratio of
-    // sums, for the same conditioning reason as in `prune_binary_scalar`: every
-    // partial value stays inside the convex hull of the child means.
+    // Running weighted mean stays inside the hull of the child means.
     for g in 0..p {
         let mut wa = 0.0f64;
         let mut ma = 0.0f64;
@@ -154,7 +123,6 @@ pub fn prune_general<T: BonsaiFloat>(
         w_out[g] = narrow(wa);
     }
 
-    // Pass two: the quadratic term against the settled parent mean.
     for g in 0..p {
         let ma = wide(m_out[g]);
         for (c, &(mc, _, _)) in children.iter().enumerate() {
@@ -179,8 +147,7 @@ pub fn prune_general<T: BonsaiFloat>(
 /// d[g] = (m_k[g] - m_l[g])^2
 /// ```
 ///
-/// Both are independent of the branch length, so they are computed once and
-/// reused across every step of the root find.
+/// Independent of the branch length, so computed once per root find.
 ///
 /// ### Params
 ///
@@ -193,10 +160,8 @@ pub fn prune_general<T: BonsaiFloat>(
 ///
 /// ### Returns
 ///
-/// `max(0, max_g (d[g] - s[g]))`, which brackets the optimal branch length from
-/// above. Beyond it every term of the stationarity condition is positive, so
-/// the root cannot lie further out. Computed here because it is free on a pass
-/// that already touches both arrays.
+/// `max(0, max_g (d[g] - s[g]))`, an upper bracket on the optimal branch
+/// length: beyond it every term of the stationarity condition is positive.
 pub fn prep_edge<T: BonsaiFloat>(
     m_k: &[T],
     w_k: &[T],
@@ -219,18 +184,15 @@ pub fn prep_edge<T: BonsaiFloat>(
 
 /// One Newton evaluation of the branch-length stationarity condition.
 ///
-/// The crate's hottest kernel. With `r = 1/(s[g] + t)`, SPEC.md section 6 gives
-/// `dL/dt = -1/2 * f(t)` where
+/// With `r = 1/(s[g] + t)`, SPEC.md section 6 gives `dL/dt = -1/2 * f(t)`
+/// where
 ///
 /// ```text
 /// f(t)  = sum_g r * (1 - d[g] * r)
 /// f'(t) = sum_g r^2 * (2 * d[g] * r - 1)
 /// ```
 ///
-/// so the branch length that maximises the loglikelihood is the root of `f`.
-/// No logarithm appears: one reciprocal, one fused multiply-add and a handful of
-/// multiplies per feature. `edge_loglik` is the only place a log is paid, and it
-/// is called once per solve rather than once per iteration.
+/// so the optimal branch length is the root of `f`. No logarithm is evaluated.
 ///
 /// ### Params
 ///
@@ -375,8 +337,7 @@ mod tests {
         let mut d = vec![0.0; p];
         prep_edge(&m_k, &w_k, &m_l, &w_l, &mut s, &mut d);
 
-        // f is -2 dL/dt, so check it against a central difference of the
-        // loglikelihood, and f' against a central difference of f.
+        // f is -2 dL/dt; f' is checked against a central difference of f.
         let t = 0.83;
         let h = 1e-6;
         let (f, fp) = edge_newton(&s, &d, t);

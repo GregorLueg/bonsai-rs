@@ -1,9 +1,8 @@
 //! The reconstruction entry points: Sanity, the S5 conversion, Bonsai, the
 //! chain from counts and the simulator.
 //!
-//! Every numeric entry point dispatches on the input's element type and runs
-//! generic over it, so `float32` in means `float32` storage all the way down.
-//! Reductions are `f64` either way; that is the core's policy, not ours.
+//! Every numeric entry point dispatches on the input's element type, so
+//! `float32` in means `float32` storage throughout.
 
 // Aliased: this file's `bonsai` and `from_sanity` are the Python entry points.
 use bonsai_rs::bonsai::bonsai as bonsai_run;
@@ -16,7 +15,7 @@ use numpy::{Element, IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyAr
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use sanity_sc_rs::config::{SanityParams, VarianceRule};
+use sanity_sc_rs::config::{SanityParams, VarianceRule, Verbosity as SanityVerbosity};
 use sanity_sc_rs::float::SanityFloat;
 use sanity_sc_rs::input::CountMatrix;
 
@@ -122,11 +121,17 @@ fn params(
 /// * `rule` - `"marginalise"`, `"posterior_mean"`, `"max_posterior"` or
 ///   `"fixed"`
 /// * `fixed_variance` - The variance for `"fixed"`, ignored otherwise
+/// * `verbose` - `0` quiet, `1` a header and progress over genes, `2` adds
+///   the per-batch stage split on the GPU
 ///
 /// ### Returns
 ///
 /// The parameters, or a `ValueError`.
-fn sanity_params(rule: &str, fixed_variance: Option<f64>) -> PyResult<SanityParams> {
+fn sanity_params(
+    rule: &str,
+    fixed_variance: Option<f64>,
+    verbose: usize,
+) -> PyResult<SanityParams> {
     let variance_rule = match (rule, fixed_variance) {
         ("marginalise", _) => VarianceRule::Marginalise,
         ("posterior_mean", _) => VarianceRule::PosteriorMean,
@@ -145,6 +150,11 @@ fn sanity_params(rule: &str, fixed_variance: Option<f64>) -> PyResult<SanityPara
     };
     Ok(SanityParams {
         variance_rule,
+        verbosity: match verbose {
+            0 => SanityVerbosity::Quiet,
+            1 => SanityVerbosity::Normal,
+            _ => SanityVerbosity::Detailed,
+        },
         ..SanityParams::default()
     })
 }
@@ -190,6 +200,7 @@ fn counts_in(
 /// * `rule`, `fixed_variance` - As [`sanity_params`]
 /// * `double` - `float64` storage instead of `float32`
 /// * `gpu` - Run Sanity on the GPU, see [`crate::gpu`]
+/// * `verbose` - As [`sanity_params`]
 ///
 /// ### Returns
 ///
@@ -207,11 +218,12 @@ pub fn sanity<'py>(
     fixed_variance: Option<f64>,
     double: bool,
     gpu: bool,
+    verbose: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     check(gpu)?;
     let counts = counts_in(&indices, &values, &indptr, n_cells)?;
     let totals = slice(&cell_totals)?;
-    let sp = sanity_params(rule, fixed_variance)?;
+    let sp = sanity_params(rule, fixed_variance, verbose)?;
     if double {
         sanity_out::<f64>(py, &counts, totals, sp, gpu)
     } else {
@@ -406,7 +418,7 @@ fn bonsai_out<'py, T: Float>(
 /// * `double` - `float64` storage instead of `float32`
 /// * `gpu` - Run Sanity on the GPU, see [`crate::gpu`]
 /// * `start`, `search`, `min_snr`, `max_amp`, `reroot` - As [`params`]
-/// * `verbose` - As [`bonsai`]; covers the tree search, not Sanity
+/// * `verbose` - As [`bonsai`] for the tree search, and passed to Sanity
 ///
 /// ### Returns
 ///
@@ -435,7 +447,7 @@ pub fn bonsai_from_counts<'py>(
     check(gpu)?;
     let counts = counts_in(&indices, &values, &indptr, n_cells)?;
     let totals = slice(&cell_totals)?;
-    let sp = sanity_params(rule, fixed_variance)?;
+    let sp = sanity_params(rule, fixed_variance, verbose)?;
     let bp = params(start, search, min_snr, max_amp, reroot)?;
     let verbosity = parse_verbosity_level(verbose);
     if double {

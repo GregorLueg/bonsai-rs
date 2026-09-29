@@ -1,64 +1,37 @@
 //! A starting tree from a neighbour-graph linkage.
 //!
-//! Search step 2 builds the initial topology by greedy likelihood-driven
-//! agglomeration (SPEC.md section 9.1). This replaces it, and is the default
-//! ([`crate::bonsai::StartTree`]).
-//!
-//! **It does better than the start it replaces, not merely as well.** On
-//! synthetic data the two reach the same Robinson-Foulds distance and the same
-//! loglikelihood, and an earlier version of this comment said so and stopped
-//! there. On real Sanity-preprocessed input the linkage wins on the
-//! loglikelihood and on Robinson-Foulds at every size measured and is several
-//! times faster; `docs/PERFORMANCE.md` has the table. The specified merge score
-//! chains on real data, and the reason is the size bias
-//! [`crate::bonsai::StartTree::GreedyMerge`] sets out.
-//!
-//! What this module does *not* do is score anything with the model. It hands
-//! the refinement a structurally sensible tree and gets out of the way. That
-//! turns out to be enough, and on noisy input it is better than a start chosen
-//! by a criterion with a size bias in it.
+//! Replaces the greedy merge start of SPEC.md section 9.1 and is the default
+//! ([`crate::bonsai::StartTree`]). On real Sanity-preprocessed input it wins on
+//! loglikelihood and Robinson-Foulds and is several times faster;
+//! `docs/PERFORMANCE.md` has the table. The specified merge score chains on
+//! real data because of the size bias [`crate::bonsai::StartTree::GreedyMerge`]
+//! sets out. Nothing here is scored with the model.
 //!
 //! ### Why Ward and not the merge score
 //!
-//! Ward is reducible, so every mutually nearest pair is a pair the naive scan
-//! merges at some point, and merging all of them at once builds the same
-//! dendrogram (Bruynooghe 1977, Murtagh 1983). The Bonsai merge gain is
-//! **not**: merging changes the peeled remainder that every other pair's score
-//! depends on, and about one round in five lifts some other pair above the
-//! score the merged pair had, by up to 13 nats. A linkage driven by the gain
-//! would silently build a different dendrogram from the one the round-by-round
-//! scan builds.
+//! Ward is reducible, so merging every mutually nearest pair at once builds the
+//! same dendrogram as the naive scan (Bruynooghe 1977, Murtagh 1983). The
+//! Bonsai merge gain is not: about one round in five lifts another pair above
+//! the merged pair's score, by up to 13 nats. Ward is defined through
+//! centroids, so a merged cluster is one `O(p)` update and needs no distance
+//! matrix.
 //!
-//! Ward is also defined through centroids, which is what makes it work on a
-//! sparse graph: a merged cluster's position is one `O(p)` update and needs no
-//! distance matrix.
+//! ### The graph
 //!
-//! ### The graph, and why it is an approximation
-//!
-//! Each round needs the nearest live *cluster* to every live cluster. A
-//! neighbour graph over the original cells answers that for leaves and only
-//! approximately for clusters, so this inherits the union of the two children's
-//! neighbour lists on every merge and rebuilds the graph over the live
-//! centroids when the live count has halved. That is the same device SPEC.md
-//! section 11 uses for the merge scan, for the same reason, and
-//! [`crate::search::candidates`] documents the measurement behind `k = 16`.
-//!
-//! The union has to be symmetric. Giving the merged cluster its children's
-//! lists without replacing the children in everyone else's leaves the new
-//! cluster invisible to the clusters it should be adjacent to, and every list
-//! runs dry. `search::candidates` records the same trap.
+//! Each round needs the nearest live cluster to every live cluster. A
+//! neighbour graph over the cells answers that only approximately for clusters,
+//! so each merge inherits the union of the children's neighbour lists
+//! (rewritten symmetrically, else the merged cluster is invisible to its
+//! neighbours and lists run dry), and the graph is rebuilt over the live
+//! centroids when the live count has halved (as SPEC.md section 11, see
+//! [`crate::search::candidates`]).
 //!
 //! ### Rounds, not a chain
 //!
-//! A nearest-neighbour chain builds caterpillars here, an order of magnitude
-//! deeper than `log2(n)`. The chain is depth-first, so one cluster runs away
-//! while everything else is still a singleton. A big centroid carries `1/size`
-//! of the noise, which at a few thousand features puts it closer to every leaf
-//! than that leaf's own third cousins are, so it takes a slot in every list;
-//! once a block has merged all its listed relatives the big cluster is its only
-//! edge left, the mutual test passes trivially, and the block is absorbed.
-//! Merging every mutual pair per round keeps the live clusters at similar
-//! sizes. `benches/start_tree.rs` is the sweep.
+//! A nearest-neighbour chain builds caterpillars, an order of magnitude deeper
+//! than `log2(n)`: one big centroid carries `1/size` of the noise, sits close to
+//! every leaf and absorbs blocks. Merging every mutual pair per round keeps
+//! cluster sizes similar. `benches/start_tree.rs` is the sweep.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};
@@ -76,50 +49,41 @@ use rustc_hash::FxHashSet;
 
 /// Neighbours kept per cluster.
 ///
-/// Ours, chosen by measurement; matches
-/// [`crate::search::candidates::KnnCandidatesParams`]. At every `k` from 8 to
-/// 128 the rounds reproduce the dense Ward tree exactly, at depth `log2(n)`, so
-/// the value is set by the cost of the graph and not by recovery. The `drift`
-/// block of `benches/start_tree.rs` is the sweep.
+/// Matches [`crate::search::candidates::KnnCandidatesParams`]. Every `k` from
+/// 8 to 128 reproduces the dense Ward tree, so cost sets the value
+/// (`drift` block of `benches/start_tree.rs`).
 const DEFAULT_K: usize = 16;
 
 /// Rebuild the graph once the live cluster count has fallen to this fraction of
 /// what it was at the last rebuild.
 ///
-/// Inheritance propagates the old adjacency, and a merged cluster's centroid is
-/// neither child's, so the graph goes stale as a description of the current
-/// geometry. Halving gives `log2(n)` rebuilds over a whole linkage, each over a
-/// set half the size of the last, so the rebuilds are a geometric series and
-/// cost a constant multiple of the first one.
-///
-/// Ours, chosen by measurement. Every cadence swept, including never redrawing
-/// on the count and leaving only the dry-list redraw, reproduces the dense tree
-/// at depth `log2(n)`, so the cadence does not decide recovery. Halving is kept
-/// as the bound on staleness.
+/// Halving gives `log2(n)` rebuilds costing a geometric series. Every cadence
+/// swept reproduces the dense tree, so this only bounds staleness.
 const DEFAULT_REBUILD_FRACTION: f64 = 0.5;
 
 /// Cells up to which the exhaustive backend is used; NN-descent above it.
 ///
-/// Ours, and deliberately conservative. NN-descent's graph produces the
-/// identical tree to the exhaustive one at every size measured, so nothing the
-/// linkage can see is lost by switching and the crossover is a pure cost
-/// decision. kmknn is out of the automatic path: k-means pruning buys nothing
-/// at this dimension. The `backend` block of `benches/start_tree.rs` is where
-/// to re-place this if the exhaustive build starts to show.
+/// Conservative: NN-descent gives the identical tree at every size measured
+/// (`backend` block of `benches/start_tree.rs`). kmknn is not chosen
+/// automatically.
 const EXHAUSTIVE_MAX_CELLS: usize = 4_096;
 
-/// Metric the graph is built in. Plain Euclidean on the transformed means: the
-/// graph decides which pairs are *considered*, and the linkage that decides
-/// which one wins is precision-free by construction.
+/// Metric the graph is built in; the graph only decides which pairs are
+/// considered.
 const ANN_METRIC: &str = "euclidean";
 
 /// NN-descent convergence threshold, as a fraction of the graph's edges updated
 /// in an iteration. The backend's own default.
 const NNDESCENT_DELTA: f32 = 0.001;
 
-/// NN-descent diversification probability. One, meaning no pruning: the graph
-/// is small in `k` and wanted at full recall.
+/// NN-descent diversification probability. One means no pruning.
 const NNDESCENT_DIVERSIFY: f32 = 1.0;
+
+/// Members left on the root when the linkage stops.
+///
+/// Three, so the root is not degree two in the unrooted sense (`search::spr`
+/// refuses to prune a child of such a root).
+const ROOT_MEMBERS: usize = 3;
 
 /// Which neighbour-search backend builds the graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,10 +126,13 @@ impl Default for LinkageParams {
     }
 }
 
+/////////////////////
+// Private helpers //
+/////////////////////
+
 /// Pick a backend from the problem size.
 ///
-/// Exhaustive up to [`EXHAUSTIVE_MAX_CELLS`], NN-descent above it; the
-/// state of the measurement is on the constant.
+/// Exhaustive up to [`EXHAUSTIVE_MAX_CELLS`], NN-descent above it.
 ///
 /// ### Params
 ///
@@ -182,14 +149,9 @@ fn resolve_backend(n_cells: usize) -> KnnBackend {
     }
 }
 
-//////////////////
-// The linkage //
-//////////////////
-
 /// Squared Euclidean distance between two centroid rows.
 ///
-/// Accumulated in `f64` over `f32` storage, which is this crate's rule
-/// everywhere: the sum is `O(p)` while the differences that matter are `O(1)`.
+/// Accumulated in `f64` over `f32` storage.
 ///
 /// ### Params
 ///
@@ -212,9 +174,8 @@ fn squared_distance(a: &[f32], b: &[f32]) -> f64 {
 /// Ward's dissimilarity between two live clusters.
 ///
 /// The increase in within-cluster sum of squares that merging them would cause,
-/// `(|A| |B| / (|A| + |B|)) * ||cA - cB||^2`. Expressed through centroids rather
-/// than through a Lance-Williams recurrence over a distance matrix, which is
-/// what lets the linkage run on a neighbour graph with no matrix at all.
+/// `(|A| |B| / (|A| + |B|)) * ||cA - cB||^2`, through centroids so no distance
+/// matrix is needed.
 ///
 /// ### Params
 ///
@@ -238,11 +199,8 @@ fn ward(centroids: &[f32], size: &[f64], p: usize, a: usize, b: usize) -> f64 {
 
 /// Build the neighbour graph over the live clusters.
 ///
-/// Returns a symmetrised adjacency keyed by slot, so a slot's list holds every
-/// slot it is adjacent to in either direction. Built in `f32` whatever the
-/// storage type, for the reason `search::candidates` gives: the graph only
-/// filters which pairs are considered, so its precision does not reach the
-/// answer, and `f32` halves the working set.
+/// Returns a symmetrised adjacency keyed by slot. Built in `f32` whatever the
+/// storage type, as `search::candidates` does.
 ///
 /// ### Params
 ///
@@ -298,11 +256,8 @@ fn build_graph(
             .map_err(|e| BonsaiErrors::NeighbourGraph {
                 reason: e.to_string(),
             })?;
-            // Reshape the graph NN-descent already built rather than running a
-            // beam search per point, which the backend documents as orders of
-            // magnitude more cost for higher recall. A linkage start does not
-            // need that recall: it only has to beat a random topology, and
-            // steps 3 to 7 fix what it gets wrong.
+            // Reshape the existing graph; a beam search per point costs orders
+            // of magnitude more and the start does not need the recall.
             extract_nndescent_knn(&index, Some(k + 1), false, false)
         }
     };
@@ -310,9 +265,7 @@ fn build_graph(
         reason: e.to_string(),
     })?;
 
-    // The backends index into `live`, and every one of them counts a point as
-    // its own nearest neighbour, so the self edge is dropped here rather than
-    // guarded against in the scan.
+    // Backends index into `live` and count a point as its own neighbour.
     let mut adjacency: Vec<Vec<u32>> = vec![Vec::new(); centroids.len() / p];
     let mut seen: FxHashSet<(u32, u32)> = FxHashSet::default();
     for (i, row) in neighbours.iter().enumerate() {
@@ -335,129 +288,6 @@ fn build_graph(
     }
     Ok(adjacency)
 }
-
-/// Build a starting tree by Ward linkage over a neighbour graph.
-///
-/// Rounds of mutual nearest-neighbour merges, with the candidate neighbours of
-/// each cluster restricted to a graph that is inherited across merges and
-/// rebuilt as it goes stale. `O(n k p)` per round plus the graph builds,
-/// against `O(n^2 p)` for the dense form.
-///
-/// Leaves come back as `0..n_cells` in the caller's order and every branch is
-/// one, since only the topology is meant: search step 4 replaces the lengths.
-/// The root is left with three children rather than two, because a binary
-/// dendrogram's root is degree two in the unrooted sense and carries no
-/// information, and `search::spr` refuses to prune a child of such a root.
-///
-/// ### Params
-///
-/// * `means` - Transformed means, row-major `[cell][feature]`
-/// * `n_cells` - Number of cells
-/// * `n_features` - Features per cell
-/// * `params` - Knobs, or `None` for [`LinkageParams::default`]
-///
-/// ### Returns
-///
-/// The starting tree, or `ShapeMismatch` if `means` is not `n_cells` rows of
-/// `n_features`, or `NeighbourGraph` if a backend fails.
-pub fn linkage_tree<T: BonsaiFloat>(
-    means: &[T],
-    n_cells: usize,
-    n_features: usize,
-    params: Option<LinkageParams>,
-) -> Result<Tree, BonsaiErrors> {
-    let params = params.unwrap_or_default();
-    let p = n_features;
-    if means.len() != n_cells * p {
-        return Err(BonsaiErrors::ShapeMismatch {
-            mean_cells: n_cells,
-            mean_features: p,
-            sd_cells: if p == 0 { 0 } else { means.len() / p.max(1) },
-            sd_features: p,
-        });
-    }
-    if n_cells < ROOT_MEMBERS {
-        return Err(BonsaiErrors::MalformedTree {
-            reason: format!("{n_cells} cells is fewer than the {ROOT_MEMBERS} a root needs"),
-        });
-    }
-
-    // One slot per original cell. A merge writes the union into the lower of
-    // the two slots and retires the higher, so the slot count never grows.
-    let mut centroids: Vec<f32> = means.iter().map(|&x| x.to_f32().unwrap_or(0.0)).collect();
-    let mut size = vec![1.0f64; n_cells];
-    let mut node_of: Vec<u32> = (0..n_cells as u32).collect();
-    let mut live: Vec<usize> = (0..n_cells).collect();
-
-    let mut parent = vec![NO_NODE; 2 * n_cells - ROOT_MEMBERS + 1];
-    let mut next_internal = n_cells;
-
-    let mut adjacency = build_graph(&centroids, &live, p, &params)?;
-    let mut live_at_rebuild = live.len();
-    let mut fresh = true;
-
-    while live.len() > ROOT_MEMBERS {
-        let stale = (live.len() as f64) <= params.rebuild_fraction * live_at_rebuild as f64;
-        if stale {
-            adjacency = build_graph(&centroids, &live, p, &params)?;
-            live_at_rebuild = live.len();
-            fresh = true;
-        }
-
-        let mut pairs = mutual_pairs(&adjacency, &centroids, &size, &live, p);
-        if pairs.is_empty() {
-            if !fresh {
-                // Inheritance has run every list dry before the halving is due.
-                // Redraw rather than join arbitrarily.
-                adjacency = build_graph(&centroids, &live, p, &params)?;
-                live_at_rebuild = live.len();
-                fresh = true;
-                continue;
-            }
-            // A fresh symmetric graph always has a mutual pair unless every
-            // remaining edge ties; join the best edge and carry on.
-            pairs.push(
-                best_edge(&adjacency, &centroids, &size, &live, p).ok_or_else(|| {
-                    BonsaiErrors::NeighbourGraph {
-                        reason: format!("no edges left among {} live clusters", live.len()),
-                    }
-                })?,
-            );
-        }
-        fresh = false;
-
-        for (merged, (a, b)) in pairs.into_iter().enumerate() {
-            if live.len() - merged == ROOT_MEMBERS {
-                break;
-            }
-            let ancestor = next_internal as u32;
-            next_internal += 1;
-            parent[node_of[a] as usize] = ancestor;
-            parent[node_of[b] as usize] = ancestor;
-
-            merge_slots(&mut centroids, &mut size, p, a, b);
-            merge_adjacency(&mut adjacency, a, b);
-            node_of[a] = ancestor;
-        }
-        // Retired slots leave `live` once per round, so a round is `O(n)` in
-        // bookkeeping rather than `O(n)` per merge.
-        live.retain(|&slot| size[slot] > 0.0);
-    }
-
-    let root = next_internal as u32;
-    for &slot in &live {
-        parent[node_of[slot] as usize] = root;
-    }
-    parent[root as usize] = NO_NODE;
-
-    let branch = vec![1.0f64; parent.len()];
-    Tree::from_parents(parent, branch, n_cells)
-}
-
-/// Members left on the root when the linkage stops.
-///
-/// Three, for the reason [`linkage_tree`] gives.
-const ROOT_MEMBERS: usize = 3;
 
 /// Nearest live neighbour of one slot under Ward's dissimilarity.
 ///
@@ -488,8 +318,7 @@ fn nearest(
             continue;
         }
         let d = ward(centroids, size, p, slot, other);
-        // Ties go to the lower slot, so the answer does not depend on the
-        // order the graph happened to list neighbours in.
+        // Ties go to the lower slot, independent of list order.
         if d < best || (d == best && other < who) {
             best = d;
             who = other;
@@ -501,16 +330,9 @@ fn nearest(
 /// Every mutually nearest pair among the live clusters, `(lower, higher)` in
 /// ascending order of the lower slot.
 ///
-/// Ward is reducible, so a mutually nearest pair is a pair the sequential
-/// linkage merges at some point and merging all of them at once builds the same
-/// dendrogram (Murtagh 1983). Taking them all per round is what keeps the live
-/// clusters level-synchronous: nothing grows far ahead of its neighbours, so no
-/// centroid becomes the low-noise attractor that crowds the true relatives out
-/// of every list. The depth-first chain this replaced did exactly that, and
-/// ended several times deeper than a dense linkage.
-///
-/// Per-slot searches are independent and run in parallel; the collection order
-/// is the live order, so the result is the same at any thread count.
+/// Merging all of them at once builds the dendrogram of the sequential linkage
+/// (Murtagh 1983). Per-slot searches run in parallel and are collected in live
+/// order, so the result is thread-count independent.
 ///
 /// ### Params
 ///
@@ -597,9 +419,7 @@ fn merge_slots(centroids: &mut [f32], size: &mut [f64], p: usize, a: usize, b: u
     for g in 0..p {
         let ca = centroids[a * p + g] as f64;
         let cb = centroids[b * p + g] as f64;
-        // A convex combination rather than a ratio of weighted sums, so the
-        // result is pinned between the two inputs and cannot cancel. The same
-        // choice the pruning recursion makes; see `CLAUDE.md`.
+        // Convex combination, as in the pruning recursion (see `CLAUDE.md`).
         centroids[a * p + g] = (ca + (cb - ca) * sb / total) as f32;
     }
     size[a] = total;
@@ -608,10 +428,7 @@ fn merge_slots(centroids: &mut [f32], size: &mut [f64], p: usize, a: usize, b: u
 
 /// Give slot `a` the union of both slots' neighbours and retire `b`.
 ///
-/// The union is maintained symmetrically: every list that held either child is
-/// rewritten to hold `a` instead. Doing only half of that leaves the merged
-/// cluster invisible to its own neighbours and its list runs dry, which is the
-/// trap `search::candidates` records.
+/// Symmetric: every list that held either child is rewritten to hold `a`.
 ///
 /// ### Params
 ///
@@ -639,6 +456,119 @@ fn merge_adjacency(adjacency: &mut [Vec<u32>], a: usize, b: usize) {
     adjacency[a] = merged;
 }
 
+///////////////////
+// Main function //
+///////////////////
+
+/// Build a starting tree by Ward linkage over a neighbour graph.
+///
+/// Rounds of mutual nearest-neighbour merges over an inherited, periodically
+/// rebuilt graph: `O(n k p)` per round plus the graph builds.
+///
+/// Leaves are `0..n_cells` in the caller's order and every branch is one (search
+/// step 4 replaces the lengths). The root keeps three children, see
+/// [`ROOT_MEMBERS`].
+///
+/// ### Params
+///
+/// * `means` - Transformed means, row-major `[cell][feature]`
+/// * `n_cells` - Number of cells
+/// * `n_features` - Features per cell
+/// * `params` - Knobs, or `None` for [`LinkageParams::default`]
+///
+/// ### Returns
+///
+/// The starting tree, or `ShapeMismatch` if `means` is not `n_cells` rows of
+/// `n_features`, or `NeighbourGraph` if a backend fails.
+pub fn linkage_tree<T: BonsaiFloat>(
+    means: &[T],
+    n_cells: usize,
+    n_features: usize,
+    params: Option<LinkageParams>,
+) -> Result<Tree, BonsaiErrors> {
+    let params = params.unwrap_or_default();
+    let p = n_features;
+    if means.len() != n_cells * p {
+        return Err(BonsaiErrors::ShapeMismatch {
+            mean_cells: n_cells,
+            mean_features: p,
+            sd_cells: if p == 0 { 0 } else { means.len() / p.max(1) },
+            sd_features: p,
+        });
+    }
+    if n_cells < ROOT_MEMBERS {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!("{n_cells} cells is fewer than the {ROOT_MEMBERS} a root needs"),
+        });
+    }
+
+    // One slot per cell; a merge writes into the lower slot and retires the higher.
+    let mut centroids: Vec<f32> = means.iter().map(|&x| x.to_f32().unwrap_or(0.0)).collect();
+    let mut size = vec![1.0f64; n_cells];
+    let mut node_of: Vec<u32> = (0..n_cells as u32).collect();
+    let mut live: Vec<usize> = (0..n_cells).collect();
+
+    let mut parent = vec![NO_NODE; 2 * n_cells - ROOT_MEMBERS + 1];
+    let mut next_internal = n_cells;
+
+    let mut adjacency = build_graph(&centroids, &live, p, &params)?;
+    let mut live_at_rebuild = live.len();
+    let mut fresh = true;
+
+    while live.len() > ROOT_MEMBERS {
+        let stale = (live.len() as f64) <= params.rebuild_fraction * live_at_rebuild as f64;
+        if stale {
+            adjacency = build_graph(&centroids, &live, p, &params)?;
+            live_at_rebuild = live.len();
+            fresh = true;
+        }
+
+        let mut pairs = mutual_pairs(&adjacency, &centroids, &size, &live, p);
+        if pairs.is_empty() {
+            if !fresh {
+                // Inheritance ran every list dry before the halving; redraw.
+                adjacency = build_graph(&centroids, &live, p, &params)?;
+                live_at_rebuild = live.len();
+                fresh = true;
+                continue;
+            }
+            // A fresh graph has a mutual pair unless every edge ties.
+            pairs.push(
+                best_edge(&adjacency, &centroids, &size, &live, p).ok_or_else(|| {
+                    BonsaiErrors::NeighbourGraph {
+                        reason: format!("no edges left among {} live clusters", live.len()),
+                    }
+                })?,
+            );
+        }
+        fresh = false;
+
+        for (merged, (a, b)) in pairs.into_iter().enumerate() {
+            if live.len() - merged == ROOT_MEMBERS {
+                break;
+            }
+            let ancestor = next_internal as u32;
+            next_internal += 1;
+            parent[node_of[a] as usize] = ancestor;
+            parent[node_of[b] as usize] = ancestor;
+
+            merge_slots(&mut centroids, &mut size, p, a, b);
+            merge_adjacency(&mut adjacency, a, b);
+            node_of[a] = ancestor;
+        }
+        live.retain(|&slot| size[slot] > 0.0);
+    }
+
+    let root = next_internal as u32;
+    for &slot in &live {
+        parent[node_of[slot] as usize] = root;
+    }
+    parent[root as usize] = NO_NODE;
+
+    let branch = vec![1.0f64; parent.len()];
+    Tree::from_parents(parent, branch, n_cells)
+}
+
 ///////////
 // Tests //
 ///////////
@@ -651,10 +581,8 @@ mod tests {
     /// Ward linkage over a full distance matrix, the answer the graph version
     /// has to reproduce when the graph is complete.
     ///
-    /// Deliberately the naive scan over an `O(n^2)` matrix with Lance-Williams
-    /// updates, which reaches the same dendrogram by a different route than
-    /// [`linkage_tree`]'s centroid arithmetic. Two independent formulations
-    /// agreeing is worth more than one agreeing with itself.
+    /// Naive scan over an `O(n^2)` matrix with Lance-Williams updates, an
+    /// independent route to the same dendrogram.
     ///
     /// ### Params
     ///
@@ -673,9 +601,7 @@ mod tests {
                 d[i * n + j] = if i == j {
                     f64::INFINITY
                 } else {
-                    // Ward at unit sizes is half the squared distance, which is
-                    // what makes the Lance-Williams recurrence below the
-                    // ordinary one.
+                    // Ward at unit sizes is half the squared distance.
                     0.5 * squared_distance(&coords[i * p..(i + 1) * p], &coords[j * p..(j + 1) * p])
                 };
             }
@@ -775,11 +701,8 @@ mod tests {
 
     #[test]
     fn test_a_complete_graph_reproduces_the_dense_linkage() {
-        // The whole approximation is the sparsity of the graph. At `k = n - 1`
-        // there is none, so the rounds have to find exactly the pairs the dense
-        // scan finds, every round. This is what says the inheritance and the
-        // symmetry bookkeeping are right, and it is the gate
-        // `search::candidates` keeps for the same reason.
+        // At `k = n - 1` the graph is complete, so the rounds must match the
+        // dense scan; this checks the inheritance and symmetry bookkeeping.
         let (n, p) = (64usize, 24usize);
         for seed in [1u64, 2, 3] {
             let means = fixture(n, p, seed);
@@ -800,10 +723,8 @@ mod tests {
 
     #[test]
     fn test_the_sparse_graph_stays_close_to_the_dense_linkage() {
-        // At the shipped `k` the answer may differ and how much is the whole
-        // question, so this pins a measurement rather than asserting an
-        // equality it does not have. A large drift means the inheritance has
-        // gone wrong, not that the approximation has bitten.
+        // Pins a bound on drift at the default `k`; large drift means broken
+        // inheritance.
         let (n, p) = (64usize, 24usize);
         let mut total = 0usize;
         for seed in [1u64, 2, 3] {
@@ -819,9 +740,7 @@ mod tests {
 
     #[test]
     fn test_the_exact_backends_agree() {
-        // Exhaustive and kmknn are both exact, so at the same `k` they hand the
-        // rounds the identical graph and therefore the identical tree.
-        // NN-descent is approximate and is not held to this.
+        // Both exact, so identical graph and tree; NN-descent is not held to this.
         let (n, p) = (64usize, 32usize);
         let means = fixture(n, p, 11);
         let mut trees = Vec::new();

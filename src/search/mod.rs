@@ -18,13 +18,15 @@ pub mod polytomy;
 pub mod spr;
 pub mod star;
 
+////////////
+// Leaves //
+////////////
+
 /// The leaf data a search step scores its trees against.
 ///
 /// Both blocks are row-major `[leaf][feature]` in the transformed units of
-/// SPEC.md section 3.1, which is the layout
-/// [`crate::model::likelihood::NodeState::new`] expects. Search steps rebuild
-/// the tree, so they rebuild the node state with it and need the leaf rows
-/// rather than a settled state.
+/// SPEC.md section 3.1, the layout
+/// [`crate::model::likelihood::NodeState::new`] expects.
 #[derive(Clone, Copy, Debug)]
 pub struct Leaves<'a, T> {
     /// Transformed means, `[leaf][feature]`.
@@ -35,9 +37,9 @@ pub struct Leaves<'a, T> {
     pub n_features: usize,
 }
 
-//////////////////////
-// Settled trees    //
-//////////////////////
+///////////////////
+// Settled trees //
+///////////////////
 
 /// Loglikelihood of a tree, from the leaf data alone.
 ///
@@ -58,8 +60,7 @@ pub(crate) fn tree_loglik<T: BonsaiFloat>(
 
 /// Settle a tree's down rows alone.
 ///
-/// The up sweep is the more expensive half of settling a tree, so a caller that
-/// only reads down rows takes this.
+/// Skips the up sweep.
 ///
 /// ### Params
 ///
@@ -131,23 +132,15 @@ pub(crate) fn leaves_below(tree: &Tree) -> Vec<usize> {
 
 /// Order-independent fingerprint of a tree's unrooted splits.
 ///
-/// Every leaf gets a fixed pseudo-random word; an internal node's word is the
-/// sum of its subtree's. A split is then canonicalised by taking the smaller of
-/// the word and its complement, so the fingerprint does not depend on which
-/// node is the root, on sibling order, or on internal node numbering. The
-/// fingerprint is the sum of a hash of each split, which is a multiset hash:
-/// the same set of splits gives the same word whatever order they are met in.
-/// Used by both NNI and SPR to reject a proposal that changes no split. That
-/// filter decides whether the search terminates: without it, collapsing and
-/// re-resolving a star reports a gain from reoptimising branch lengths while
-/// leaving the topology alone, and the greedy phase does branch-length descent
-/// forever. See the deviation note on SPEC.md section 9.4.
+/// Leaves get fixed pseudo-random words, an internal node's word is the sum of
+/// its subtree's, and each split contributes a hash of the smaller of its word
+/// and complement. Blind to root position, sibling order and node numbering.
+/// NNI and SPR use it to reject proposals that change no split (SPEC.md
+/// section 9.4 deviation note); without it the greedy phase loops on
+/// branch-length descent.
 ///
-/// **Skipping the second child of a degree-two root is not tidying.** Its two
-/// children describe the same split, so the sum would carry it twice and two
-/// representations of one unrooted tree would compare unequal. Skipping it is
-/// what makes the fingerprint blind to rerooting, which is what the filter
-/// needs it to be.
+/// The second child of a degree-two root is skipped: both children describe
+/// one split and would otherwise be counted twice.
 ///
 /// ### Params
 ///
@@ -179,10 +172,9 @@ pub(crate) fn split_fingerprint_with(tree: &Tree, word: &[u64]) -> u64 {
 
 /// One split's term in [`split_fingerprint_with`].
 ///
-/// The split's leaf word canonicalised against its complement, so either side
-/// names it, then mixed. The fingerprint is the wrapping sum of these over the
-/// tree's distinct non-trivial splits, so a caller that knows which splits a
-/// move adds can update a fingerprint without walking the new tree.
+/// The leaf word canonicalised against its complement, then mixed. The
+/// fingerprint is the wrapping sum of these over the distinct non-trivial
+/// splits.
 ///
 /// ### Params
 ///
@@ -223,11 +215,8 @@ pub(crate) fn split_fingerprint_counted(tree: &Tree, word: &[u64], below: &[usiz
     tree.internal_postorder()
         .filter(|&node| tree.parent(node).is_some() && node != duplicate)
         .filter(|&node| {
-            // A split with fewer than two leaves on a side is trivial: every
-            // tree over the same leaves has it, so it distinguishes nothing.
-            // Excluding it is what makes the fingerprint survive rooting on a
-            // leaf's own branch, which puts the old root one step above a tip
-            // and makes it describe exactly such a split.
+            // Trivial splits (under two leaves a side) are shared by every tree;
+            // excluding them keeps the fingerprint stable when rooting on a leaf branch.
             let here = below[node as usize];
             here >= 2 && n_leaves - here >= 2
         })
@@ -238,15 +227,9 @@ pub(crate) fn split_fingerprint_counted(tree: &Tree, word: &[u64], below: &[usiz
 
 /// Per-node word summarising which leaves sit below it.
 ///
-/// Each leaf gets a fixed pseudo-random word and an internal node gets the sum
-/// of its subtree's, so the value identifies a *set of leaves* rather than a
-/// node index. That is what makes it survive the renumbering `Tree::from_parents`
-/// performs: SPR uses it to name a subtree across a rebuild, and
-/// [`split_fingerprint`] to name a split.
-///
-/// Summation means two different leaf sets can collide, at roughly `2^-64` per
-/// comparison. Fine for both callers, neither of which is deciding correctness
-/// on the result alone.
+/// A leaf's word is fixed pseudo-random, an internal node's is the sum of its
+/// subtree's, so it names a leaf set and survives the renumbering of
+/// `Tree::from_parents`. Distinct sets collide at roughly `2^-64`.
 ///
 /// ### Params
 ///
@@ -272,10 +255,8 @@ pub(crate) fn leaf_words(tree: &Tree) -> Vec<u64> {
 /// Words of every node within `radius` edges of a clade a move created.
 ///
 /// A created clade is a node of the new tree with no counterpart in the old
-/// one, which is exactly the path the move rewired. The walk is unrooted, so it
-/// reaches the moved subtree and its new siblings as well as the ancestors.
-/// SPR uses it to choose what the next sweep proposes, NNI to choose which
-/// cached gains to throw away.
+/// one. The walk is unrooted, so it also reaches the moved subtree and its new
+/// siblings.
 ///
 /// ### Params
 ///
@@ -324,13 +305,8 @@ mod tests {
     use super::*;
     use crate::tree::cluster::reroot;
 
-    /// Regression. NNI and SPR independently grew the same split
-    /// fingerprint, but only SPR's deduplicated. A degree-two root's two
-    /// children describe one split, so the raw key carries it twice and the
-    /// same unrooted tree compares unequal to itself under a different root.
-    /// NNI's move filter would then accept a proposal that changed nothing but
-    /// where the root sat, which is the branch-length descent the filter exists
-    /// to stop.
+    /// Regression: a degree-two root's children describe one split, which must
+    /// be counted once.
     #[test]
     fn test_the_fingerprint_is_blind_to_where_the_tree_is_rooted() {
         let tree = Tree::balanced_binary(16, 0.7).expect("balanced fixture");

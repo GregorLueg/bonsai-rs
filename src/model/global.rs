@@ -1,22 +1,14 @@
 //! Global branch-length optimisation.
 //!
-//! Collapsing everything but one edge into an effective leaf on each side turns
-//! that edge into the one-dimensional problem
-//! [`crate::model::branch::optimise_edge`] already solves; doing it for every
-//! edge at once needs the effective leaf on *both* sides of every edge, which
-//! is one sweep in each direction over the arena.
+//! Collapsing everything but one edge into an effective leaf per side turns the
+//! edge into the problem [`crate::model::branch::optimise_edge`] solves. Doing
+//! it for every edge needs the "up" value of each non-root node `k` with
+//! parent `a`: the effective leaf at `a` of everything outside `k`'s subtree.
+//! Down values settle in post-order ([`crate::model::likelihood`]), up values
+//! in pre-order.
 //!
-//! The pruning recursion in [`crate::model::likelihood`] supplies one side: for
-//! every node `k`, the subtree below `k`. This module supplies the other, the
-//! "up" value: for a non-root node `k` with parent `a`, the effective leaf at
-//! `a` of everything except `k`'s own subtree. Down values settle in
-//! post-order, up values in pre-order, and the arena invariant makes both a
-//! bare linear scan, the second one backwards.
-//!
-//! Optimising one edge moves the effective leaves every other edge sees, so the
-//! two are iterated. The proposal is computed for all edges from one pair of
-//! sweeps, which is not on its own guaranteed to improve the tree; see
-//! [`optimise_branch_lengths`] for why it is safe anyway.
+//! Optimising one edge moves the leaves every other edge sees, so the two are
+//! iterated; see [`optimise_branch_lengths`] for why the joint proposal is safe.
 
 use crate::errors::BonsaiErrors;
 use crate::model::branch::optimise_edge;
@@ -32,13 +24,9 @@ use rayon::prelude::*;
 
 /// The effective leaf *above* every node: everything outside its own subtree.
 ///
-/// Stored the same way as [`NodeState`], two flat row-major blocks of
-/// `n_nodes * p`, so a node's row is one contiguous span and row indices agree
-/// between the two sides. The root's row is zeroed: there is nothing above the
-/// root, which is the same thing as an effective leaf of zero precision.
-///
-/// A row is meaningful only after [`UpState::sweep`], and only for the tree and
-/// down rows it was swept against.
+/// Laid out like [`NodeState`] (flat row-major `n_nodes * p`). The root's row
+/// is zeroed, i.e. zero precision. Rows are meaningful only after
+/// [`UpState::sweep`], for the tree and down rows it was swept against.
 #[derive(Clone, Debug)]
 pub struct UpState<T> {
     /// Up means, `[node][feature]`, row-major.
@@ -103,27 +91,21 @@ impl<T: BonsaiFloat> UpState<T> {
 
     /// Fill every node's up row from a settled set of down rows.
     ///
-    /// Writing `Wd[c] = W[c] / (1 + t[c] * W[c])` for the diffusion-corrected
-    /// precision of a child and `Wup[a]` for the diffusion-corrected precision
-    /// of `a`'s own up-part, the total effective precision seen at `a` is
+    /// With `Wd[c] = W[c] / (1 + t[c] * W[c])` and `Wup[a]` the diffused
+    /// precision of `a`'s own up-part, the total precision at `a` is
     ///
     /// ```text
     /// Wtot[a] = sum_{c in C(a)} Wd[c] + Wup[a]
     /// Wup[a]  = 1 / (t[a] + 1 / Wu[a])          (zero at the root)
     /// ```
     ///
-    /// with the matching weighted mean, and the up value of a child `k` is that
-    /// total with `k`'s own contribution removed, `Wu[k] = Wtot[a] - Wd[k]`.
-    /// Diffusing `a`'s up value along `t[a]` is the same operation the down
-    /// recursion applies to a child, which is what makes this the mirror image
-    /// of SPEC.md section 4 rather than a separate derivation.
+    /// with the matching weighted mean; the up value of child `k` is that total
+    /// minus `k`'s own contribution, `Wu[k] = Wtot[a] - Wd[k]` (mirror image of
+    /// SPEC.md section 4).
     ///
-    /// Each node's row reads only its parent's, which sits in a higher level,
-    /// so the levels are walked from the top down, the leaves last, and the
-    /// nodes of one level are written in parallel: their rows are contiguous
-    /// and every row they read lies above them. Measured 2026-09-27 at 10,000
-    /// cells by 2,767 features, the sequential sweep was 0.065 s a pass of the
-    /// global branch solve, as long as the parallel edge solves it feeds.
+    /// Levels are walked top down, leaves last, each level in parallel (a row
+    /// reads only its parent's, in a higher level). The sequential sweep was
+    /// 0.065 s a pass at 10,000 cells by 2,767 features, 2026-09-27.
     ///
     /// ### Params
     ///
@@ -165,11 +147,10 @@ impl<T: BonsaiFloat> UpState<T> {
 
 /// Write one node's up row from its parent's.
 ///
-/// The per-feature expressions of the two-sided sweep, for one child: with a
-/// binary parent the sibling diffused plus the parent's up-part, otherwise the
-/// parent's total with this child's own contribution removed. The total is
-/// formed per child rather than once per parent, the same expressions in the
-/// same order, so the bits do not depend on which child asked.
+/// With a binary parent: the sibling diffused plus the parent's up-part;
+/// otherwise the parent's total minus this child's contribution. The total is
+/// formed per child, in the same order, so bits do not depend on which child
+/// asked.
 ///
 /// ### Params
 ///
@@ -230,9 +211,8 @@ fn up_row_into<T: BonsaiFloat>(
 /// The up-part of a node as its children see it: its own up value diffused
 /// along the branch above it.
 ///
-/// `pub(crate)` because [`crate::search::spr`]'s lazy rows fill one node's up
-/// row at a time and have to apply the identical expression, in the identical
-/// order, to get the identical bits.
+/// `pub(crate)` because [`crate::search::spr`]'s lazy rows must apply the
+/// identical expression, in the identical order, to get identical bits.
 ///
 /// ### Params
 ///
@@ -257,17 +237,13 @@ pub(crate) fn up_part<T: BonsaiFloat>(is_root: bool, t_a: f64, w_up: T, m_up: T)
 
 /// The whole tree collapsed onto every node in turn.
 ///
-/// For node `i`, the effective leaf you get by rooting there and marginalising
-/// everything else, which is the same object as the posterior at `i`: the
-/// likelihood does not depend on the root (S14), so it is the product of two
-/// Gaussians the sweeps already hold, the subtree below `i` and everything
-/// above it seen across `i`'s own branch. Precisions add, means combine
-/// precision-weighted. Two sweeps give it for every node at once, which is what
-/// makes both a placement search and a whole-tree posterior affordable.
+/// For node `i`, the effective leaf from rooting there, i.e. the posterior at
+/// `i` (root-independent, S14): the product of the subtree below `i` and
+/// everything above it seen across `i`'s branch. Precisions add, means combine
+/// precision-weighted.
 ///
-/// The mean is formed as a convex combination rather than a ratio of sums, for
-/// the reason given in [`crate::utils::kernels::prune_binary_scalar`]: the
-/// result is pinned between the two inputs and cannot cancel.
+/// The mean is a convex combination, as in
+/// [`crate::utils::kernels::prune_binary_scalar`].
 ///
 /// ### Params
 ///
@@ -282,12 +258,8 @@ pub(crate) fn up_part<T: BonsaiFloat>(is_root: bool, t_a: f64, w_up: T, m_up: T)
 /// `f64`, which is what a caller wanting standard deviations needs and what a
 /// caller wanting an effective leaf narrows.
 ///
-/// ### Why this is public
-///
-/// [`crate::model::place::place`] is public and takes the effective leaf of
-/// every node as a closure, which its own documentation says must be this
-/// composition and not [`UpState`]'s rows. So an external caller of `place`
-/// cannot write a correct one without this.
+/// Public because [`crate::model::place::place`] takes a closure that must be
+/// this composition, not [`UpState`]'s rows.
 pub fn collapse_onto_every_node<T: BonsaiFloat>(
     tree: &Tree,
     means: &[T],
@@ -307,8 +279,7 @@ pub fn collapse_onto_every_node<T: BonsaiFloat>(
         let (m_down, w_down) = (down.means(node), down.precisions(node));
 
         if tree.parent(node).is_none() {
-            // The root has nothing above it, so its row is the whole tree seen
-            // from below.
+            // Root: the whole tree seen from below.
             for g in 0..p {
                 m[lo + g] = m_down[g];
                 w[lo + g] = wide(w_down[g]);
@@ -319,8 +290,7 @@ pub fn collapse_onto_every_node<T: BonsaiFloat>(
         let (m_up, w_up) = (up.means(node), up.precisions(node));
         let t = tree.branch(node);
         for g in 0..p {
-            // The up part sits at the parent, so it reaches this node across
-            // this node's own branch.
+            // The up part sits at the parent, so it crosses this node's branch.
             let w_u = wide(w_up[g]);
             let up_here = w_u / (1.0 + t * w_u);
             let w_d = wide(w_down[g]);
@@ -343,29 +313,18 @@ pub fn collapse_onto_every_node<T: BonsaiFloat>(
 
 /// Backtracking budget for one iteration.
 ///
-/// The proposal is an ascent direction (see [`optimise_branch_lengths`]), so
-/// some step size along it improves the tree unless the tree is already
-/// stationary. Twenty halvings take the step to `1e-6` of its length, far below
-/// the point at which a failure to improve means stationarity rather than an
-/// overlong step.
+/// The proposal is an ascent direction, so some step improves the tree unless
+/// it is stationary; twenty halvings reach `1e-6` of the step.
 const MAX_BACKTRACK: usize = 20;
 
 /// Factor by which a rejected step is shrunk.
-///
-/// Plain halving. Nothing here is sensitive to the schedule: the accepted step
-/// is usually the full one, and the shrinking exists to survive the cases where
-/// it is not.
 const BACKTRACK_SHRINK: f64 = 0.5;
 
 /// Floor on the scale used by the relative convergence test.
 ///
-/// Loglikelihoods here are defined up to an additive constant (SPEC.md section
-/// 3.2), so one can sit arbitrarily close to zero on a small enough fixture.
-/// Without a floor the relative test would then demand an improvement of zero
-/// and never terminate.
-///
-/// Shared with [`crate::search::spr`], whose acceptance floor is the same
-/// shape and needs the same guard for the same reason.
+/// Loglikelihoods are defined up to a constant (SPEC.md section 3.2), so one
+/// can sit near zero and the relative test would never terminate. Shared with
+/// [`crate::search::spr`].
 pub(crate) const LOGLIK_SCALE_FLOOR: f64 = 1.0;
 
 /// Stopping rule for [`optimise_branch_lengths`].
@@ -381,17 +340,10 @@ pub struct GlobalBranchParams {
 impl Default for GlobalBranchParams {
     /// Ours, chosen by measurement.
     ///
-    /// Each edge's proposal is that edge's exact conditional optimum rather
-    /// than a small step, so the outer iteration converges linearly at a rate
-    /// set only by how strongly the edges couple. On the fixtures in this
-    /// module it takes tens of iterations at worst, from which `max_iter` is a
-    /// runaway guard at roughly three times that rather than a working limit.
-    /// The starting point barely matters, which is what one would expect of an
-    /// iteration whose every component step is an exact solve.
-    ///
-    /// `tol` is far tighter than the search needs. Branch lengths feed the
-    /// merge scores, and where this loop stops should never be what separates
-    /// two candidate topologies.
+    /// Each proposal is an exact conditional optimum, so convergence is linear
+    /// and takes tens of iterations at worst on this module's fixtures;
+    /// `max_iter` is a runaway guard at roughly three times that. `tol` is far
+    /// tighter than the search needs.
     fn default() -> Self {
         Self {
             max_iter: 64,
@@ -402,28 +354,20 @@ impl Default for GlobalBranchParams {
 
 /// Optimise every branch length in the tree.
 ///
-/// One iteration sweeps down (the pruning recursion), sweeps up, and then
-/// solves every edge with [`crate::model::branch::optimise_edge`] on
+/// One iteration sweeps down (pruning), sweeps up, then solves every edge with
+/// [`crate::model::branch::optimise_edge`] on
 ///
 /// ```text
 /// s[g] = 1 / W_down[k][g] + 1 / W_up[k][g]
 /// d[g] = (M_down[k][g] - M_up[k][g])^2
 /// ```
 ///
-/// Each of those solves is the exact optimum of that edge with every other
-/// branch length held fixed, because the whole tree loglikelihood as a function
-/// of `t[k]` alone is the edge form of SPEC.md section 6 plus a constant. Taken
-/// one at a time they would each improve the tree; taken together, as they are
-/// here, they need not, because moving one edge moves the effective leaves the
-/// others were solved against.
-///
-/// What survives is that the proposal is an *ascent direction*. The
-/// loglikelihood's partial derivative in `t[k]` is `-f(t[k])/2` for that edge's
-/// `f`, and `optimise_edge` returns a length above the current one exactly when
-/// `f(t[k])` is negative, so every component of the proposed move agrees in
-/// sign with its own partial derivative. A step that fails to improve the tree
-/// is therefore too long rather than wrong, and is retried shorter. That is
-/// what makes the loop monotone in the loglikelihood.
+/// Each solve is the exact optimum of its edge with the others fixed (edge form
+/// of SPEC.md section 6). Taken together they need not improve the tree, but
+/// the proposal is an ascent direction: the partial derivative in `t[k]` is
+/// `-f(t[k])/2`, and `optimise_edge` returns a length above the current one
+/// exactly when `f(t[k])` is negative. A step that fails to improve is
+/// therefore too long, and is retried shorter, which makes the loop monotone.
 ///
 /// ### Params
 ///
@@ -453,13 +397,8 @@ pub fn optimise_branch_lengths<T: BonsaiFloat>(
 
     for _ in 0..params.max_iter {
         up.sweep(tree, state);
-        // One independent edge solve per node, each reading the two settled
-        // rows and writing its own slot, so this is parallel without a
-        // reduction and is bit-identical to the sequential loop whatever the
-        // thread count. The scratch is per thread rather than per node: the
-        // pair of `p`-length buffers is the only allocation an edge solve
-        // needs, and allocating it once per node would cost more than the
-        // solve. The sweeps either side of this stay sequential.
+        // Independent per-node solves writing their own slot: bit-identical at
+        // any thread count. Scratch is per thread, not per node.
         let settled: &NodeState<T> = state;
         let up_ref = &up;
         let current_ref = &current;
@@ -502,9 +441,7 @@ pub fn optimise_branch_lengths<T: BonsaiFloat>(
             alpha *= BACKTRACK_SHRINK;
         }
 
-        // A step worth less than the tolerance is undone rather than kept, so
-        // that a second call on a converged tree returns the identical tree
-        // instead of one nudged by a further sub-tolerance step.
+        // Sub-tolerance steps are undone so a second call returns the same tree.
         match improved {
             Some(l) if l - best > params.tol * best.abs().max(LOGLIK_SCALE_FLOOR) => {
                 current.copy_from_slice(tree.branches());
@@ -512,8 +449,7 @@ pub fn optimise_branch_lengths<T: BonsaiFloat>(
             }
             _ => {
                 tree.branches_mut().copy_from_slice(&current);
-                // Resettle the rows the rejected step left behind, so the state
-                // the caller keeps still describes the tree it holds.
+                // Resettle so the caller's state matches the tree.
                 state.prune(tree);
                 return Ok(best);
             }

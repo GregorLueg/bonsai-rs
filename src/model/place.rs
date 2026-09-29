@@ -1,17 +1,10 @@
-//! Placing a node on an existing tree.
+//! Placing a node on an existing tree: which node should `q` hang off, used to
+//! regraft the pruned subtree of an SPR move.
 //!
-//! Used by the search to regraft the pruned subtree of an SPR move: "which
-//! node of this tree should `q` hang off".
-//!
-//! ### Why the score is an ordinary edge
-//!
-//! Attaching `q` below `a` gives a tree whose loglikelihood is the old tree's,
-//! plus `q`'s own, plus the contribution of the single edge joining them. The
-//! first two terms do not depend on `a`: the collapse of the existing tree onto
-//! `a` accumulates the same total whatever `a` is, because the likelihood does
-//! not depend on the choice of root. So the edge term alone ranks attachment
-//! points, and the edge term is exactly what `model::branch` already solves. No
-//! new kernel appears here.
+//! Attaching `q` below `a` adds the old tree's loglikelihood, `q`'s own, and one
+//! edge term. The first two do not depend on `a` (the likelihood is root
+//! independent), so the edge term alone ranks attachment points and
+//! `model::branch` already solves it.
 
 use crate::errors::BonsaiErrors;
 use crate::model::branch::optimise_edge_loglik;
@@ -20,53 +13,33 @@ use crate::tree::Tree;
 use crate::utils::kernels::prep_edge;
 use crate::utils::traits::BonsaiFloat;
 
-////////////////
-// Parameters //
-////////////////
+////////////
+// Consts //
+////////////
 
 /// Beam tolerance, in nats of loglikelihood.
 ///
-/// A neighbour is recursed into when its attachment score is within this much
-/// of the best score seen so far, so it buys breadth against cost. Zero is
-/// greedy hill-climbing and infinity is an exhaustive scan; both are supported
-/// and both are used by the tests.
-///
-/// Ours, not theirs, and set by measurement over a grid from 2 to 6: this is
-/// the smallest value that returns the exhaustive scan's node on every fixture
-/// swept. A query is a second noisy measurement of a cell already in the tree,
-/// and the values below this one fail on ladders only, badly rather than
-/// marginally.
-///
-/// Cost is shape-dependent and worth knowing. A balanced tree scores a tenth of
-/// its nodes or fewer; a ladder scores half, and does not score more than that
-/// at any wider tolerance, so on the shape that needs the beam the beam is
-/// already covering everything it will ever cover.
-///
-/// It is an absolute loglikelihood difference and does not scale with the
-/// feature count, deliberately: what is being compared is the gap between two
-/// neighbouring attachment points, and that gap stays `O(1)` as features are
-/// added because neighbouring nodes agree on most features.
+/// A neighbour is recursed into when its score is within this of the best so
+/// far. Zero is greedy, infinity exhaustive. Ours: the smallest value in a grid
+/// of 2 to 6 that returns the exhaustive node on every swept fixture; smaller
+/// values fail badly on ladders. It is an absolute difference, not scaled by
+/// feature count, as neighbouring gaps stay `O(1)`.
 const DEFAULT_TOLERANCE: f64 = 4.0;
 
-/// Number of start points the beam search fans out from.
+/// Number of start points the beam search fans out from (SPEC.md section 7.2).
 ///
-/// The paper describes `log(n)` centres from a distance-based clustering; our
-/// count is ours to choose (SPEC.md section 7.2), and set by measurement over
-/// the fixtures described on [`DEFAULT_TOLERANCE`]. A balanced tree recovers
-/// every query from a single start at every tolerance tried. A ladder does not,
-/// and what it loses it loses badly rather than marginally, in the same cliff
-/// [`DEFAULT_TOLERANCE`] describes; eight starts closes it and fewer do not.
-///
-/// Eight ships because on the shape that fails it is nearly free, and what it
-/// costs on the shapes that do not fail is a handful of extra node scores per
-/// query.
+/// Ours, not the paper's `log(n)`. A balanced tree needs one; a ladder fails at
+/// fewer than eight (measured over the fixtures behind [`DEFAULT_TOLERANCE`]).
 const DEFAULT_STARTS: usize = 8;
+
+///////////
+// Types //
+///////////
 
 /// Tuning knobs for the beam search of SPEC.md section 7.2.
 ///
-/// Neither changes the model. Both trade the number of attachment scores
-/// evaluated, each of which is a root find over `p` features, against the risk
-/// of stopping at a local optimum.
+/// Neither changes the model; both trade attachment scores evaluated (one root
+/// find over `p` features each) against the risk of a local optimum.
 #[derive(Clone, Copy, Debug)]
 pub struct PlacementParams {
     /// How far below the best score seen so far a neighbour may fall and still
@@ -91,10 +64,6 @@ impl Default for PlacementParams {
     }
 }
 
-//////////////////////
-// Attachment score //
-//////////////////////
-
 /// The result of attaching a node below one particular node of the tree.
 #[derive(Clone, Copy, Debug)]
 pub struct Attachment {
@@ -103,10 +72,77 @@ pub struct Attachment {
     /// SPEC.md section 7.3's polytomy resolution then has to deal with.
     pub branch: f64,
     /// The edge's loglikelihood at that length, which is the attachment score.
-    /// Comparable across attachment points but not an absolute quantity; see
-    /// the module docs.
+    /// Comparable across attachment points, not an absolute quantity.
     pub loglik: f64,
 }
+
+/// Where a node should be attached, and what that costs.
+#[derive(Clone, Copy, Debug)]
+pub struct Placement {
+    /// Node of the existing tree to attach below.
+    pub node: u32,
+    /// Optimal length of the new edge.
+    pub branch: f64,
+    /// Attachment score there, the best found by the search.
+    pub loglik: f64,
+    /// How many distinct nodes were scored; the search's cost in `O(p)` root
+    /// finds.
+    pub scored: usize,
+}
+
+/// What the beam search needs from the tree it walks.
+///
+/// A [`Tree`] is one; the other is the view an SPR cut would leave behind (see
+/// [`crate::search::masked`]). Both must present the same start points and
+/// neighbour order.
+pub(crate) trait Walk {
+    /// Size of the node id space, for the visited set.
+    fn id_space(&self) -> usize;
+    /// The spread start points, root first; [`start_points`] for a tree.
+    fn spread_starts(&self, n_starts: usize) -> Vec<u32>;
+    /// A node's children in arena order, then its parent.
+    fn neighbours(&self, node: u32, out: &mut Vec<u32>);
+}
+
+impl Walk for Tree {
+    fn id_space(&self) -> usize {
+        self.n_nodes()
+    }
+
+    fn spread_starts(&self, n_starts: usize) -> Vec<u32> {
+        start_points(self, n_starts)
+    }
+
+    fn neighbours(&self, node: u32, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend(neighbours(self, node));
+    }
+}
+
+/////////////////////
+// Private helpers //
+/////////////////////
+
+/// Neighbours of a node in the unrooted sense: its children and its parent.
+///
+/// The likelihood is unrooted, so the search must be able to walk upwards.
+///
+/// ### Params
+///
+/// * `tree` - Tree being searched
+/// * `node` - Node whose neighbours are wanted
+///
+/// ### Returns
+///
+/// An iterator over the neighbours, children first in arena order and the
+/// parent last. The fixed order makes the search deterministic.
+fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
+    tree.children(node).iter().copied().chain(tree.parent(node))
+}
+
+///////////////
+// Functions //
+///////////////
 
 /// Score attaching `q` below a node summarised by the effective leaf `a`.
 ///
@@ -115,13 +151,9 @@ pub struct Attachment {
 ///                        + (M[g,a] - M[g,q])^2 / (t + 1/W[g,a] + 1/W[g,q]) ]
 /// ```
 ///
-/// which is the edge expression with
-/// `s[g] = 1/W[g,a] + 1/W[g,q]` and `d[g] = (M[g,a] - M[g,q])^2`. Those are
-/// what `prep_edge` produces, along with the bracket, on the one pass it makes
-/// over the two arrays, and the maximisation over `t` is what
-/// `optimise_edge_loglik` does. So this function is a two-line composition
-/// rather than a kernel, which is the point: there is only one branch-length
-/// solver in the crate.
+/// which is the edge expression with `s[g] = 1/W[g,a] + 1/W[g,q]` and
+/// `d[g] = (M[g,a] - M[g,q])^2`, as produced by `prep_edge` and maximised by
+/// `optimise_edge_loglik`.
 ///
 /// ### Params
 ///
@@ -152,40 +184,16 @@ pub fn attachment_score<T: BonsaiFloat>(
     Ok(Attachment { branch, loglik })
 }
 
-/////////////////
-// Beam search //
-/////////////////
-
-/// Where a node should be attached, and what that costs.
-#[derive(Clone, Copy, Debug)]
-pub struct Placement {
-    /// Node of the existing tree to attach below.
-    pub node: u32,
-    /// Optimal length of the new edge.
-    pub branch: f64,
-    /// Attachment score there, the best found by the search.
-    pub loglik: f64,
-    /// How many distinct nodes were scored. Diagnostic only: it is the search's
-    /// cost in units of one `O(p)` root find, and the handle on whether the
-    /// tolerance is doing anything.
-    pub scored: usize,
-}
-
 /// Start points for the beam search.
 ///
-/// **Placeholder.** SPEC.md section 7.2 takes the centres of the distance-based
-/// clustering of the Methods, which depends on machinery this crate does not
-/// have yet; until it does, this spreads the starts evenly over the node index.
-/// That is a real spread rather than an arbitrary one, because the arena
-/// invariant makes the index ordering meaningful: leaves come first, then
-/// internal nodes by height, so an even sweep over indices samples the leaves
-/// broadly and then samples every level of the internal skeleton.
+/// **Placeholder.** SPEC.md section 7.2 takes the centres of a distance-based
+/// clustering this crate does not have; this spreads the starts evenly over the
+/// node index, which samples the leaves and then every internal level (arena
+/// order).
 ///
-/// The root always comes first. That is not cosmetic:
-/// start points share one visited set (see [`place`]), so the first start is
-/// the only one guaranteed to explore unimpeded, and putting the root there
-/// makes a multi-start search provably no worse than a single search from the
-/// root.
+/// The root comes first: starts share one visited set (see [`place`]), so the
+/// first is the only one guaranteed to explore unimpeded, which makes multi-start
+/// no worse than a single search from the root.
 ///
 /// ### Params
 ///
@@ -200,33 +208,11 @@ pub fn start_points(tree: &Tree, n_starts: usize) -> Vec<u32> {
     let k = n_starts.clamp(1, n);
     let mut out = Vec::with_capacity(k);
     out.push(tree.root());
-    // `i * n / k` for `i` in `1..k` lands inside `0..n`. It can collide with the
-    // root once `k` approaches `n`; the shared visited set absorbs that.
+    // May collide with the root as `k` approaches `n`; the visited set absorbs it.
     for i in 1..k {
         out.push((i * n / k) as u32);
     }
     out
-}
-
-/// Neighbours of a node in the unrooted sense: its children and its parent.
-///
-/// The arena is rooted for bookkeeping but the likelihood is not, so the search
-/// has to be able to walk upwards. Forgetting the parent here would confine the
-/// search to the subtree below its start point, which is the single easiest way
-/// to get this module quietly wrong.
-///
-/// ### Params
-///
-/// * `tree` - Tree being searched
-/// * `node` - Node whose neighbours are wanted
-///
-/// ### Returns
-///
-/// An iterator over the neighbours, children first in arena order and the
-/// parent last. Allocation-free, and the fixed order is what makes the search
-/// deterministic.
-fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
-    tree.children(node).iter().copied().chain(tree.parent(node))
 }
 
 /// Find the best node of a tree to attach `q` below.
@@ -235,42 +221,19 @@ fn neighbours(tree: &Tree, node: u32) -> impl Iterator<Item = u32> + '_ {
 /// recurse into those whose score is within `tolerance` of the best score seen
 /// anywhere so far. The best node over all start points wins.
 ///
-/// The comparison is against the best seen *before* the neighbour itself is
-/// folded in, so a tolerance of zero means "recurse only into a neighbour that
-/// strictly improves on everything seen so far", which is hill-climbing.
-/// A tolerance of `f64::INFINITY` admits every neighbour and therefore visits
-/// the whole tree, which is an exhaustive scan.
+/// The comparison is against the best seen before the neighbour is folded in,
+/// so a tolerance of zero is hill-climbing and `f64::INFINITY` is exhaustive.
 ///
-/// Nodes are scored at most once across the whole call: one visited set is
-/// shared by every start point, so the total cost is bounded by `n_nodes` root
-/// finds however many starts are requested. The search is sequential and
-/// depth-first with a fixed neighbour order, so the answer does not depend on
-/// the thread count.
+/// Each node is scored at most once (one visited set across all starts). The
+/// search is sequential and depth-first with a fixed neighbour order, so the
+/// answer does not depend on the thread count.
 ///
-/// ### The effective-leaf seam
-///
-/// `eff` maps a node index to the effective leaf summarising **the entire
-/// existing tree collapsed onto that node**: the pruning recursion of SPEC.md
-/// section 4 run with that node as the root, which for a leaf includes the
-/// leaf's own observation. That is a two-sided quantity, one upward and one
-/// downward sweep over the arena, so it is passed in rather than built here. It
-/// must be defined for every index in `0..tree.n_nodes()` and every leaf it
-/// returns must have `q`'s feature count.
-///
-/// **Do not reach for [`crate::model::global::UpState`]'s rows directly.** They
-/// are everything outside a node's subtree, positioned at the node's *parent*
-/// and not diffused along the branch above it, so a caller who passes them
-/// straight in is wrong on two counts. The composition that is right is
-/// `model::global::collapse_onto_every_node`; `search::spr` forms the same
-/// rows one node at a time rather than all at once, because a proposal reads a
-/// few dozen of them.
-///
-/// A plain closure is used rather than a trait because the provider is free to
-/// store the sweep in whatever layout suits it, needs no wrapper type, and the
-/// borrow it hands back is checked at the call site. The one thing the closure
-/// signature does impose is that the effective leaves are materialised
-/// somewhere the closure can borrow from, rather than computed into a local
-/// buffer on each call.
+/// `eff` maps a node index to the effective leaf of the entire existing tree
+/// collapsed onto that node (SPEC.md section 4 with that node as root). It must
+/// be defined for every index in `0..tree.n_nodes()` and return leaves with
+/// `q`'s feature count. Do not pass [`crate::model::global::UpState`] rows
+/// directly: they sit at the node's parent and are not diffused along the branch
+/// above. Use `model::global::collapse_onto_every_node`.
 ///
 /// ### Params
 ///
@@ -293,37 +256,6 @@ where
     F: Fn(u32) -> EffLeaf<'a, T>,
 {
     place_walk(tree, q, eff, params)
-}
-
-/// What the beam search needs from the tree it walks.
-///
-/// A [`Tree`] is one. The other is a tree that exists only as a view, the one
-/// an SPR cut would leave behind, walked in the original tree's node ids
-/// without being built; see [`crate::search::masked`]. Both have to present
-/// the same start points and the same neighbour order, since the search's
-/// answer depends on both.
-pub(crate) trait Walk {
-    /// Size of the node id space, for the visited set.
-    fn id_space(&self) -> usize;
-    /// The spread start points, root first; [`start_points`] for a tree.
-    fn spread_starts(&self, n_starts: usize) -> Vec<u32>;
-    /// A node's children in arena order, then its parent.
-    fn neighbours(&self, node: u32, out: &mut Vec<u32>);
-}
-
-impl Walk for Tree {
-    fn id_space(&self) -> usize {
-        self.n_nodes()
-    }
-
-    fn spread_starts(&self, n_starts: usize) -> Vec<u32> {
-        start_points(self, n_starts)
-    }
-
-    fn neighbours(&self, node: u32, out: &mut Vec<u32>) {
-        out.clear();
-        out.extend(neighbours(self, node));
-    }
 }
 
 /// [`place`] over anything the search can walk.
@@ -356,8 +288,7 @@ where
     let mut stack: Vec<u32> = Vec::new();
     let mut around: Vec<u32> = Vec::new();
     let spread = walk.spread_starts(params.n_starts);
-    // The root is always the first start point and is therefore always scored,
-    // so this placeholder is always overwritten before it is returned.
+    // The root is the first start and always scored, so this is overwritten.
     let mut best = Placement {
         node: spread[0],
         branch: 0.0,
@@ -389,8 +320,7 @@ where
                 let at = attachment_score(eff(nb), q, &mut s, &mut d)?;
                 best.scored += 1;
 
-                // Threshold against the incumbent before the neighbour joins
-                // it, otherwise a zero tolerance could never admit anything.
+                // Threshold against the incumbent before the neighbour joins it.
                 let admit = at.loglik > best.loglik - params.tolerance;
                 if at.loglik > best.loglik {
                     best.node = nb;
@@ -437,10 +367,9 @@ mod tests {
     impl Fixture {
         /// Simulate leaf data on a tree and collapse it onto every node.
         ///
-        /// Positions random-walk down the tree with the tree's own branch
-        /// lengths, in the transformed units of SPEC.md section 3.1 where the
-        /// diffusion has unit variance per feature, then leaves pick up
-        /// measurement noise of standard deviation `sigma`.
+        /// Positions random-walk down the tree in the units of SPEC.md section
+        /// 3.1, then leaves pick up measurement noise of standard deviation
+        /// `sigma`.
         ///
         /// ### Params
         ///
@@ -532,9 +461,7 @@ mod tests {
 
         /// Score every node of the tree by brute force.
         ///
-        /// The independent reference the beam search is pinned against: no
-        /// traversal, no tolerance, no visited set, just every node in index
-        /// order.
+        /// The independent reference the beam search is pinned against.
         ///
         /// ### Params
         ///
@@ -580,11 +507,8 @@ mod tests {
     /// Collapse the component of the tree containing `x`, with the edge to
     /// `from` cut, onto `x`.
     ///
-    /// The two-sided sweep written the slow, obvious, recursive way: `O(n)` per
-    /// node rather than `O(1)` amortised. The independent reference the
-    /// effective leaves in the fixture come from, so these tests share no code
-    /// with [`crate::model::global::collapse_onto_every_node`], which is what a
-    /// production caller passes in.
+    /// Slow recursive reference, sharing no code with
+    /// [`crate::model::global::collapse_onto_every_node`].
     ///
     /// ### Params
     ///
@@ -637,9 +561,7 @@ mod tests {
 
     /// A balanced binary tree of eight leaves with one very tight cherry.
     ///
-    /// Leaves 0 and 1 sit on branches short enough that they are near
-    /// duplicates of each other and far from everything else, which makes the
-    /// answer to "where does leaf 0 belong" unambiguous.
+    /// Leaves 0 and 1 are near duplicates far from everything else.
     ///
     /// ### Returns
     ///
@@ -703,9 +625,6 @@ mod tests {
 
     #[test]
     fn test_greedy_multi_start_is_not_worse_than_a_single_root_start() {
-        // Greedy from the root alone stops at the first node that beats
-        // everything before it, so on a deep tree it can be trapped a long way
-        // from the optimum. The extra starts are what get it out.
         let fix = Fixture::new(Tree::ladder(24, 0.5).expect("ladder"), 48, 0.3, 31337);
         let mut improved = 0usize;
         for leaf in 0..fix.tree.n_leaves() as u32 {
@@ -745,9 +664,8 @@ mod tests {
 
     #[test]
     fn test_a_detached_leaf_is_placed_back_next_to_its_sibling() {
-        // Balanced tree of eight, leaves 0 and 1 a tight cherry. Detach leaf 0
-        // and suppress the degree-two node it leaves behind, then ask where it
-        // belongs. The answer has to be its old sibling.
+        // Detach leaf 0, suppress the degree-two node it leaves, and ask where
+        // it belongs: its old sibling.
         let full = Fixture::new(tight_cherry(), 64, 0.05, 4242);
 
         // Old indices: leaves 0..7, cherries 8..11, then 12, 13, root 14.
@@ -859,9 +777,7 @@ mod tests {
             0.4,
             2718,
         );
-        // The node being attached is an exact copy of leaf 3's measurement, so
-        // its squared separation from leaf 3 is identically zero and the edge
-        // wants no length at all.
+        // An exact copy of leaf 3, so the edge wants no length.
         let q = fix.leaf(3);
         let got = place(&fix.tree, q, |a| fix.eff(a), None).expect("placement");
         assert_eq!(got.node, 3);
@@ -886,16 +802,14 @@ mod tests {
         .expect("placement");
         assert_eq!(exhaustive.scored, 3);
         assert_eq!(exhaustive.node, fix.best(q).0);
-        // A tree this small has no room for the beam to matter, so the default
-        // parameters must land in the same place.
         let default = place(&fix.tree, q, |a| fix.eff(a), None).expect("placement");
         assert_eq!(default.node, exhaustive.node);
     }
 
     #[test]
     fn test_star_tree_is_searched_through_its_root() {
-        // Every leaf of a star is reachable only through the root, so this is
-        // the case that fails if the search does not walk upwards.
+        // Leaves are reachable only through the root: fails if the walk never
+        // goes upwards.
         let parent = vec![6, 6, 6, 6, 6, 6, NO_NODE];
         let tree = Tree::from_parents(parent, vec![1.0; 7], 6).expect("star");
         let fix = Fixture::new(tree, 32, 0.3, 606);
@@ -948,8 +862,7 @@ mod tests {
 
     #[test]
     fn test_placement_is_the_same_whatever_the_start_count() {
-        // With a tolerance wide enough to cover the tree, the start points are
-        // bookkeeping and must not change the answer.
+        // Exhaustive tolerance: start points must not change the answer.
         let fix = Fixture::new(
             Tree::balanced_binary(16, 1.0).expect("balanced tree"),
             32,

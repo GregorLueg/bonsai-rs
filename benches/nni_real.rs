@@ -1,12 +1,7 @@
-//! What step 6 does on a tree step 5 leaves behind, and what the knobs around
-//! it buy in loglikelihood and Robinson-Foulds rather than in seconds.
-//!
-//! Written for the first comparison on realistic data, where step 6 turned out
-//! to gain far less than the equivalent stage of the published implementation;
-//! `docs/COMPARISON.md` has the numbers. Steps 1 to
-//! 5 are run once per fixture and the trees after steps 4 and 5 are cached as
-//! Newick in the scratch directory, so every variant below starts from the
-//! identical step 5 tree and only the part under test is rerun.
+//! What step 6 does on a tree step 5 leaves behind, and what its knobs buy in
+//! loglikelihood and Robinson-Foulds. Steps 1 to 5 run once per fixture and the
+//! step 4 and 5 trees are cached as Newick, so every variant starts from the
+//! same step 5 tree.
 //!
 //! ```sh
 //! cargo bench --bench nni_real -- real <dir> <variant> [args]
@@ -23,7 +18,7 @@
 //! * `alternate [cycles]` - steps 5 and 6 repeated until neither moves
 //!
 //! Every variant reports the loglikelihood after step 7 and the RF to the
-//! generating tree, which are the gate.
+//! generating tree.
 
 use bonsai_rs::model::global::optimise_branch_lengths;
 use bonsai_rs::model::likelihood::NodeState;
@@ -200,9 +195,8 @@ fn optimise(tree: &mut Tree, leaves: Leaves<'_, f64>, params: &BonsaiParams) -> 
     optimise_branch_lengths(tree, &mut state, Some(params.branch)).expect("branch")
 }
 
-/// Relabel internal nodes into a post-order so that every parent index
-/// exceeds its children's, which is what the arena requires and what a hand
-/// swap breaks.
+/// Relabel internal nodes into a post-order so every parent index exceeds its
+/// children's, as the arena requires.
 fn renumber(parent: &[u32], branch: &[f64], n_leaves: usize) -> (Vec<u32>, Vec<f64>) {
     let n = parent.len();
     let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -365,8 +359,7 @@ fn finish(label: &str, mut tree: Tree, fx: &Fixture, params: &BonsaiParams, secs
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    // The linkage start is the baseline; the greedy merge is
-    // kept reachable because it is still the crate's default.
+    // Linkage is the baseline start; `START=greedy` selects the crate default.
     let mut params = BonsaiParams {
         start: match env::var("START").as_deref() {
             Ok("greedy") => StartTree::GreedyMerge,
@@ -456,9 +449,7 @@ fn main() {
             finish(&label, out.tree, &fx, &params, secs);
         }
         "alternate" => {
-            // Steps 5 and 6 to a joint fixed point, with step 4 between them
-            // when asked, starting from the cached step 5 tree so the first
-            // step 6 is the shipped one.
+            // Steps 5 and 6 to a joint fixed point, optionally with step 4 between.
             let cycles: usize = rest
                 .get(1)
                 .map(|s| s.parse().expect("cycles"))
@@ -509,9 +500,7 @@ fn main() {
             );
         }
         "perturb" => {
-            // How much the random phase actually moves the tree: RF between
-            // the step 5 tree and its perturbation, and what the climb gets
-            // back.
+            // RF between the step 5 tree and its perturbation, and what the climb recovers.
             params.nni.n_random = rest[1].parse().expect("n_random");
             params.nni.temperature = rest.get(2).map(|s| s.parse().expect("tau")).unwrap_or(1.0);
             params.nni.seed = rest.get(3).map(|s| s.parse().expect("seed")).unwrap_or(0);
@@ -551,9 +540,7 @@ fn main() {
             );
         }
         "foreign" => {
-            // A tree from elsewhere, with `cell<i>`
-            // labels: its loglikelihood as it stands, after our step 7, and
-            // whether our steps 5 and 6 find anything left in it.
+            // External tree with `cell<i>` labels: loglik as given, after step 7, then our NNI and SPR.
             let cell_labels: Vec<String> = (0..fx.n).map(|i| format!("cell{i}")).collect();
             let mut tree = load_tree(Path::new(&rest[1]), &cell_labels);
             println!(
@@ -581,10 +568,7 @@ fn main() {
             finish("foreign", out.tree, &fx, &params, 0.0);
         }
         "neighbours" => {
-            // Is the step 7 tree a local optimum of the interchange
-            // neighbourhood when every branch length is re-optimised, rather
-            // than only the three the star primitive creates? Every binary
-            // interchange, spliced by hand and handed to step 4.
+            // Every binary interchange, hand-spliced and fully re-optimised, against the step 7 tree.
             let mut tree = t5.clone();
             let out = nni(&tree, leaves, Some(params.nni), Verbosity::Quiet).expect("nni");
             tree = out.tree;
@@ -637,7 +621,7 @@ fn main() {
             }
         }
         "spr-from-4" => {
-            // Sanity check of the cache: step 5 again from the step 4 tree.
+            // Cache sanity check: step 5 again from the step 4 tree.
             let out = spr(&t4, leaves, Some(params.spr), Verbosity::Quiet).expect("spr");
             println!(
                 "spr from step 4: loglik {:.3} rf {} moves {}",

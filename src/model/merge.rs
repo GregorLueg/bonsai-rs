@@ -1,15 +1,9 @@
-//! The merge score: what does inserting an ancestor above two children of a
-//! star gain?
+//! The merge score: the loglikelihood gained by inserting an ancestor above two
+//! children of a star.
 //!
-//! This is the quantity the whole tree search is  a search over, so it is worth
-//! being precise about its shape. Both the tree before the merge and the tree
-//! after it are three-leaf stars over the same three effective leaves: the two
-//! children `k` and `l`, and `R`, which is every other child of the root
-//! collapsed into one. The score is the difference of the two stars'
-//! loglikelihoods.
-//!
-//! Because `R` is obtained by peeling `k` and `l` off the root's own effective
-//! leaf, scoring one pair costs `O(p)` rather than `O(n * p)`.
+//! Before and after are three-leaf stars over the children `k` and `l` and `R`,
+//! every other child of the root collapsed into one, so scoring a pair is
+//! `O(p)`.
 
 use crate::errors::BonsaiErrors;
 use crate::model::branch::optimise_edge;
@@ -21,15 +15,13 @@ use crate::utils::traits::{BonsaiFloat, wide};
 
 /// Tuning knobs for the merge-score branch-length solve.
 ///
-/// All three trade accuracy of the *branch lengths* against the cost of the
-/// merge scan, which is the dominant cost of the whole search. None of them
-/// change the model.
+/// All three trade branch-length accuracy against merge-scan cost; none change
+/// the model.
 #[derive(Clone, Copy, Debug)]
 pub struct MergeParams {
     /// Coordinate sweeps in the constrained stage (SPEC.md section 8.4).
     ///
-    /// Each sweep is monotone in the gain, so this is a stopping rule rather
-    /// than a correctness bound.
+    /// Each sweep is monotone in the gain, so this is a stopping rule only.
     pub coord_sweeps: usize,
     /// Relative convergence tolerance on the split of the total branch length.
     pub split_tol: f64,
@@ -38,30 +30,13 @@ pub struct MergeParams {
 }
 
 impl Default for MergeParams {
-    /// Ours, chosen by measurement; `docs/PERFORMANCE.md` has the sweep.
+    /// Ours, chosen by measurement (`docs/PERFORMANCE.md`).
     ///
-    /// Two coordinate sweeps. Stage two is the dominant cost of a merge scan,
-    /// so this is the most expensive constant in the crate, and it is not
-    /// optional either: stage two roughly triples the gain over the unrefined
-    /// split, which is what `test_two_coordinate_sweeps_reach_the_fixed_point`
-    /// pins.
-    ///
-    /// **Two sweeps are not the exact fixed point.** The coordinate descent
-    /// converges slowly on a small corner of the space, where the split and the
-    /// root branch are strongly coupled; everywhere else two sweeps and twenty
-    /// agree to the bit. The shortfall is in a *candidate's* score rather than
-    /// in the tree, and running the whole pipeline at two sweeps against eight
-    /// gives identical trees, so the default stands. A merge scan losing close
-    /// calls on a coupled fixture is still where to look first.
-    ///
-    /// `split_tol` is looser than the branch-length tolerance in
-    /// `model::branch` on purpose: the gain is stationary in the split at the
-    /// optimum, so an error of `eps` in the split costs `O(eps^2)` in the
-    /// score. It is tighter than it needs to be for that alone because the
-    /// secant solve lands where its iterates take it rather than on a fixed
-    /// grid of midpoints, so two solves on inputs differing in the last place
-    /// can return splits `eps` apart, and that showed up as drift between the
-    /// exact and incremental centre in `search::bounds`.
+    /// Two sweeps are not the exact fixed point in the strongly coupled corner of
+    /// split and root branch, but the pipeline at two sweeps gives the same trees
+    /// as at eight. `split_tol` is looser than `model::branch` because the gain is
+    /// stationary in the split (`O(eps^2)` cost), and tight enough that the secant
+    /// solve does not drift `search::bounds`' exact and incremental centres.
     fn default() -> Self {
         Self {
             coord_sweeps: 2,
@@ -82,10 +57,9 @@ pub struct EffLeaf<'a, T> {
 
 /// Per-feature constants of one candidate pair.
 ///
-/// Everything here is independent of the three branch lengths being optimised,
-/// so it is computed once and reused across every step of the solve. Reused
-/// across candidate pairs too, via [`MergeScratch::prepare`], so a parallel scan
-/// allocates once per thread rather than once per pair.
+/// Independent of the three branch lengths being optimised, so computed once per
+/// pair and reused across the solve. Reused across pairs via
+/// [`MergeScratch::prepare`].
 #[derive(Clone, Debug)]
 pub struct MergeScratch {
     /// Inverse effective precision of `k`, `l` and `R`.
@@ -119,50 +93,6 @@ pub struct MergeScore {
     pub t_ar: f64,
 }
 
-/// One feature's contribution to a three-leaf star's loglikelihood.
-///
-/// SPEC.md section 8.3, using the three-point identity (S33) so the star's own
-/// centre never has to be formed:
-///
-/// ```text
-/// star3 = log(a1 * a2 * a3) - log(a1 + a2 + a3)
-///         - (a1*a2*d12 + a1*a3*d13 + a2*a3*d23) / (a1 + a2 + a3)
-/// ```
-///
-/// One logarithm, not four: the product is well scaled because each factor is a
-/// diffusion-corrected precision bounded above by the reciprocal of its branch
-/// length.
-///
-/// ### Params
-///
-/// * `a1`, `a2`, `a3` - Diffusion-corrected precisions of the three leaves
-/// * `d12`, `d13`, `d23` - Squared separations between them
-///
-/// ### Returns
-///
-/// The feature's contribution, twice the loglikelihood term.
-#[inline(always)]
-fn star3(a1: f64, a2: f64, a3: f64, d12: f64, d13: f64, d23: f64) -> f64 {
-    let s = a1 + a2 + a3;
-    let q = a1 * a2 * d12 + a1 * a3 * d13 + a2 * a3 * d23;
-    (a1 * a2 * a3).ln() - s.ln() - q / s
-}
-
-/// Precision of a leaf seen across a branch of length `t`.
-///
-/// ### Params
-///
-/// * `c` - The leaf's inverse effective precision
-/// * `t` - Branch length
-///
-/// ### Returns
-///
-/// `1 / (t + c)`.
-#[inline(always)]
-fn across(c: f64, t: f64) -> f64 {
-    1.0 / (t + c)
-}
-
 impl MergeScratch {
     /// Allocate scratch for a given feature count.
     ///
@@ -190,10 +120,8 @@ impl MergeScratch {
 
     /// Load one candidate pair, computing everything that does not move.
     ///
-    /// One pass over the features. `t_rk` and `t_rl` are the branch lengths the
-    /// two children currently have to the root, which fix the "before" star;
-    /// `R` attaches to the root directly, so its own contribution needs no
-    /// diffusion correction.
+    /// `t_rk` and `t_rl` fix the "before" star; `R` attaches to the root
+    /// directly, so it needs no diffusion correction.
     ///
     /// ### Params
     ///
@@ -248,19 +176,10 @@ impl MergeScratch {
 
     /// The score and its gradient at a given set of branch lengths.
     ///
-    /// The gradient is taken with respect to `u`, the share of the total
-    /// `k`-to-`l` length assigned to `t_ak`, and to `t_ar`. With
-    /// `a = 1 / (t + c)` the chain rule needs only `da/dt = -a^2`, so both
-    /// partials fall out of the same pass that evaluates the score.
-    ///
-    /// Neither partial has a production consumer: the split is solved by
-    /// [`MergeScratch::split_derivative`] and `t_ar` by the edge solve, so
-    /// [`score_merge`] and [`gain_at`] both call this for the gain alone.
-    /// [`crate::search::bounds`] differentiates the score too but does it with
-    /// respect to the centre, through its own chain rule. These are kept
-    /// because they are what pins the two gradient copies against central
-    /// differences, and they are nearly free: this runs once per candidate
-    /// pair, against the tens of `split_derivative` calls the bisection makes.
+    /// The gradient is with respect to `u`, the share of the total `k`-to-`l`
+    /// length assigned to `t_ak`, and to `t_ar`. Only the gain has a production
+    /// consumer; the partials pin [`MergeScratch::split_derivative`] against
+    /// central differences in tests.
     ///
     /// ### Params
     ///
@@ -287,8 +206,6 @@ impl MergeScratch {
             let s = a1 + a2 + a3;
             let q = a1 * a2 * d12 + a1 * a3 * d13 + a2 * a3 * d23;
             let inv_s = 1.0 / s;
-            // log(a1*a2*a3) = -log(r1*r2*r3), one logarithm either way but
-            // without forming three reciprocals to feed it.
             after += -(r1 * r2 * r3).ln() - s.ln() - q * inv_s;
 
             let q_over_s2 = q * inv_s * inv_s;
@@ -307,10 +224,8 @@ impl MergeScratch {
 
     /// Optimise `t_ar` with the two child branches held fixed.
     ///
-    /// With `t_ak` and `t_al` fixed, the pair collapses into a single effective
-    /// leaf at the ancestor and the remaining problem is an ordinary edge
-    /// between that leaf and `R`, so the branch-length root find of SPEC.md
-    /// section 6 applies unchanged.
+    /// The pair collapses into one effective leaf at the ancestor, leaving an
+    /// ordinary edge to `R` (SPEC.md section 6).
     ///
     /// ### Params
     ///
@@ -352,11 +267,8 @@ impl MergeScratch {
 
     /// Derivative of the gain with respect to the split, and nothing else.
     ///
-    /// The same arithmetic as [`MergeScratch::gain_and_gradient`] with the two
-    /// logarithms removed, because the bracketed solve below only ever looks at
-    /// this derivative's sign. The logarithms are the single most expensive
-    /// operation in these kernels, so paying for a score nobody reads dominated
-    /// the whole merge scan before this existed.
+    /// The same arithmetic as [`MergeScratch::gain_and_gradient`] without the
+    /// logarithms, as the split solve only needs the sign.
     ///
     /// ### Params
     ///
@@ -370,9 +282,6 @@ impl MergeScratch {
     fn split_derivative(&self, total: f64, u: f64, t_ar: f64) -> f64 {
         let mut acc = 0.0f64;
         for g in 0..self.c_k.len() {
-            // `1/a` is the branch length plus the leaf's own inverse precision,
-            // which is what `a` was built from, so it is a subtraction saved
-            // rather than a reciprocal paid.
             let r1 = u + self.c_k[g];
             let r2 = (total - u) + self.c_l[g];
             let r3 = t_ar + self.c_r[g];
@@ -393,14 +302,8 @@ impl MergeScratch {
     /// Optimise how the total `k`-to-`l` length divides between the two child
     /// branches, with `t_ar` held fixed.
     ///
-    /// Bracketed on `(0, total)` and solved on the analytic derivative by
-    /// regula falsi with the Illinois modification, which is a secant step
-    /// that never leaves the bracket and halves a stale end's weight so the
-    /// bracket cannot stall on one side. No second derivative is available, so
-    /// Newton is out. Bisection reaches the shipped tolerance too, and is what
-    /// this replaced, but it takes tens of derivative passes per sweep where
-    /// the secant takes a handful, and that is most of the cost of resolving
-    /// the four-member star search step 5 leaves after every regraft.
+    /// Regula falsi with the Illinois modification, bracketed on `(0, total)`
+    /// and solved on the analytic derivative.
     ///
     /// ### Params
     ///
@@ -423,9 +326,8 @@ impl MergeScratch {
             return total;
         }
         let (mut lo, mut hi) = (0.0f64, total);
-        // Which end the last step moved: `1` for `lo`, `-1` for `hi`, `0` for
-        // neither yet. Two moves of the same end in a row is the stall the
-        // Illinois halving breaks.
+        // Last end moved: 1 for `lo`, -1 for `hi`, 0 for none. Two in a row
+        // triggers the Illinois halving.
         let mut moved = 0i8;
 
         for _ in 0..params.max_split_iter {
@@ -462,18 +364,62 @@ impl MergeScratch {
     }
 }
 
+/////////////////////
+// Private helpers //
+/////////////////////
+
+/// One feature's contribution to a three-leaf star's loglikelihood.
+///
+/// SPEC.md section 8.3, using the three-point identity (S33) so the star's own
+/// centre never has to be formed:
+///
+/// ```text
+/// star3 = log(a1 * a2 * a3) - log(a1 + a2 + a3)
+///         - (a1*a2*d12 + a1*a3*d13 + a2*a3*d23) / (a1 + a2 + a3)
+/// ```
+///
+/// One logarithm, as the product is well scaled.
+///
+/// ### Params
+///
+/// * `a1`, `a2`, `a3` - Diffusion-corrected precisions of the three leaves
+/// * `d12`, `d13`, `d23` - Squared separations between them
+///
+/// ### Returns
+///
+/// The feature's contribution, twice the loglikelihood term.
+#[inline(always)]
+fn star3(a1: f64, a2: f64, a3: f64, d12: f64, d13: f64, d23: f64) -> f64 {
+    let s = a1 + a2 + a3;
+    let q = a1 * a2 * d12 + a1 * a3 * d13 + a2 * a3 * d23;
+    (a1 * a2 * a3).ln() - s.ln() - q / s
+}
+
+/// Precision of a leaf seen across a branch of length `t`.
+///
+/// ### Params
+///
+/// * `c` - The leaf's inverse effective precision
+/// * `t` - Branch length
+///
+/// ### Returns
+///
+/// `1 / (t + c)`.
+#[inline(always)]
+fn across(c: f64, t: f64) -> f64 {
+    1.0 / (t + c)
+}
+
+////////////////////
+// Public functions //
+////////////////////
+
 /// Score a candidate merge, optimising the three new branch lengths.
 ///
 /// The two-stage scheme of SPEC.md section 8.4. Stage one fixes the total
-/// `k`-to-`l` length by solving the two-leaf problem with the ancestor detached
-/// from the root, which is the distance the merge is really asserting and the
-/// one quantity the rest of the search will not revisit. Stage two divides that
-/// total and picks the branch to the root, holding the total fixed.
-///
-/// Stage two runs as coordinate descent over the two remaining freedoms rather
-/// than as a two-dimensional Newton. Each half is a bracketed one-dimensional
-/// solve, each step is monotone in the score, and the whole thing reuses the
-/// branch-length machinery instead of needing a Hessian.
+/// `k`-to-`l` length from the two-leaf problem with the ancestor detached.
+/// Stage two divides that total and picks the root branch by coordinate descent
+/// over bracketed one-dimensional solves.
 ///
 /// ### Params
 ///
@@ -526,10 +472,8 @@ pub fn score_merge<T: BonsaiFloat>(
 
 /// The gain of a merge at explicitly given branch lengths, without optimising.
 ///
-/// The score as a function of where the ancestor sits rather than at its
-/// optimum, which is what a central difference against
-/// [`MergeScratch::gain_and_gradient`] needs. Test-only: this module's
-/// gradient tests and `search::bounds`'s use it for exactly that.
+/// Test-only: the score away from its optimum, for central differences against
+/// [`MergeScratch::gain_and_gradient`].
 ///
 /// ### Params
 ///
@@ -557,11 +501,8 @@ mod tests {
     use approx::assert_relative_eq;
 
     /// Three effective leaves with `k` and `l` nearer to each other than either
-    /// is to `R`.
-    ///
-    /// `pair_sep` has to exceed the pair's combined error bars, or the optimal
-    /// branch between them is zero and the branch-length tests are probing a
-    /// degenerate case rather than the solve.
+    /// is to `R`. `pair_sep` must exceed the pair's combined error bars, or the
+    /// optimal branch is zero.
     #[allow(clippy::type_complexity)]
     fn three_leaves(
         p: usize,
@@ -574,11 +515,7 @@ mod tests {
             .enumerate()
             .map(|(g, x)| x + pair_sep * (1.0 + 0.3 * (g as f64 * 0.13).cos()))
             .collect();
-        // Place R away from the k-l midpoint, alternating side by feature, so
-        // that neither child is systematically nearer to it. A one-sided R
-        // pushes the new ancestor onto whichever child it favours, which pins
-        // the split at a bracket end and makes the branch-length tests probe a
-        // corner instead of an interior optimum.
+        // Alternate R's side by feature, so the split stays interior.
         let m_r: Vec<f64> = (0..p)
             .map(|g| {
                 let mid = 0.5 * (m_k[g] + m_l[g]);
@@ -626,10 +563,7 @@ mod tests {
         assert_relative_eq!(d_du, fd_u, max_relative = 1e-6);
         assert_relative_eq!(d_dtar, fd_tar, max_relative = 1e-6);
 
-        // `split_derivative` is the copy the bracketed solve actually runs, and
-        // it is the one the central differences above do not touch. It is
-        // documented as the same arithmetic with the logarithms dropped, so it
-        // must agree to the bit, not merely to a tolerance.
+        // `split_derivative` must agree to the bit, not to a tolerance.
         for &(u, t_ar) in [
             (0.3 * total, 0.7),
             (0.05 * total, 0.01),
@@ -708,15 +642,8 @@ mod tests {
 
     #[test]
     fn test_gain_equals_the_difference_of_two_pruned_tree_loglikelihoods() {
-        // The test that matters in this module. `score_merge` computes the gain
-        // in closed form from three effective leaves; the pruning recursion in
-        // `model::likelihood` computes whole-tree loglikelihoods knowing nothing
-        // about any of that. Building both trees explicitly and differencing
-        // them must reproduce the gain exactly.
-        //
-        // Four leaves on a star at the root: k, l and two others that make up
-        // R. The merged tree hangs k and l off a new ancestor a, which attaches
-        // to the root.
+        // Four leaves on a star: k, l and two others that make up R. The merged
+        // tree hangs k and l off a new ancestor a, which attaches to the root.
         use crate::model::likelihood::NodeState;
         use crate::tree::{NO_NODE, Tree};
 
@@ -733,9 +660,7 @@ mod tests {
 
         let (t_rk, t_rl, t_m, t_n) = (0.8, 0.9, 1.3, 0.6);
 
-        // Peel the rest of the star into one effective leaf, SPEC.md 8.1. Here
-        // it is built directly rather than by subtraction, since there are only
-        // two nodes in it.
+        // Peel the rest of the star into one effective leaf, SPEC.md 8.1.
         let mut m_r = vec![0.0f64; p];
         let mut w_r = vec![0.0f64; p];
         for g in 0..p {
@@ -791,13 +716,7 @@ mod tests {
 
     #[test]
     fn test_two_coordinate_sweeps_reach_the_fixed_point() {
-        // Pins the default in `MergeParams`. Stage two is two thirds of the
-        // cost of a merge scan, so the sweep count is the most expensive
-        // constant in the crate and it should not sit on an assumption.
-        //
-        // Ten sweeps stands in for the converged answer. If a later change
-        // makes the coupling between the split and the root branch stronger,
-        // this test is what notices.
+        // Pins the `MergeParams` default; ten sweeps stands in for converged.
         let (m_k, w_k, m_l, w_l, m_r, w_r) = three_leaves(256, 2.5, 6.0);
         let k = EffLeaf { m: &m_k, w: &w_k };
         let l = EffLeaf { m: &m_l, w: &w_l };
@@ -840,16 +759,9 @@ mod tests {
 
     #[test]
     fn test_a_boundary_optimal_split_lands_exactly_on_the_boundary() {
-        // The split solve used to bracket on
-        // `(1e-12 * total, total - 1e-12 * total)` and so could never return
-        // an end, which turned a zero-length branch into a `1e-12 * total` one
-        // and hid the polytomy SPEC.md section 9.2 goes looking for.
-        //
-        // `R` sits on top of one of the pair and carries most of the precision,
-        // which drags the new ancestor onto that member: the optimal split is
-        // then the whole of `total` on the far child and nothing on the near
-        // one. Both sides are checked, because they are the two separate
-        // returns in `optimise_split`.
+        // `R` sits on one of the pair and carries most of the precision, so the
+        // optimal split is all of `total` on the far child. Both sides are the
+        // two early returns in `optimise_split`.
         let p = 32usize;
         for near_k in [true, false] {
             let m_k: Vec<f64> = (0..p).map(|g| (g as f64 * 0.29).sin()).collect();
@@ -883,8 +795,6 @@ mod tests {
             );
             assert_eq!(whole, total, "the two branches no longer sum to the total");
 
-            // The snap is not cosmetic: the end of the bracket really is the
-            // better split, so the old interior answer also cost gain.
             let inside = gain_at(total, 1e-12 * total, score.t_ar, &scratch);
             let inside = if near_k {
                 inside

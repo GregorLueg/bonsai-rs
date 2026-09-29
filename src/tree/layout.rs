@@ -1,33 +1,20 @@
-//! Two-dimensional layouts for a [`Tree`].
+//! Two-dimensional layouts for a [`Tree`] (SPEC.md section 14).
 //!
-//! Topology and branch lengths in, coordinates out. Nothing here touches the
-//! likelihood machinery or any per-node data, so the tree a search returns can
-//! be handed straight to a plotting layer.
+//! Topology and branch lengths in, coordinates out, as two parallel `Vec<f64>`
+//! indexed by node.
 //!
-//! Three layouts and one post-processing step (SPEC.md section 14):
-//!
-//! * [`dendrogram`], the conventional ladderised rectangular tree,
+//! * [`dendrogram`], the ladderised rectangular tree,
 //! * [`equal_angle`], Felsenstein's linear-time circular layout,
 //! * [`equal_daylight`], his iterative refinement of it,
 //! * [`Layout::hyperbolic`], the disk projection, which applies to any of them.
 //!
-//! [`has_edge_crossing`] checks a layout for crossings exactly. It is what
-//! [`equal_daylight`] leans on, and it is worth reaching for whenever a
-//! drawing looks wrong.
+//! The root is a bookkeeping choice (SPEC.md section 2, S14), so rerooting
+//! changes every layout. The distance between two nodes is the summed branch
+//! length along the tree path, never the Euclidean distance between their
+//! coordinates.
 //!
-//! Coordinates come back as two parallel `Vec<f64>` indexed by node, which is
-//! what an R or Python wrapper wants: no per-node struct to unpack.
-//!
-//! Two things are worth stating before anyone reads a picture off these. The
-//! root is a bookkeeping choice and not a feature of the tree (SPEC.md section
-//! 2, S14), so rerooting changes every layout here without changing anything
-//! about the tree. And the distance between two nodes is always the sum of the
-//! branch lengths along the tree path, never the Euclidean distance between
-//! their coordinates.
-//!
-//! Everything is written as flat scans or with an explicit stack. Bonsai trees
-//! can be deep and laddery ([`Tree::ladder`] exists to exercise exactly that),
-//! and a recursive layout would overflow the stack on a real dataset.
+//! Everything is a flat scan or uses an explicit stack: deep ladders would
+//! overflow the stack under recursion.
 
 use std::f64::consts::{PI, TAU};
 
@@ -40,83 +27,60 @@ use crate::tree::Tree;
 
 /// Node count above which [`equal_daylight`] declines to refine.
 ///
-/// The rotation sweep, the acceptance test and the crossing check all measure
-/// something about every node from every node, so one sweep is `O(n^2)` and no
-/// reordering fixes that. Ours, chosen by measurement: a gate at 2048 nodes is
-/// the last doubling that keeps a default `equal_daylight` call inside a few
-/// seconds on one core; anyone who wants the
-/// next one can raise `LayoutParams::daylight_max_nodes` and pay for it. Above
-/// the gate the equal-angle layout comes back unchanged.
+/// One sweep is `O(n^2)`. Ours, by measurement: 2048 nodes is the last doubling
+/// that keeps a default call inside a few seconds on one core. Above the gate
+/// the equal-angle layout comes back unchanged.
 const DAYLIGHT_MAX_NODES: usize = 2048;
 
 /// Hard cap on refinement sweeps in [`equal_daylight`].
 ///
-/// The sweep is a coordinate descent with no convergence proof, so a cap is
-/// what makes termination a fact rather than a hope, and since each sweep is
-/// `O(n^2)` the cap is also the run time. Ours, chosen by measurement across
-/// balanced, ladder, star and random trees: twelve sweeps take the daylight
-/// discrepancy to within two per cent of where forty sweeps leave it on every
-/// shape tried, and the remaining two per cent is not visible in a drawing.
+/// The descent has no convergence proof, so the cap bounds the run time. Ours,
+/// by measurement on balanced, ladder, star and random trees: twelve sweeps
+/// land within two per cent of forty.
 const DAYLIGHT_MAX_SWEEPS: usize = 12;
 
 /// Largest rotation, in radians, a sweep may apply and still count as
 /// converged.
 ///
-/// A ten-thousandth of a radian is six thousandths of a degree. On a drawing a
-/// thousand pixels across, that moves the outermost node by roughly a
-/// twentieth of a pixel, so a sweep that moves nothing by more than this has
-/// stopped changing the picture and there is no point running another.
+/// A ten-thousandth of a radian moves the outermost node of a 1000 pixel
+/// drawing by about a twentieth of a pixel.
 const DAYLIGHT_ANGLE_TOL: f64 = 1e-4;
 
 /// Number of times a sweep may halve its rotation looking for a step that both
 /// improves the daylight and keeps the drawing planar.
 ///
-/// Ten halvings take [`DAYLIGHT_DAMPING`] from a half down to about five parts
-/// in ten thousand. Ours, chosen by measurement: random trees with branch
-/// lengths spread over a factor of forty need to come down to about 0.005,
-/// which is seven halvings, before a sweep stops crossing; ten
-/// leaves three halvings of margin. Past that the step is too small to be
-/// worth another `O(n^2)` pass, and the run stops.
+/// Ours, by measurement: random trees with branch lengths spread over a factor
+/// of forty need about seven halvings from [`DAYLIGHT_DAMPING`] before a sweep
+/// stops crossing; ten leaves three of margin.
 const DAYLIGHT_MAX_BACKTRACKS: usize = 10;
 
 /// Largest fraction of the way towards equal daylight that one rotation may
 /// move.
 ///
-/// The starting point for the backtracking search inside [`equal_daylight`],
-/// which halves it until the sweep both improves the daylight and leaves the
-/// drawing planar. Half a step rather than a whole one because an undamped
-/// sweep on a large balanced tree
-/// overshoots into a crossing on its first move and then has to backtrack from
-/// there anyway; starting at a half saves that wasted pass and costs nothing,
-/// since the search doubles the step back up whenever it is accepted.
+/// Starting step of the backtracking search in [`equal_daylight`]. An undamped
+/// sweep on a large balanced tree overshoots into a crossing on its first move.
 const DAYLIGHT_DAMPING: f64 = 0.5;
 
 /// Vertical spacing between adjacent leaves in [`dendrogram`].
 ///
-/// Purely a display scale, since the vertical axis of a dendrogram carries no
-/// information. One unit per leaf keeps leaf rows at integer coordinates,
-/// which is the easiest thing for a plotting layer to label.
+/// Display scale only; the vertical axis carries no information.
 const DEFAULT_LEAF_SPACING: f64 = 1.0;
 
 /// Fraction of the layout's largest coordinate below which a point counts as
 /// coincident with the node it is being measured from.
 ///
-/// A point sitting on the node it is measured from has no direction, so it
-/// cannot contribute to an angular extent. The threshold is relative because
-/// branch lengths carry the units of the input, which are arbitrary.
+/// Relative, because branch lengths carry the arbitrary units of the input.
 const COINCIDENT_REL_EPS: f64 = 1e-12;
 
 /// Relative tolerance on the orientation determinant in [`has_edge_crossing`].
 ///
-/// The determinant is a product of two coordinate differences, so it scales as
-/// the square of the layout. Below this it is indistinguishable from zero and
-/// the three points are treated as collinear.
+/// The determinant scales as the product of the two segment lengths; below
+/// this the three points are treated as collinear.
 const ORIENT_REL_EPS: f64 = 1e-12;
 
 /// Tuning for the layouts and for the hyperbolic projection.
 ///
-/// Every layout function takes this as `Option<LayoutParams>` and resolves it
-/// with `unwrap_or_default()`, so the common case is `None`.
+/// Every layout function takes `Option<LayoutParams>`; `None` gives the defaults.
 #[derive(Clone, Copy, Debug)]
 pub struct LayoutParams {
     /// Vertical distance between adjacent leaves in [`dendrogram`].
@@ -142,10 +106,8 @@ pub struct LayoutParams {
 
 impl Default for LayoutParams {
     /// The shipped defaults: one unit per leaf, wedges starting along the
-    /// positive `x` axis, the measured daylight gate of
-    /// [`DAYLIGHT_MAX_NODES`], and a hyperbolic projection centred on the
-    /// layout origin at unit zoom, which is where [`equal_angle`] puts the
-    /// root.
+    /// positive `x` axis, and a hyperbolic projection centred on the origin at
+    /// unit zoom.
     ///
     /// ### Returns
     ///
@@ -190,34 +152,19 @@ impl Layout {
 
     /// Project onto the hyperbolic disk (SPEC.md section 14).
     ///
-    /// Translate by the origin, scale by the zoom, convert to polar, leave the
-    /// angle alone and map the radius
+    /// Translate by the origin, scale by the zoom, leave the angle alone and
+    /// map the radius
     ///
     /// ```text
     /// r -> r / (1 + sqrt(1 + r^2))
     /// ```
     ///
-    /// which sends `0` to `0` and infinity to `1`. The map is strictly
-    /// increasing in `r` (its derivative is `1 / (s * (1 + s))` with
-    /// `s = sqrt(1 + r^2)`), so radial order survives and nothing turns inside
-    /// out. This is a post-processing step rather than a fourth layout: apply
-    /// it to whichever of the three is being drawn.
+    /// which is strictly increasing, sends `0` to `0` and infinity to `1`. In
+    /// `f64`, past about `1e16` the result saturates at exactly `1` (radial
+    /// order stays non-decreasing); `hypot` avoids overflow of `r^2`.
     ///
-    /// ### In floating point
-    ///
-    /// Mathematically every finite radius lands strictly inside the disk. In
-    /// `f64` it does not: past about `1e16` the `1 +` is lost to rounding and
-    /// the result is exactly `1`, on the rim. That saturation is harmless and
-    /// unavoidable, and radial order is still non-decreasing through it. What
-    /// is *not* acceptable is order inversion, which is what an earlier form of
-    /// this computation did by squaring `r` before the square root: that
-    /// overflowed above `1.3e154`, collapsed the scale to zero and sent the
-    /// furthest points to the origin. Hence `hypot`.
-    ///
-    /// Unlike the layout functions this takes no `Result`, so it cannot reject
-    /// a nonsensical parameter the way [`check_params`] does for them: a
-    /// non-finite `hyperbolic_origin` or `hyperbolic_zoom` gives non-finite
-    /// coordinates back rather than an error.
+    /// Takes no `Result`: a non-finite `hyperbolic_origin` or `hyperbolic_zoom`
+    /// gives non-finite coordinates back.
     ///
     /// ### Params
     ///
@@ -238,12 +185,8 @@ impl Layout {
             let u = (self.x[i] - ox) * p.hyperbolic_zoom;
             let v = (self.y[i] - oy) * p.hyperbolic_zoom;
             let r = u.hypot(v);
-            // Applied as a scale factor on (u, v) rather than as a polar round
-            // trip. `atan2` followed by `sin_cos` would cost two transcendental
-            // calls and perturb an angle the projection is supposed to leave
-            // exactly alone.
-            // `r.hypot(1.0)`, not `(1.0 + r * r).sqrt()`; see the doc above. It
-            // also gives 0.5 at r = 0, so the zero case needs no branch.
+            // Scale on (u, v), not a polar round trip, so the angle is untouched.
+            // `hypot` also gives 0.5 at r = 0, so no branch.
             let scale = 1.0 / (1.0 + r.hypot(1.0));
             x.push(u * scale);
             y.push(v * scale);
@@ -258,14 +201,8 @@ impl Layout {
 
 /// Reject layout parameters that cannot be drawn with.
 ///
-/// The whole bundle is checked wherever any of it is read: it is one struct,
-/// and a caller who has put a `NaN` in one field has a bug whichever function
-/// happens to read it. Without this, `dendrogram` with a non-finite
-/// `leaf_spacing` returns a layout of `NaN` coordinates and reports success.
-///
-/// [`Layout::hyperbolic`] is the one entry point this cannot serve, because it
-/// returns a [`Layout`] rather than a `Result`; its own docs say what a
-/// non-finite origin or zoom does.
+/// The whole bundle is checked wherever any of it is read. Not used by
+/// [`Layout::hyperbolic`], which returns no `Result`.
 ///
 /// ### Params
 ///
@@ -335,8 +272,7 @@ fn check_branches(tree: &Tree) -> Result<(), BonsaiErrors> {
 
 /// Number of leaves below each node, itself included for a leaf.
 ///
-/// One ascending scan: by the arena invariant, ascending index order is a
-/// post-order, so every child is complete before its parent is reached.
+/// One ascending scan (ascending index is a post-order).
 ///
 /// ### Params
 ///
@@ -361,10 +297,8 @@ fn leaf_counts(tree: &Tree) -> Vec<u32> {
 
 /// A depth-first pre-order over the arena, held as index ranges.
 ///
-/// Built with two flat scans and no stack. The point of it is that a subtree
-/// becomes one contiguous slice of `order`, which is what turns rotating a
-/// subtree in [`equal_daylight`] into a linear pass over memory rather than a
-/// traversal.
+/// Built with two flat scans and no stack. A subtree is one contiguous slice of
+/// `order`.
 struct Tour {
     /// Nodes in depth-first pre-order.
     order: Vec<u32>,
@@ -412,8 +346,7 @@ fn tour(tree: &Tree) -> Tour {
     Tour { order, tin, tout }
 }
 
-/// Largest absolute coordinate in a layout, the scale the relative epsilons
-/// are taken against.
+/// Largest absolute coordinate in a layout, the scale for the relative epsilons.
 ///
 /// ### Params
 ///
@@ -450,25 +383,12 @@ fn wrap_pi(a: f64) -> f64 {
 
 /// Ladderised rectangular dendrogram.
 ///
-/// **Only the horizontal axis carries meaning.** `x` is the summed branch
-/// length from the root, so the horizontal separation between two nodes,
-/// measured along the elbowed path through their common ancestor, is their
-/// tree distance. The vertical axis is a display convenience: it exists to
-/// stop the leaves overprinting and carries no information whatever. Reading
-/// vertical proximity as similarity is the standard misreading of a
-/// dendrogram, and rotating any node's children about it gives a different
-/// picture of exactly the same tree.
+/// Only the horizontal axis carries meaning: `x` is the summed branch length
+/// from the root. The vertical axis is a display convenience.
 ///
-/// "Ladderised" means the children of each node are ordered by the number of
-/// leaves below them, smallest first, so small clades comb out along one side
-/// instead of scattering. Ties break on node index, which keeps the output
-/// deterministic. An internal node sits vertically centred on the span of its
-/// children, taken as the midpoint of the extreme two rather than the mean of
-/// all of them, so a polytomy stays centred on its bracket.
-///
-/// One descending scan for the horizontal coordinate, one explicit-stack
-/// depth-first walk for the leaf order, one ascending scan for the internal
-/// vertical coordinates. Nothing recurses.
+/// Children of each node are ordered by leaf count, smallest first, ties on
+/// node index. An internal node sits at the midpoint of its extreme two
+/// children.
 ///
 /// ### Params
 ///
@@ -486,7 +406,7 @@ pub fn dendrogram(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, B
     let n = tree.n_nodes();
     let counts = leaf_counts(tree);
 
-    // Ladderised children, as our own CSR alongside the arena's.
+    // Ladderised children as a CSR.
     let mut ptr = vec![0u32; n + 1];
     for v in 0..n {
         ptr[v + 1] = ptr[v] + tree.children(v as u32).len() as u32;
@@ -498,8 +418,7 @@ pub fn dendrogram(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, B
         kids[start..].sort_unstable_by_key(|&c| (counts[c as usize], c));
     }
 
-    // Horizontal: distance from the root. Descending index order is a
-    // pre-order, so a parent is always placed before its children.
+    // Descending index is a pre-order: parents are placed before children.
     let mut x = vec![0.0f64; n];
     for v in (0..n).rev() {
         for &c in &kids[ptr[v] as usize..ptr[v + 1] as usize] {
@@ -507,9 +426,7 @@ pub fn dendrogram(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, B
         }
     }
 
-    // Vertical: leaves in ladderised depth-first order. The stack is a `Vec`,
-    // so a ladder of a million leaves costs a million heap slots rather than a
-    // million call frames.
+    // Leaves in ladderised depth-first order.
     let mut y = vec![0.0f64; n];
     let mut stack: Vec<u32> = vec![tree.root()];
     let mut next = 0usize;
@@ -526,8 +443,7 @@ pub fn dendrogram(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, B
         }
     }
 
-    // Internal nodes centred on their children's span. Ascending index order
-    // is a post-order, so the children are already placed.
+    // Ascending index is a post-order: children are already placed.
     for v in tree.n_leaves()..n {
         let first = kids[ptr[v] as usize] as usize;
         let last = kids[ptr[v + 1] as usize - 1] as usize;
@@ -545,33 +461,18 @@ pub fn dendrogram(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, B
 /// pp. 578-584).
 ///
 /// The root sits at the origin and owns the whole circle. Each node hands its
-/// angular wedge down to its children in slices proportional to the number of
-/// leaves each contains, and each child is placed at its parent's position
-/// offset by its own branch length along the bisector of its slice. One
-/// descending scan over the arena: no traversal, no recursion, `O(n)`.
+/// wedge to its children in slices proportional to their leaf counts, and each
+/// child is placed at its parent's position offset by its branch length along
+/// the slice bisector. One descending scan, `O(n)`.
 ///
-/// The reason this is the default for large trees is that sibling subtrees are
-/// confined to disjoint angular wedges seen from their parent, so no two edges
-/// can cross. Be precise about that guarantee, because it is not
-/// unconditional: the containment argument needs each wedge to be a convex
-/// cone, which holds when the wedge is at most `pi` wide, and a node's wedge is
-/// `2*pi` times its share of the leaves.
+/// Sibling subtrees occupy disjoint wedges, so edges cannot cross provided each
+/// wedge is at most `pi` wide (a convex cone). Wedges above `pi` occur at any
+/// node holding more than half the leaves, e.g. in a caterpillar, so planarity
+/// is not guaranteed there; no crossing has been produced on ladders, balanced
+/// or random trees (`test_equal_angle_never_crosses_edges`).
 ///
-/// **Wedges above `pi` are ordinary, not exotic.** Any node holding more than
-/// half the leaves has one, so a caterpillar has one on every rung of its upper
-/// half, and that is exactly the shape SPEC.md calls biologically typical. A
-/// balanced tree has none at any size. So the convex-cone argument covers a
-/// balanced tree and does not cover half the internal nodes of a caterpillar.
-///
-/// What has never been produced is an actual crossing. Ladders, balanced trees
-/// and random trees up to 120 leaves with branch lengths spread over a factor
-/// of forty all come back clean, which is what
-/// `test_equal_angle_never_crosses_edges` runs. [`has_edge_crossing`] settles
-/// it exactly wherever it matters.
-///
-/// Unlike [`dendrogram`], both axes carry meaning here: the Euclidean distance
-/// from a node to its parent is exactly that node's branch length. Distances
-/// between non-adjacent nodes are still tree distances, not Euclidean ones.
+/// Both axes carry meaning: the Euclidean distance from a node to its parent is
+/// its branch length.
 ///
 /// ### Params
 ///
@@ -598,8 +499,7 @@ pub fn equal_angle(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, 
     lo[root] = p.start_angle;
     width[root] = TAU;
 
-    // Descending index order is a pre-order, so a node's wedge is settled
-    // before its children need it.
+    // Descending index is a pre-order: a wedge is settled before its children.
     for v in (0..n).rev() {
         let kids = tree.children(v as u32);
         if kids.is_empty() {
@@ -621,6 +521,124 @@ pub fn equal_angle(tree: &Tree, params: Option<LayoutParams>) -> Result<Layout, 
     Ok(Layout { x, y })
 }
 
+//////////////////////
+// Crossing checker //
+//////////////////////
+
+/// Orientation determinant of three points.
+///
+/// ### Params
+///
+/// * `ax` - Horizontal coordinate of the first point
+/// * `ay` - Vertical coordinate of the first point
+/// * `bx` - Horizontal coordinate of the second point
+/// * `by` - Vertical coordinate of the second point
+/// * `cx` - Horizontal coordinate of the third point
+/// * `cy` - Vertical coordinate of the third point
+///
+/// ### Returns
+///
+/// Twice the signed area of the triangle: positive if the points turn left,
+/// negative if they turn right, zero if they are collinear.
+#[inline]
+fn orient(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> f64 {
+    (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+}
+
+/// Whether a point lies within the bounding box of a segment.
+///
+/// Only meaningful once the three points are known to be collinear.
+///
+/// ### Params
+///
+/// * `ax` - Horizontal coordinate of the segment start
+/// * `ay` - Vertical coordinate of the segment start
+/// * `bx` - Horizontal coordinate of the segment end
+/// * `by` - Vertical coordinate of the segment end
+/// * `cx` - Horizontal coordinate of the point tested
+/// * `cy` - Vertical coordinate of the point tested
+///
+/// ### Returns
+///
+/// `true` if the point is inside the bounding box.
+#[inline]
+fn on_segment(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> bool {
+    cx >= ax.min(bx) && cx <= ax.max(bx) && cy >= ay.min(by) && cy <= ay.max(by)
+}
+
+/// Whether a layout contains two edges that cross.
+///
+/// Compares every pair of edges (node to parent), `O(n^2)`. Pairs sharing an
+/// endpoint are skipped; any other intersection counts, including a collinear
+/// overlap and an edge through an unrelated node.
+///
+/// ### Params
+///
+/// * `tree` - Tree the layout belongs to
+/// * `layout` - Coordinates to check
+///
+/// ### Returns
+///
+/// `true` if some pair of non-adjacent edges intersects, or `NodeOutOfRange`
+/// if the layout does not cover the tree.
+fn has_edge_crossing(tree: &Tree, layout: &Layout) -> Result<bool, BonsaiErrors> {
+    let n = tree.n_nodes();
+    if layout.x.len() != n || layout.y.len() != n {
+        return Err(BonsaiErrors::NodeOutOfRange {
+            index: layout.x.len().min(layout.y.len()),
+            n_nodes: n,
+        });
+    }
+
+    let edges: Vec<(u32, u32)> = (0..n as u32)
+        .filter_map(|v| tree.parent(v).map(|p| (v, p)))
+        .collect();
+
+    for i in 0..edges.len() {
+        let (a, b) = edges[i];
+        let (ax, ay) = (layout.x[a as usize], layout.y[a as usize]);
+        let (bx, by) = (layout.x[b as usize], layout.y[b as usize]);
+        let ab_len = (bx - ax).hypot(by - ay);
+        for j in i + 1..edges.len() {
+            let (c, d) = edges[j];
+            if a == c || a == d || b == c || b == d {
+                continue;
+            }
+            let (cx, cy) = (layout.x[c as usize], layout.y[c as usize]);
+            let (dx, dy) = (layout.x[d as usize], layout.y[d as usize]);
+            let cd_len = (dx - cx).hypot(dy - cy);
+
+            // The determinant scales as |ab| * |cd|; a global epsilon would
+            // call short far-out edges collinear and report false crossings.
+            let eps = ORIENT_REL_EPS * ab_len * cd_len;
+
+            // A degenerate segment is a point and cannot cross anything.
+            if ab_len == 0.0 || cd_len == 0.0 {
+                continue;
+            }
+
+            let d1 = orient(cx, cy, dx, dy, ax, ay);
+            let d2 = orient(cx, cy, dx, dy, bx, by);
+            let d3 = orient(ax, ay, bx, by, cx, cy);
+            let d4 = orient(ax, ay, bx, by, dx, dy);
+
+            let straddles = |u: f64, v: f64| (u > eps && v < -eps) || (u < -eps && v > eps);
+            if straddles(d1, d2) && straddles(d3, d4) {
+                return Ok(true);
+            }
+            if (d1.abs() <= eps && on_segment(cx, cy, dx, dy, ax, ay))
+                || (d2.abs() <= eps && on_segment(cx, cy, dx, dy, bx, by))
+                || (d3.abs() <= eps && on_segment(ax, ay, bx, by, cx, cy))
+                || (d4.abs() <= eps && on_segment(ax, ay, bx, by, dx, dy))
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 ////////////////////
 // Equal daylight //
 ////////////////////
@@ -639,8 +657,8 @@ struct Wedge {
 
 /// Scratch buffers reused across a whole refinement run.
 ///
-/// The sweep touches every node from every node, so allocating any of these
-/// per call would dominate the arithmetic.
+/// The sweep touches every node from every node; per-call allocation would
+/// dominate.
 #[derive(Default)]
 struct Scratch {
     /// Incident wedges of the node currently being worked on.
@@ -655,14 +673,9 @@ struct Scratch {
 /// given slices.
 ///
 /// Sorts the directions and takes the complement of the widest gap between
-/// consecutive ones, which is the smallest containing arc by construction.
-/// The `O(m log m)` sort is the price of getting it exactly, and it is worth
-/// paying: a merely *containing* arc, taken relative to some reference
-/// direction, can be far wider than the true extent, and [`sweep_node`] packs
-/// subtrees using those widths. Referencing the subtree's own root instead
-/// inflates the first sweep's daylight discrepancy by more than an order of
-/// magnitude and the refinement never recovers; the circular mean of the
-/// directions is worse again.
+/// consecutive ones. Exactness matters: [`sweep_node`] packs subtrees using
+/// these widths, and a looser containing arc inflates the discrepancy by more
+/// than an order of magnitude.
 ///
 /// ### Params
 ///
@@ -705,8 +718,7 @@ fn arc(
         return Some((angles[0], 0.0));
     }
 
-    // Gap `j` runs from `angles[j]` to its cyclic successor. The widest one is
-    // the daylight *inside* the subtree, so the arc is everything else.
+    // The widest cyclic gap is the daylight inside the subtree; the arc is the rest.
     let mut widest = angles[0] + TAU - angles[k - 1];
     let mut after = 0usize;
     for j in 0..k - 1 {
@@ -721,10 +733,8 @@ fn arc(
 
 /// Angular arcs of every subtree incident to a node.
 ///
-/// A node's neighbours are its children plus, unless it is the root, the whole
-/// rest of the tree hanging off its parent. Both are contiguous in the
-/// pre-order tour: a child's subtree is one slice, the parent side is the two
-/// slices either side of the node's own.
+/// Neighbours are the children plus, unless root, the rest of the tree off the
+/// parent: one tour slice per child, two slices for the parent side.
 ///
 /// ### Params
 ///
@@ -800,12 +810,8 @@ fn incident_wedges(
 
 /// Sort wedges into cyclic order and measure the daylight between them.
 ///
-/// Gaps are signed. A negative one means the two wedges overlap, which is
-/// normal rather than exceptional: the arcs computed by [`arc`] are containing
-/// arcs and not minimal ones, and a subtree deep in a large tree genuinely can
-/// subtend most of the circle seen from one of its own nodes. Overlap is
-/// therefore not treated as a planarity failure; [`has_edge_crossing`] settles
-/// that question exactly, and separately.
+/// Gaps are signed; a negative one means overlapping wedges, which is normal
+/// and not a planarity failure ([`has_edge_crossing`] decides that).
 ///
 /// ### Params
 ///
@@ -873,18 +879,10 @@ fn rotate_subtree(
 
 /// Move one node's subtrees a fraction of the way towards equal daylight.
 ///
-/// The parent-side subtree is held fixed and the child subtrees are rotated
-/// rigidly about the node towards the positions that would make the gaps
-/// between consecutive wedges equal, travelling `damping` of the way there. A
-/// rigid rotation cannot change anything inside the subtree it moves, but it
-/// changes how that subtree looks from every node outside it, so the sweep
-/// gives no guarantee about the tree as a whole and [`equal_daylight`] checks
-/// the result rather than trusting it.
-///
-/// The node is left alone when the wedges already sum to more than the whole
-/// circle. There is no daylight to share out, and packing them anyway means
-/// choosing which subtrees to bury under which, which measurably sends the
-/// descent off into oscillation.
+/// The parent-side subtree is held fixed and child subtrees are rotated
+/// rigidly about the node, `damping` of the way towards equal gaps. The node is
+/// left alone when the wedges already exceed the circle (packing them
+/// oscillates).
 ///
 /// ### Params
 ///
@@ -921,8 +919,7 @@ fn sweep_node(
     }
 
     let target = daylight / k as f64;
-    // The parent side anchors the node to the rest of the picture. At the root
-    // there is no parent side, so the first child in cyclic order stands in.
+    // The parent side anchors; at the root the first child stands in.
     let fixed = scratch
         .wedges
         .iter()
@@ -947,16 +944,9 @@ fn sweep_node(
 /// Total daylight discrepancy of a layout: the objective the refinement
 /// minimises.
 ///
-/// At every internal node, the sum of squared deviations of the gaps between
-/// consecutive subtree wedges from their own mean. It is zero exactly when the
-/// daylight around every node is equal, which is the thing the algorithm is
-/// named after. It says nothing about planarity, which is
-/// [`has_edge_crossing`]'s job: a node whose subtrees overlap uniformly scores
-/// zero here, and whether that overlap actually puts two edges across each
-/// other is a separate question with an exact answer.
-///
-/// Nodes with a subtree entirely coincident with them are skipped, since they
-/// have no angular extent to be uniform about.
+/// At every internal node, the sum of squared deviations of the wedge gaps from
+/// their mean. Says nothing about planarity. Nodes with a subtree entirely
+/// coincident with them are skipped.
 ///
 /// ### Params
 ///
@@ -995,36 +985,16 @@ fn daylight_discrepancy(
 
 /// Felsenstein's equal-daylight refinement of the equal-angle layout.
 ///
-/// Starts from [`equal_angle`] and repeatedly sweeps the internal nodes from
-/// the root downwards, rotating each node's child subtrees rigidly about it so
-/// the angular gaps between them come out equal. Equalising at one node
-/// perturbs its neighbours, so this is a coordinate descent with no
-/// convergence proof and it has to be bounded from outside. Two things bound
-/// it, and they are what makes this honest rather than hopeful:
+/// Starts from [`equal_angle`] and sweeps the internal nodes from the root
+/// down, rotating child subtrees rigidly so the gaps between them equalise. A
+/// sweep is adopted only if it lowers the discrepancy and
+/// [`has_edge_crossing`] finds no crossing, so a crossing never reaches the
+/// caller. The step starts at `daylight_damping` and halves up to
+/// [`DAYLIGHT_MAX_BACKTRACKS`] times until a sweep is accepted. The run stops
+/// when no step improves, when a sweep moves nothing by more than
+/// `daylight_angle_tol`, or after `daylight_max_sweeps`.
 ///
-/// * a sweep is **adopted only if it lowers the discrepancy**, so the
-///   objective falls monotonically and the run stops as soon as no step size
-///   improves on where it already is, when a sweep moves nothing by more than
-///   `daylight_angle_tol`, or when `daylight_max_sweeps` runs out;
-/// * the naive form of this algorithm **introduces edge crossings**, and the
-///   sweep here does too. It is prevented rather than merely reported: every
-///   candidate is checked exactly by [`has_edge_crossing`], edge pair against
-///   edge pair, and one that crosses is discarded rather than adopted, so a
-///   crossing can never reach the caller.
-///
-/// How far each rotation actually travels is found by a backtracking search:
-/// a sweep starts at `daylight_damping` and halves until it lands one that is
-/// both cleaner and planar, up to ten times. That is not decoration. On trees
-/// with uniform branch lengths a full-strength sweep is fine and the
-/// discrepancy goes to zero; on 512-leaf trees whose branch lengths span a
-/// factor of forty, a sweep at damping 0.1 crosses and the same sweep at 0.005
-/// does not, so without the search the refinement is a no-op on exactly the
-/// trees this crate produces. What it buys on those is real but modest: about
-/// a tenth off the discrepancy, against effectively all of it on a ladder or a
-/// balanced tree.
-///
-/// Every check costs a full `O(n^2)` pass, the same order as the sweep itself.
-/// Above `daylight_max_nodes` that is not worth paying and the equal-angle
+/// Each sweep and check is `O(n^2)`; above `daylight_max_nodes` the equal-angle
 /// layout is returned unrefined.
 ///
 /// ### Params
@@ -1056,8 +1026,7 @@ pub fn equal_daylight(tree: &Tree, params: Option<LayoutParams>) -> Result<Layou
 
     for _ in 0..p.daylight_max_sweeps {
         let mut accepted = false;
-        // Backtracking line search on the rotation size; see the doc above for
-        // why a full-strength sweep is not enough on realistic branch lengths.
+        // Backtracking line search on the rotation size.
         for _ in 0..DAYLIGHT_MAX_BACKTRACKS {
             let mut candidate = best.clone();
             let mut moved = 0.0f64;
@@ -1078,8 +1047,7 @@ pub fn equal_daylight(tree: &Tree, params: Option<LayoutParams>) -> Result<Layou
                 score = next;
                 accepted = true;
                 converged = moved < p.daylight_angle_tol;
-                // Let the step grow back, so one awkward sweep does not pin
-                // the rest of the run at a needlessly tiny rotation.
+                // Let the step grow back after an awkward sweep.
                 step = (step * 2.0).min(p.daylight_damping);
                 break;
             }
@@ -1091,137 +1059,6 @@ pub fn equal_daylight(tree: &Tree, params: Option<LayoutParams>) -> Result<Layou
     }
 
     Ok(best)
-}
-
-//////////////////////
-// Crossing checker //
-//////////////////////
-
-/// Orientation determinant of three points.
-///
-/// ### Params
-///
-/// * `ax` - Horizontal coordinate of the first point
-/// * `ay` - Vertical coordinate of the first point
-/// * `bx` - Horizontal coordinate of the second point
-/// * `by` - Vertical coordinate of the second point
-/// * `cx` - Horizontal coordinate of the third point
-/// * `cy` - Vertical coordinate of the third point
-///
-/// ### Returns
-///
-/// Twice the signed area of the triangle: positive if the points turn left,
-/// negative if they turn right, zero if they are collinear.
-#[inline]
-fn orient(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> f64 {
-    (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-}
-
-/// Whether a point lies within the bounding box of a segment.
-///
-/// Only meaningful once the three points are known to be collinear.
-///
-/// ### Params
-///
-/// * `ax` - Horizontal coordinate of the segment start
-/// * `ay` - Vertical coordinate of the segment start
-/// * `bx` - Horizontal coordinate of the segment end
-/// * `by` - Vertical coordinate of the segment end
-/// * `cx` - Horizontal coordinate of the point tested
-/// * `cy` - Vertical coordinate of the point tested
-///
-/// ### Returns
-///
-/// `true` if the point is inside the bounding box.
-#[inline]
-fn on_segment(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> bool {
-    cx >= ax.min(bx) && cx <= ax.max(bx) && cy >= ay.min(by) && cy <= ay.max(by)
-}
-
-/// Whether a layout contains two edges that cross.
-///
-/// An edge joins a node to its parent, so a tree with `n` nodes has `n - 1` of
-/// them and this compares every pair: `O(n^2)`, deliberately so. It is a
-/// checker rather than a layout step, meant for tests and for spot-checking a
-/// drawing that looks wrong, not for a hot path.
-///
-/// Pairs of edges sharing an endpoint are skipped, since meeting at a shared
-/// node is what a tree does. Any other intersection counts, including a
-/// collinear overlap and an edge passing through an unrelated node.
-///
-/// ### Params
-///
-/// * `tree` - Tree the layout belongs to
-/// * `layout` - Coordinates to check
-///
-/// ### Returns
-///
-/// `true` if some pair of non-adjacent edges intersects, or `NodeOutOfRange`
-/// if the layout does not cover the tree.
-fn has_edge_crossing(tree: &Tree, layout: &Layout) -> Result<bool, BonsaiErrors> {
-    let n = tree.n_nodes();
-    if layout.x.len() != n || layout.y.len() != n {
-        return Err(BonsaiErrors::NodeOutOfRange {
-            index: layout.x.len().min(layout.y.len()),
-            n_nodes: n,
-        });
-    }
-
-    let edges: Vec<(u32, u32)> = (0..n as u32)
-        .filter_map(|v| tree.parent(v).map(|p| (v, p)))
-        .collect();
-
-    for i in 0..edges.len() {
-        let (a, b) = edges[i];
-        let (ax, ay) = (layout.x[a as usize], layout.y[a as usize]);
-        let (bx, by) = (layout.x[b as usize], layout.y[b as usize]);
-        let ab_len = (bx - ax).hypot(by - ay);
-        for j in i + 1..edges.len() {
-            let (c, d) = edges[j];
-            if a == c || a == d || b == c || b == d {
-                continue;
-            }
-            let (cx, cy) = (layout.x[c as usize], layout.y[c as usize]);
-            let (dx, dy) = (layout.x[d as usize], layout.y[d as usize]);
-            let cd_len = (dx - cx).hypot(dy - cy);
-
-            // Scale the tolerance to the two segments actually being compared,
-            // not to the layout's global extent. An orientation determinant
-            // scales as |ab| * |cd|, so a global epsilon swamps any short edge
-            // sitting far from the origin and declares it collinear, after
-            // which the bounding-box fallback reports a crossing that is not
-            // there. Measured: 41 of 1000 random trees were false positives,
-            // and every tree with zero-length branches was, which includes
-            // every Newick string parsed without them.
-            let eps = ORIENT_REL_EPS * ab_len * cd_len;
-
-            // A degenerate segment is a point. It cannot cross anything, and
-            // sending it down the collinear branch is what made two siblings
-            // sitting exactly on their parent read as a crossing.
-            if ab_len == 0.0 || cd_len == 0.0 {
-                continue;
-            }
-
-            let d1 = orient(cx, cy, dx, dy, ax, ay);
-            let d2 = orient(cx, cy, dx, dy, bx, by);
-            let d3 = orient(ax, ay, bx, by, cx, cy);
-            let d4 = orient(ax, ay, bx, by, dx, dy);
-
-            let straddles = |u: f64, v: f64| (u > eps && v < -eps) || (u < -eps && v > eps);
-            if straddles(d1, d2) && straddles(d3, d4) {
-                return Ok(true);
-            }
-            if (d1.abs() <= eps && on_segment(cx, cy, dx, dy, ax, ay))
-                || (d2.abs() <= eps && on_segment(cx, cy, dx, dy, bx, by))
-                || (d3.abs() <= eps && on_segment(ax, ay, bx, by, cx, cy))
-                || (d4.abs() <= eps && on_segment(ax, ay, bx, by, dx, dy))
-            {
-                return Ok(true);
-            }
-        }
-    }
-
-    Ok(false)
 }
 
 ///////////
@@ -1395,12 +1232,7 @@ mod tests {
 
     #[test]
     fn test_zero_length_branches_are_not_reported_as_crossings() {
-        // Regression. The crossing epsilon was
-        // scaled to the layout's global extent, so two siblings sitting exactly
-        // on their parent read as collinear and then as a crossing. That is
-        // every tree with zero-length branches, which includes every Newick
-        // string parsed without them, and it silently turned `equal_daylight`
-        // into a no-op because every candidate was rejected.
+        // Regression: a global crossing epsilon flagged zero-length branches.
         for n_leaves in [4usize, 8, 16] {
             let tree = Tree::balanced_binary(n_leaves, 0.0).expect("balanced fixture");
             let layout = equal_angle(&tree, None).expect("equal angle");
@@ -1413,10 +1245,7 @@ mod tests {
 
     #[test]
     fn test_short_edges_far_from_the_origin_are_not_false_positives() {
-        // The other half of the same bug: an orientation determinant scales as
-        // the product of the two segment lengths, so a global epsilon swamps a
-        // short edge sitting far out. Branch lengths spanning six orders of
-        // magnitude are what surfaced it.
+        // Regression: a global epsilon swamped short edges far from the origin.
         let tree = Tree::from_parents(
             vec![4, 4, 5, 5, 6, 6, NO_NODE],
             vec![1e-3, 5.8e-3, 1e3, 0.24, 1e3, 1e-3, 0.0],
@@ -1432,10 +1261,7 @@ mod tests {
 
     #[test]
     fn test_hyperbolic_keeps_radial_order_at_extreme_radii() {
-        // Regression. Squaring the radius before
-        // the square root overflowed above 1.3e154, collapsing the scale to
-        // zero so the furthest points landed on the origin rather than near the
-        // rim. Radial order inverted exactly where the docs promise it holds.
+        // Regression: squaring r overflowed above 1.3e154 and inverted radial order.
         let radii = [0.0f64, 1.0, 1e10, 1e100, 1e160, 1e300];
         let layout = Layout {
             x: radii.to_vec(),
@@ -1447,10 +1273,7 @@ mod tests {
         for (i, &r) in radii.iter().enumerate() {
             let out = mapped.x[i].hypot(mapped.y[i]);
             assert!(out.is_finite(), "r = {r:e} mapped to {out}");
-            // `<=`, not `<`: past about 1e16 the `1 +` in the scale is lost to
-            // rounding and the result saturates at exactly 1. Harmless, and
-            // documented on `hyperbolic`. The property that matters is that the
-            // order never inverts, which is the next assertion.
+            // `<=`: the result saturates at exactly 1 past about 1e16.
             assert!(out <= 1.0, "r = {r:e} landed outside the rim at {out}");
             assert!(
                 out >= previous,
@@ -1814,9 +1637,7 @@ mod tests {
 
     #[test]
     fn test_rejects_layout_parameters_that_cannot_be_drawn_with() {
-        // A non-finite `leaf_spacing` produced a whole layout of `NaN` and
-        // reported success, because
-        // nothing validated `LayoutParams` at all.
+        // Regression: a non-finite `leaf_spacing` used to give an all-NaN layout.
         let tree = Tree::balanced_binary(4, 1.0).expect("balanced");
         let bad = [
             LayoutParams {

@@ -1,20 +1,11 @@
 //! Distances along a tree, and how well they recover the distances in the data.
 //!
-//! This is the property the method exists for. A tree can have the right
-//! topology and useless branch lengths, and Robinson-Foulds will report zero
-//! either way; what the paper claims over UMAP and tSNE is that path distances
-//! along the tree track high-dimensional distances *at every scale*, which is
-//! the relation its Fig. S8 plots and Fig. S9 scores.
+//! Path distances along the tree should track high-dimensional distances at
+//! every scale (paper Fig. S8 plots the relation, Fig. S9 scores it).
+//! Robinson-Foulds cannot see wrong branch lengths; this can.
 //!
-//! So this is the measurement to compare two implementations on, and the one
-//! that would catch a search that found a plausible topology by accident.
-//!
-//! Nothing in the search calls any of this. It is scored once, from
-//! `benches/recovery.rs`, so it is not a target for vectorisation however much
-//! [`data_distances`] and [`pearson`] look like one: a kernel the pipeline never
-//! runs cannot be worth a lane. [`data_distances`] is parallel because it is
-//! `O(pairs * p)` and the ceiling is two million pairs; [`pearson`] is `O(n)`
-//! against that and is left alone.
+//! Not called by the search; scored from `benches/recovery.rs`, so not a
+//! vectorisation target.
 
 use rayon::prelude::*;
 
@@ -28,10 +19,8 @@ use crate::utils::traits::{BonsaiFloat, wide};
 
 /// Pair count above which the metrics subsample rather than enumerate.
 ///
-/// All pairs is `n * (n - 1) / 2`, which is 2 million at 2048 leaves and 450
-/// million at 30 thousand, so the full set stops being storable well before the
-/// search stops being runnable. Two million pairs estimates a correlation far
-/// past any precision the comparison needs.
+/// All pairs is `n * (n - 1) / 2` (2 million at 2048 leaves), which stops being
+/// storable well before the search stops being runnable.
 pub const MAX_PAIRS: usize = 2_000_000;
 
 ///////////////
@@ -40,10 +29,8 @@ pub const MAX_PAIRS: usize = 2_000_000;
 
 /// Path distances from one node to every other, along the tree.
 ///
-/// Breadth-first over the *undirected* tree, so it walks through the parent as
-/// well as the children: the arena stores a rooted representation of an unrooted
-/// tree and the root is a bookkeeping choice (S14). Iterative, so a
-/// hundred-thousand-leaf ladder does not touch the stack.
+/// Breadth-first over the undirected tree: the root is a bookkeeping choice
+/// (S14), so the walk goes through parents as well as children. Iterative.
 ///
 /// ### Params
 ///
@@ -128,8 +115,7 @@ pub fn leaf_pairs(n_leaves: usize, max_pairs: usize, seed: u64) -> Vec<(usize, u
 ///
 /// One distance per pair, in the order given.
 pub fn tree_distances(tree: &Tree, pairs: &[(usize, usize)]) -> Vec<f64> {
-    // One traversal per distinct source, reused across every pair sharing it,
-    // which turns the all-pairs case from `O(n^2)` traversals into `O(n)`.
+    // One traversal per distinct source, shared by all its pairs.
     let mut by_source: Vec<Vec<usize>> = vec![Vec::new(); tree.n_leaves()];
     for (idx, &(i, _)) in pairs.iter().enumerate() {
         by_source[i].push(idx);
@@ -180,9 +166,8 @@ pub fn data_distances<T: BonsaiFloat>(
 
 /// Pearson correlation of two equal-length samples.
 ///
-/// Two passes, means first, rather than the `E[xy] - E[x]E[y]` shortcut, which
-/// cancels catastrophically when the values are large and their spread is not.
-/// Tree distances at atlas scale are exactly that shape.
+/// Two passes, means first: the `E[xy] - E[x]E[y]` shortcut cancels when values
+/// are large and their spread is not.
 ///
 /// ### Params
 ///
@@ -216,9 +201,7 @@ pub fn pearson(a: &[f64], b: &[f64]) -> f64 {
 
 /// How well a tree's path distances recover the distances in the data.
 ///
-/// The headline number for comparing two reconstructions of the same dataset,
-/// and the one Robinson-Foulds cannot see: a tree with the right topology and
-/// wrong branch lengths scores zero on RF and poorly here.
+/// Scores branch lengths as well as topology, which Robinson-Foulds cannot.
 ///
 /// ### Params
 ///

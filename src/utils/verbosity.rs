@@ -4,8 +4,7 @@ use std::time::Duration;
 
 /// Percentage step between two progress lines of a long sweep.
 ///
-/// Reporting on decile crossings rather than per unit of work bounds a sweep at
-/// ten lines, whether it makes ten merges or ten thousand.
+/// Bounds a sweep at ten progress lines.
 const PROGRESS_STEP_PCT: usize = 10;
 
 /// How much the pipeline prints while it runs.
@@ -59,9 +58,8 @@ pub fn parse_verbosity_level(level: usize) -> Verbosity {
 
 /// Print a progress line whenever a sweep crosses a decile of its work.
 ///
-/// Cheap enough to call on every unit of work: it formats nothing unless `done`
-/// and `prev_done` fall either side of a [`PROGRESS_STEP_PCT`] boundary, or the
-/// sweep has just finished. The verbosity check stays with the caller.
+/// Cheap to call per unit of work; prints only across a [`PROGRESS_STEP_PCT`]
+/// boundary or at completion. The verbosity check stays with the caller.
 ///
 /// ### Params
 ///

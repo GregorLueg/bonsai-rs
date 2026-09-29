@@ -32,18 +32,10 @@ pub struct NodeState<T> {
     p: usize,
     /// Number of nodes, leaves included.
     n_nodes: usize,
-    /// Leaf rows the caller actually supplied.
-    ///
-    /// Kept so `prune` can tell a state built for this tree from one built for
-    /// a smaller leaf set: the constructor takes a node count, so it cannot
-    /// check this itself.
+    /// Leaf rows supplied to `new`; `prune` checks it against the tree.
     n_leaf_rows: usize,
-    /// Per-node loglikelihood contributions, the terms `prune` sums. Zero at
-    /// the leaves and at any internal node not yet pruned.
-    ///
-    /// Kept so a tree that differs from this one at a few nodes can be scored
-    /// by summing these where it agrees and recomputing where it does not,
-    /// which is what search step 5 does with its candidates.
+    /// Per-node loglikelihood terms summed by `prune`; zero at leaves and
+    /// unpruned nodes.
     contrib: Vec<f64>,
 }
 
@@ -75,11 +67,7 @@ impl<T: BonsaiFloat> NodeState<T> {
                 sd_features: p,
             });
         }
-        // A leaf block that is not a whole number of rows, or that does not fit
-        // the arena, is a caller error rather than a broken invariant. Before
-        // this check the over-long case panicked inside `copy_from_slice` and
-        // the short case under-filled silently, leaving zero-precision rows
-        // that turn the loglikelihood into `NaN` at the first logarithm.
+        // A ragged or over-long leaf block is a caller error, not an invariant.
         if p == 0 || !leaf_means.len().is_multiple_of(p) || leaf_means.len() > n_nodes * p {
             return Err(BonsaiErrors::ShapeMismatch {
                 mean_cells: leaf_means.len() / p.max(1),
@@ -160,17 +148,9 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// Run the pruning recursion over the whole tree and return its
     /// loglikelihood.
     ///
-    /// Walks levels from the leaves up. The nodes of one level are pruned in
-    /// parallel: each writes its own row, the level's rows are contiguous, and
-    /// every row a level reads lies below it, which the arena invariant
-    /// guarantees. Measured 2026-09-27 at 10,000 cells by 2,767 features, the
-    /// sequential prune was three quarters of the global branch solve (steps
-    /// 4, 7 and 8), 0.16 s a call.
-    ///
-    /// Per-node contributions are summed within a level, in ascending node
-    /// index, and only then added to the running total, which keeps the
-    /// association fixed to the tree: the answer is the same bits whatever the
-    /// thread count.
+    /// Walks levels from the leaves up, pruning the nodes of a level in
+    /// parallel. Contributions are summed per level in ascending node index, so
+    /// the result is bit-identical at any thread count.
     ///
     /// ### Params
     ///
@@ -183,9 +163,8 @@ impl<T: BonsaiFloat> NodeState<T> {
     /// ### Panics
     ///
     /// If `tree` has a different node count from the one this state was built
-    /// for, or a different leaf count from the number of leaf rows supplied to
-    /// [`NodeState::new`]. Both are a mismatched pair of arguments rather than
-    /// bad data.
+    /// for, or a different leaf count from the leaf rows supplied to
+    /// [`NodeState::new`].
     pub fn prune(&mut self, tree: &Tree) -> f64 {
         assert_eq!(
             tree.n_nodes(),
@@ -193,11 +172,8 @@ impl<T: BonsaiFloat> NodeState<T> {
             "this state was built for a tree of {} nodes",
             self.n_nodes
         );
-        // Same reasoning as above, for the other half of the shape. An
-        // under-filled leaf block leaves zero-precision rows, which the first
-        // logarithm turns into `-inf`: a finite-looking `Ok` carrying a
-        // meaningless number, since `Leaves` has public fields and nothing ties
-        // its length to the tree.
+        // An under-filled leaf block leaves zero-precision rows and a
+        // meaningless loglikelihood.
         assert_eq!(
             tree.n_leaves(),
             self.n_leaf_rows,
@@ -239,10 +215,7 @@ impl<T: BonsaiFloat> NodeState<T> {
 // Per-node dispatch //
 ///////////////////////
 
-/// Prune one internal node, reading its children's settled rows.
-///
-/// The dispatch between the binary and polytomy kernels, against a slab of
-/// equal-length rows indexed by node.
+/// Prune one internal node, dispatching to the binary or polytomy kernel.
 ///
 /// ### Params
 ///
@@ -308,9 +281,7 @@ pub(crate) mod tests {
     use crate::utils::rng::SplitMix64;
     use approx::assert_relative_eq;
 
-    /// Deterministic pseudo-random leaf data, so tests do not need an rng
-    /// dependency and always describe the same scenario.
-    ///
+    /// Deterministic pseudo-random leaf data.
     ///
     /// ### Params
     ///
@@ -333,11 +304,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_rejects_leaf_blocks_that_do_not_fit_the_arena() {
-        // Regression. An over-long leaf block
-        // panicked inside `copy_from_slice`, in library code, on the crate's
-        // most-used type. A block that was not a whole number of rows was
-        // accepted and under-filled, leaving zero-precision rows that make the
-        // loglikelihood NaN at the first logarithm.
         let p = 8usize;
 
         let too_long = vec![1.0f64; 32];
@@ -366,12 +332,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_the_loglikelihood_is_the_same_at_every_rooting() {
-        // S14, listed in SPEC.md section 13.2 as a required invariant. The
-        // root is a bookkeeping choice: the model is defined on the unrooted
-        // tree, so
-        // moving the root along any edge, which splits that edge in two and
-        // reverses the path back to the old root, has to leave the
-        // loglikelihood exactly where it was.
+        // S14, SPEC.md section 13.2: the model is defined on the unrooted tree.
         use crate::tree::cluster::reroot;
 
         let p = 12usize;
@@ -411,9 +372,7 @@ pub(crate) mod tests {
                 let error = (here - base).abs() / base.abs().max(1.0);
                 worst = worst.max(error);
             }
-            // The worst measured here is `O(1e-16)` relative on every shape,
-            // including the polytomy path. The bound sits two orders above
-            // that, so it pins the invariant rather than the summation order.
+            // Worst is O(1e-16); the bound pins the invariant, not summation order.
             assert!(
                 worst < 1e-14,
                 "{name}: rerooting moved the loglikelihood by {worst:e} relative"
@@ -424,9 +383,6 @@ pub(crate) mod tests {
     #[test]
     #[should_panic(expected = "this state was built for a tree of")]
     fn test_pruning_a_tree_the_state_was_not_built_for_is_caught() {
-        // This was a `debug_assert`, so a release build indexed happily
-        // inside the larger state's rows and
-        // returned a well-formed loglikelihood computed from the wrong ones.
         let p = 4usize;
         let big = Tree::balanced_binary(8, 0.5).expect("big");
         let small = Tree::balanced_binary(4, 0.5).expect("small");
@@ -437,15 +393,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_the_loglikelihood_is_l_and_not_twice_it() {
-        // SPEC.md section 12: the paper states thresholds in `2L` and this
-        // crate works in `L`, so anything transcribed has to be halved. Not a
-        // claim about the constants, none of which are theirs: a claim about
-        // the units the whole crate is denominated in, and the only place to
-        // pin it is against the formula as written.
-        //
-        // S20 transcribed literally, `1/2` and all, in the direct form with the
-        // ancestor's mean formed rather than the pairwise identity, over a tree
-        // with a polytomy in it so both prune kernels are covered.
+        // SPEC.md section 12: the crate works in `L`, not `2L`. S20 transcribed
+        // literally in the direct form, over a tree covering both prune kernels.
         let p = 6usize;
         let n_leaves = 6usize;
         let (m, w) = leaf_data(n_leaves, p);

@@ -1,15 +1,7 @@
 //! End-to-end scaling of the whole seven-step search.
 //!
-//! This is the number the project was justified on. The original criterion was
-//! thirty thousand cells by two thousand features in under an hour on one
-//! machine; everything measured before this point was the likelihood kernel
-//! alone, with no search around it.
-//!
 //! Reports wall time and Robinson-Foulds to the generating tree, so a
-//! configuration that got fast by getting worse is visible rather than
-//! flattering.
-//!
-//! **Run on a quiet machine.** Check `uptime` first.
+//! configuration that got fast by getting worse is visible.
 //!
 //! ```sh
 //! cargo bench --bench pipeline
@@ -25,13 +17,10 @@ const LEAVES: [usize; 5] = [128, 256, 512, 1024, 2048];
 /// Feature counts swept.
 const FEATURES: [usize; 2] = [200, 2000];
 
-/// Measurement noise, in transformed units. 0.3 sits inside the range where the
-/// greedy step recovers the topology well, so the timing is of a search doing
-/// real work rather than one thrashing on noise.
+/// Measurement noise, in transformed units.
 const NOISE: f64 = 0.3;
 
-/// Wall-clock ceiling per configuration. Past this the sweep stops growing,
-/// so an unattended run cannot turn into an overnight one.
+/// Wall-clock ceiling per configuration; past it the sweep stops growing.
 const BUDGET_SECONDS: f64 = 240.0;
 
 fn main() {
@@ -51,9 +40,7 @@ fn main() {
             }))
             .expect("simulation");
 
-            // `simulate` already returns transformed units, which is what the
-            // pipeline works in, so ingest is bypassed here on purpose: this
-            // measures the search, not the feature selection.
+            // Simulated data is already in transformed units: ingest is bypassed.
             let prepared = PreparedData {
                 transformed_means: data.means.clone(),
                 transformed_precisions: data.precisions(),

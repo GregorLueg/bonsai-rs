@@ -3,21 +3,12 @@
 //! Portable SIMD via the `wide` crate. This is the only file in the crate that
 //! names a `wide` type; algorithm code stays generic over [`BonsaiSimd`].
 //!
-//! ### What is vectorised
+//! Two kernels are vectorised: [`edge_newton_simd`] (tens of calls per
+//! candidate pair) and the `f32` binary prune. Kernels are picked by call
+//! count; `docs/PERFORMANCE.md` has the measurements.
 //!
-//! Two kernels: [`edge_newton_simd`], which the bracketed branch-length solve
-//! calls tens of times per candidate pair, and the `f32` binary prune. Nothing
-//! else, because nothing else is called often enough for a tier to show up in
-//! the whole run. Kernels are picked by call count, not by how vectorisable
-//! they look; `docs/PERFORMANCE.md` has the measurements and the tiers that
-//! were written and thrown away.
-//!
-//! Neither kernel is auto-vectorised. Both accumulate into floating-point
-//! reductions LLVM may not reorder.
-//!
-//! `wide` compiles to the target's baseline instruction set, so lane width
-//! follows the build, not the source. On aarch64 that is NEON. On x86-64 with
-//! no `target-cpu` it is SSE2, and `-C target-cpu=x86-64-v3` is worth setting.
+//! `wide` compiles to the target's baseline instruction set: NEON on aarch64,
+//! SSE2 on x86-64 without `target-cpu`.
 
 use wide::{f32x8, f64x4};
 
@@ -27,26 +18,22 @@ use crate::utils::traits::BonsaiFloat;
 /// Lanes in the `f32` vector type.
 const LANES_F32: usize = 8;
 
+/// Lanes in the `f64` vector type.
+const LANES_F64: usize = 4;
+
 /// Vectors accumulated in `f32` lanes before flushing into the `f64` total.
 ///
-/// Sets the trade between logarithm throughput and accumulation error. At 32
-/// vectors the block holds 256 features, so the `f32` rounding error inside a
-/// block grows as `sqrt(256) * 6e-8`, around `1e-6` relative, which is
-/// comfortably below the error already present in `f32` input data. Ours,
-/// chosen on that argument; no measurement says the exact value matters.
+/// 32 vectors is 256 features, so in-block `f32` rounding error is about
+/// `sqrt(256) * 6e-8`. Chosen on that argument, not measured.
 const FLUSH_BLOCKS: usize = 32;
 
 /// Vectorised feature-axis kernels, one implementation per storage type.
 ///
-/// Algorithm code calls these through the [`BonsaiFloat`] bound rather than
-/// naming a lane width, so a new tier or a new storage type is a change here
-/// and nowhere else.
+/// Algorithm code calls these through the [`BonsaiFloat`] bound.
 pub trait BonsaiSimd: Sized + Copy {
     /// Fused prune of a node with exactly two children.
     ///
-    /// Semantics are identical to
-    /// [`crate::utils::kernels::prune_binary_scalar`]; see that function for
-    /// the equations and the argument meanings.
+    /// Same semantics as [`crate::utils::kernels::prune_binary_scalar`].
     ///
     /// ### Params
     ///
@@ -75,35 +62,8 @@ pub trait BonsaiSimd: Sized + Copy {
     ) -> f64;
 }
 
-/// Load eight consecutive `f32` into a vector register.
-///
-/// ### Params
-///
-/// * `s` - Slice of at least eight elements
-///
-/// ### Returns
-///
-/// The first eight elements as a vector.
-#[inline(always)]
-fn load8(s: &[f32]) -> f32x8 {
-    f32x8::from([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
-}
-
-/// Store a vector register into eight consecutive `f32`.
-///
-/// ### Params
-///
-/// * `v` - Vector to store
-/// * `s` - Destination of at least eight elements
-#[inline(always)]
-fn store8(v: f32x8, s: &mut [f32]) {
-    s[..LANES_F32].copy_from_slice(&v.to_array());
-}
-
 impl BonsaiSimd for f64 {
     /// `f64` storage has no vector tier and runs the scalar path.
-    ///
-    /// No measurement says it should not have one; see the module docs.
     #[inline]
     fn prune_binary_simd(
         m_k: &[f64],
@@ -138,10 +98,7 @@ impl BonsaiSimd for f32 {
         let tk = f32x8::splat(t_k as f32);
         let tl = f32x8::splat(t_l as f32);
 
-        // Lane accumulator flushed into `f64` every FLUSH_BLOCKS vectors, so
-        // the `f32` rounding error grows as the square root of the block length
-        // rather than of the whole feature axis, while the logarithm still gets
-        // to run eight lanes wide.
+        // Flushed into `f64` every FLUSH_BLOCKS vectors to bound `f32` error.
         let mut acc = 0.0f64;
         let mut lanes = f32x8::splat(0.0);
         let mut since_flush = 0usize;
@@ -158,18 +115,12 @@ impl BonsaiSimd for f32 {
             let wa = wdk + wdl;
             let inv = one / wa;
 
-            // Associate as `(wdk * inv) * wdl`, never `wdk * wdl * inv`. The
-            // first factor is a weight in [0, 1], so nothing can leave range.
-            // Forming the bare product first overflows f32 above 1.8e19 per
-            // factor and goes subnormal below 1.1e-19, and `ln` of the result
-            // is then a signed infinity. The scalar tier is saved from this
-            // only by widening to f64 first, which is not a guarantee, so it
-            // associates the same way.
+            // Keep `(wdk * inv) * wdl`: `wdk * wdl` first overflows f32 above
+            // 1.8e19 per factor and goes subnormal below 1.1e-19.
             let reduced = (wdk * inv) * wdl;
             let diff = ml - mk;
             lanes += reduced.ln() - reduced * diff * diff;
 
-            // Convex combination, not a ratio of sums; see the scalar kernel.
             store8(diff.mul_add(wdl * inv, mk), &mut m_out[i..]);
             store8(wa, &mut w_out[i..]);
 
@@ -200,8 +151,34 @@ impl BonsaiSimd for f32 {
     }
 }
 
-/// Lanes in the `f64` vector type.
-const LANES_F64: usize = 4;
+/////////////////////
+// Private helpers //
+/////////////////////
+
+/// Load eight consecutive `f32` into a vector register.
+///
+/// ### Params
+///
+/// * `s` - Slice of at least eight elements
+///
+/// ### Returns
+///
+/// The first eight elements as a vector.
+#[inline(always)]
+fn load8(s: &[f32]) -> f32x8 {
+    f32x8::from([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+}
+
+/// Store a vector register into eight consecutive `f32`.
+///
+/// ### Params
+///
+/// * `v` - Vector to store
+/// * `s` - Destination of at least eight elements
+#[inline(always)]
+fn store8(v: f32x8, s: &mut [f32]) {
+    s[..LANES_F32].copy_from_slice(&v.to_array());
+}
 
 /// Load four consecutive `f64` into a vector register.
 ///
@@ -217,19 +194,15 @@ fn load4(s: &[f64]) -> f64x4 {
     f64x4::from([s[0], s[1], s[2], s[3]])
 }
 
+//////////////////////
+// Public functions //
+//////////////////////
+
 /// One Newton evaluation of the branch-length stationarity condition,
 /// vectorised.
 ///
-/// Semantics are identical to [`crate::utils::kernels::edge_newton`]; see that
-/// function for the equations.
-///
-/// This is the kernel the search spends its time in: `optimise_edge` is a
-/// bracketed Newton and every iteration is one pass over the feature axis, so
-/// it runs tens of times per candidate pair.
-///
-/// Four lanes, two lane accumulators, reduced in a fixed order so the result
-/// does not depend on how the work was scheduled. Accumulation stays in `f64`,
-/// and trees and loglikelihoods are identical to the scalar tier.
+/// Same semantics as [`crate::utils::kernels::edge_newton`]. Four `f64` lanes
+/// reduced in a fixed order, so the result is deterministic.
 ///
 /// ### Params
 ///
@@ -304,9 +277,7 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
-    /// Two effective leaves of `p` features, spanning several orders of
-    /// magnitude in precision so the logarithm is exercised over a realistic
-    /// range rather than a comfortable one.
+    /// Two effective leaves of `p` features with wide-ranging precisions.
     fn toy_pair(p: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
         let mut m_k = Vec::with_capacity(p);
         let mut w_k = Vec::with_capacity(p);
@@ -326,9 +297,7 @@ mod tests {
     fn test_vector_edge_newton_tracks_the_scalar_one() {
         use crate::utils::kernels::edge_newton;
 
-        // A length that is not a multiple of the lane count, so the tail runs,
-        // and precisions spanning several orders of magnitude so the reciprocal
-        // is exercised over the range a deep tree produces.
+        // Not a multiple of the lane count, so the tail runs.
         let p = 2053usize;
         let s: Vec<f64> = (0..p)
             .map(|g| 1e-3 * (1.0 + (g as f64 * 0.37).sin().abs() * 1e4))
@@ -347,10 +316,7 @@ mod tests {
 
     #[test]
     fn test_vector_edge_newton_is_deterministic_across_lengths() {
-        // Lane count decides which features take the vector path and which fall
-        // to the tail, so a per-feature-constant input must give a per-feature
-        // constant answer whatever the length. This is the shape of bug
-        // `test_extreme_precisions_do_not_leave_f32_range` pins for the prune.
+        // Constant input must give a per-feature constant answer at any length.
         let mut previous: Option<(f64, f64)> = None;
         for p in [3usize, 4, 7, 8, 64, 1000] {
             let s = vec![0.25f64; p];
@@ -367,8 +333,6 @@ mod tests {
 
     #[test]
     fn test_wide_ln_is_accurate_over_the_range_the_kernels_see() {
-        // Effective precisions span many orders of magnitude in a deep tree, so
-        // check the whole plausible range rather than a comfortable slice of it.
         let mut worst = 0.0f64;
         let mut x = 1e-12f32;
         while x < 1e12 {
@@ -382,8 +346,7 @@ mod tests {
 
     #[test]
     fn test_f32_simd_prune_tracks_the_f64_scalar_prune() {
-        // A length that is not a multiple of the lane count, so the tail path
-        // runs too.
+        // Not a multiple of the lane count, so the tail runs.
         let p = 4099usize;
         let (m_k, w_k, m_l, w_l) = toy_pair(p);
         let (t_k, t_l) = (0.42, 1.73);
@@ -407,15 +370,8 @@ mod tests {
 
     #[test]
     fn test_extreme_precisions_do_not_leave_f32_range() {
-        // Regression. Forming `wdk * wdl` before
-        // dividing overflowed f32 above 1.8e19 per factor and went subnormal
-        // below 1.1e-19, so `reduced.ln()` came back as a signed infinity while
-        // the scalar tier, which widens to f64 first, was fine.
-        //
-        // The lane count is part of the bug, not incidental to it: `p % 8`
-        // decides which features take the vector path and which fall to the
-        // scalar tail, so the same per-element data gave different answers at
-        // different feature counts. Hence the p = 7 against p = 8 comparison.
+        // Regression: `wdk * wdl` before dividing overflowed f32 and gave an
+        // infinite `ln`. `p % 8` picks vector versus tail, hence p = 7 against 8.
         for (precision, branch) in [(1e-25f32, 1.0f64), (1e30f32, 1e-30f64)] {
             let mut previous: Option<f64> = None;
             for p in [7usize, 8, 15, 16, 64] {
@@ -449,17 +405,8 @@ mod tests {
 
     #[test]
     fn test_f32_simd_prune_matches_the_f32_scalar_prune() {
-        // Same storage type on both sides, so this isolates the lane arithmetic
-        // and the block flushing from the cost of storing in f32. The scalar
-        // tier still widens to f64 internally, so what is being pinned is the
-        // extra error from keeping the intermediates in f32 lanes.
-        //
-        // The means are compared on an absolute tolerance. An effective mean
-        // that lands near zero between two child means of order one carries
-        // absolute error around `3 * f32::EPSILON`, which reads as a large
-        // relative error while being irrelevant: everything downstream consumes
-        // squared *differences* of means, so absolute accuracy is what the
-        // likelihood is sensitive to.
+        // Isolates the f32 lane arithmetic and block flushing. Means use an
+        // absolute tolerance: only differences of means enter the likelihood.
         let p = 2053usize;
         let (m_k, w_k, m_l, w_l) = toy_pair(p);
         let f32v = |v: &[f64]| -> Vec<f32> { v.iter().map(|&x| x as f32).collect() };

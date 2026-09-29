@@ -1,15 +1,9 @@
 //! Sanity on the GPU, when this build and this machine can reach one.
 //!
-//! Two separate questions. Whether the extension was compiled with the `gpu`
-//! feature is fixed when the wheel is built; it is on by default, because the
-//! CubeCL/wgpu code adds little to the binary. Whether there is an adapter is
-//! only answerable at runtime, and is legitimately "no" on a headless box or in
-//! a container without the Vulkan loader. [`gpu_available`] answers both at
-//! once, and asking for the GPU where it is `False` raises rather than falling
-//! back silently.
-//!
-//! The device path is `f32` throughout, whatever dtype the caller asked for:
-//! wgpu has no `f64`. `sanity-sc-rs` documents what that costs.
+//! The `gpu` feature is fixed at build time; whether wgpu finds an adapter is
+//! only known at runtime. [`gpu_available`] answers both, and asking for the GPU
+//! where it is `False` raises rather than falling back silently. The device path
+//! is `f32` throughout, since wgpu has no `f64`.
 
 use pyo3::prelude::*;
 use sanity_sc_rs::SanityOutput;
@@ -23,27 +17,10 @@ use crate::error::{BErr, BonsaiError};
 // Probe  //
 ////////////
 
-/// Whether Sanity can run on the GPU here.
-///
-/// ### Params
-///
-/// * `py` - Attached interpreter token
-///
-/// ### Returns
-///
-/// `True` only when this build has the `gpu` feature **and** wgpu resolves an
-/// adapter. Safe to call on any machine.
-#[pyfunction]
-pub fn gpu_available(py: Python<'_>) -> bool {
-    py.detach(probe)
-}
-
 /// Try to stand up a wgpu client on the default device.
 ///
-/// Acquiring a client panics rather than erroring when there is no adapter, so
-/// the attempt is caught. That is sound because the release profile pins
-/// `panic = "unwind"`, which pyo3 needs anyway. The panic hook is silenced for
-/// the duration, or merely asking prints a backtrace.
+/// Acquiring a client panics when there is no adapter, so the attempt is caught
+/// (the release profile pins `panic = "unwind"`) with the panic hook silenced.
 ///
 /// ### Returns
 ///
@@ -73,10 +50,24 @@ fn probe() -> bool {
     false
 }
 
+/// Whether Sanity can run on the GPU here.
+///
+/// ### Params
+///
+/// * `py` - Attached interpreter token
+///
+/// ### Returns
+///
+/// `True` only when this build has the `gpu` feature **and** wgpu resolves an
+/// adapter. Safe to call on any machine.
+#[pyfunction]
+pub fn gpu_available(py: Python<'_>) -> bool {
+    py.detach(probe)
+}
+
 /// Refuse a GPU request this build or machine cannot serve.
 ///
-/// Called with the interpreter attached, before the work is detached, so the
-/// refusal is a Python exception rather than a panic on a worker.
+/// Call with the interpreter attached, before detaching, so the refusal is a Python exception.
 ///
 /// ### Params
 ///

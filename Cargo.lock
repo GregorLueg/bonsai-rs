@@ -61,9 +61,9 @@ checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
 name = "ann-search-rs"
-version = "0.8.5"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "892b436854dd55270545d7c52881924bdbab8b4c9cc8424bc6f595b896b0c239"
+checksum = "db388fa481391db6af480fbfc523ce6270acc58314e812227490032c402e0ab1"
 dependencies = [
  "document-features",
  "faer",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ann-search-rs",
  "approx",
@@ -3494,9 +3494,9 @@ dependencies = [
 
 [[package]]
 name = "sanity-sc-rs"
-version = "0.1.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ed3508634abcc391841bee93b688c2f166e03336b07d7f2798b98a738a03bff"
+checksum = "3deba97f057368ff283403b21905e01a4bd7a1a4ff3b5ac97fed3abd398acd73"
 dependencies = [
  "cubecl",
  "cubecl-utils-rs",

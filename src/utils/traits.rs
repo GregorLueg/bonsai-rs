@@ -8,53 +8,18 @@ use std::ops::{AddAssign, DivAssign, MulAssign, SubAssign};
 
 /// Floating-point types that `bonsai-rs` can store node coordinates in.
 ///
-/// The bounds break down as follows. `Float`, `FromPrimitive` and
-/// `ToPrimitive` give the arithmetic and the widening to `f64` that every
-/// kernel performs before it accumulates (see the note on precision below).
-/// `BonsaiSimd` carries the vectorised feature-axis kernels, so algorithm code
-/// never names a lane width. `Send`/`Sync`/`'static` are needed because the
-/// merge-round pair scan, the bound scan of `search::bounds` and the ingest
-/// feature pass all fan out under rayon. The `*Assign`
-/// family keeps the in-place accumulation loops readable. `Debug` is there so
-/// assertion failures in the tests print something useful.
-///
-/// ### Note on precision
-///
-/// This trait governs *storage*, not accumulation. Every reduction in this
-/// crate accumulates in `f64` regardless of `T`, because the tree
-/// loglikelihood is a sum over thousands of features whose interesting
-/// differences are `O(1)` while the sum itself is `O(p)`. Storing in `f32`
-/// halves memory traffic on the dominant access pattern; accumulating in `f32`
-/// would make the convergence criterion noise.
+/// Governs storage only: every reduction in this crate accumulates in `f64`
+/// (see [`wide`] and [`narrow`]).
 ///
 /// ### `f32` storage wants centred means
 ///
-/// Every kernel reads the means only through `(m_k - m_l)^2`, so what has to
-/// survive the narrowing is the *separation between cells*, not the position of
-/// the feature. Storing an uncentred mean spends the mantissa on an offset that
-/// then cancels: the loss is governed by `|mean| / separation`, and `f32` has
-/// about seven digits to spend on it.
-///
-/// Measured on four leaves by 256 features, comparing the difference
-/// of two topologies' loglikelihoods, which is the quantity a search decides
-/// on, against the same computation in `f64`:
-///
-/// | `|mean| / separation` | relative error in the difference |
-/// |---|---|
-/// | 0 | 1.1e-6 |
-/// | 1e3 | 1.5e-6 |
-/// | 1e5 | 3.2e-4 |
-/// | 1e7 | 7.0e-2 |
-///
-/// Up to about `1e3` the error is the ordinary `f32` floor. By `1e5` the
-/// decision is wrong in its fourth digit and by `1e7` it is wrong in its first.
-/// **Note that [`crate::ingest`] does not centre**: SPEC.md section 3.1's
-/// transform is a scale, `mu / sqrt(v)`, and the feature mean of section 3.3 is
-/// used for the signal-to-noise filter and then dropped. So a caller whose raw
-/// means sit far from zero relative to their spread should centre them before
-/// asking for `f32` storage, or use `f64`. Subtracting a per-feature constant
-/// from every cell leaves the loglikelihood exactly unchanged, since only
-/// differences enter.
+/// Kernels read means only through `(m_k - m_l)^2`, so `f32` loses precision
+/// as `|mean| / separation` grows. Relative error in a loglikelihood
+/// difference, 4 leaves by 256 features: 1.1e-6 at 0, 1.5e-6 at 1e3, 3.2e-4 at
+/// 1e5, 7.0e-2 at 1e7. [`crate::ingest`] scales but does not centre, so
+/// callers whose means sit far from zero relative to their spread should
+/// centre them or use `f64`; subtracting a per-feature constant leaves the
+/// loglikelihood unchanged.
 pub trait BonsaiFloat:
     Float
     + BonsaiSimd
@@ -93,9 +58,8 @@ impl<T> BonsaiFloat for T where
 
 /// Widen a storage float to `f64` for accumulation.
 ///
-/// Every kernel goes through this rather than calling `to_f64()` and unwrapping
-/// at each site. `f32` and `f64` both convert infallibly, so the fallback is
-/// unreachable for the types this crate is used with.
+/// `f32` and `f64` convert infallibly, so the `NAN` fallback is unreachable
+/// for the types this crate is used with.
 ///
 /// ### Params
 ///

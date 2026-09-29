@@ -4017,10 +4017,10 @@ mod tests {
     #[test]
     fn test_the_two_orders_reach_the_same_topology() {
         // The paper's ordering is inherited rather than derived, so it is
-        // checked rather than assumed. Both orders recover the generating tree;
-        // see `PruneOrder::LongestBranch` for what separates them, which is
-        // move count and the final loglikelihood rather than whether they get
-        // there.
+        // checked rather than assumed. Both orders recover the generating tree.
+        // Move count is not asserted: at 32 leaves it is noise. Seed 1 takes
+        // 19 moves on macOS and 20 on Linux on the same CPU, against the random
+        // order's 19 on both (2026-09-29).
         let (p, n) = (256usize, 32usize);
         for seed in [1u64, 2] {
             let (data, w) = dataset(n, p, seed);
@@ -4044,7 +4044,6 @@ mod tests {
             .expect("spr");
             assert_eq!(robinson_foulds(&ordered.tree, &data.tree).expect("rf"), 0);
             assert_eq!(robinson_foulds(&random.tree, &data.tree).expect("rf"), 0);
-            assert!(ordered.gains.len() <= random.gains.len());
         }
     }
 

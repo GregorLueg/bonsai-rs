@@ -16,7 +16,7 @@ use numpy::{Element, IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyAr
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use sanity_sc_rs::config::{SanityParams, VarianceRule};
+use sanity_sc_rs::config::{SanityParams, VarianceRule, Verbosity as SanityVerbosity};
 use sanity_sc_rs::float::SanityFloat;
 use sanity_sc_rs::input::CountMatrix;
 
@@ -143,8 +143,11 @@ fn sanity_params(rule: &str, fixed_variance: Option<f64>) -> PyResult<SanityPara
             )));
         }
     };
+    // sanity-sc-rs 0.2 defaults to printing progress; `verbose` here covers the
+    // tree search only, so Sanity stays silent as it did before
     Ok(SanityParams {
         variance_rule,
+        verbosity: SanityVerbosity::Quiet,
         ..SanityParams::default()
     })
 }

@@ -34,6 +34,8 @@ xy = bs.layout(res.tree)  # (n_nodes, 2), edges run node -> parent
 newick = bs.to_newick(res.tree, labels=cell_names)
 ```
 
+`verbose` covers the tree search; Sanity runs silently.
+
 `cell_totals` is each cell's UMI total over **all** genes. Leave it out and the
 row sums are used, which is only right when `counts` holds every gene.
 

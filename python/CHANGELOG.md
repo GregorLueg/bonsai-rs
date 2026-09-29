@@ -1,5 +1,12 @@
 # News
 
+## 0.2.1
+
+Vendors `bonsai-rs` 0.2.1 and `sanity-sc-rs` 0.2.1.
+
+- Sanity runs silently again. `sanity-sc-rs` 0.2 prints progress by default,
+  and `verbose` covers the tree search only, as documented.
+
 ## 0.2.0
 
 Vendors `bonsai-rs` 0.2.0.

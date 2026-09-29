@@ -45,11 +45,14 @@ let out = bonsai::<f32>(&means, &sds, n_cells, n_genes, None, None, Verbosity::N
 println!("{}", write_newick(&out.tree, &cell_names)?);
 ```
 
-`out.steps` holds the loglikelihood after each of the eight search steps, so a
-dud run tells you which step did nothing. Tune via `BonsaiParams`; `None` takes
+`out.steps` holds the loglikelihood and wall time after each of the eight
+search steps, so a dud run tells you which step did nothing and a slow one
+which step took the time. Tune via `BonsaiParams`; `None` takes
 the documented defaults. `ingest::prepare` plus `bonsai_prepared` splits ingest
 from search, for your own feature selection or several parameter settings on
-one ingest.
+one ingest. Only after the tree? `BonsaiParams { skip_posteriors: true, .. }`
+leaves out the per-node posteriors, `2 * n_nodes * n_features` values that at
+100k cells run to gigabytes.
 
 `Verbosity` sets what gets printed while it runs: `Quiet` (the default) prints
 nothing, `Normal` one line per step with its loglikelihood, gain and time,
@@ -65,9 +68,13 @@ prior shrinkage (S5), drop and report ill-conditioned genes.
 bonsai-rs = { version = "0.2", features = ["sanity"] }
 ```
 
+Name Sanity through the re-export, `bonsai_rs::sanity_sc_rs`, so its types are
+the ones `from_sanity_output` takes, whatever else in your tree depends on
+`sanity-sc-rs`.
+
 ```rust
 use bonsai_rs::prelude::*;
-use sanity_sc_rs::sanity;
+use bonsai_rs::sanity_sc_rs::sanity;
 
 let post = sanity::<f32>(&counts, &cell_totals, None)?;
 let lik = from_sanity_output(&post, None)?;
@@ -88,12 +95,34 @@ The `gpu` feature runs Sanity through CubeCL/wgpu; the output goes into
 ```rust
 use cubecl::Runtime;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-use sanity_sc_rs::gpu::sanity_gpu;
+use bonsai_rs::sanity_sc_rs::gpu::sanity_gpu;
 
 let client = WgpuRuntime::client(&WgpuDevice::default());
 let post = sanity_gpu::<f32, WgpuRuntime>(&counts, &cell_totals, None, &client)?;
 let lik = from_sanity_output(&post, None)?;
 ```
+
+### Every gene, not the HVGs
+
+Both of the ingest's gene filters, the S5 conditioning check and the
+signal-to-noise cut, depend on one gene's posteriors alone. `sanity_gene_passes`
+decides them per gene, so it drops straight into Sanity's select variants and
+only the genes that would reach the tree are ever stored:
+
+```rust
+use bonsai_rs::sanity_sc_rs::sanity_select;
+
+let ingest = IngestParams::default();
+let post = sanity_select::<f32, _>(&counts, &cell_totals, None, |g| {
+    sanity_gene_passes(g.log_fold_changes, g.error_bars, g.variance, &ingest)
+})?;
+```
+
+`sanity_gpu_select` takes the same predicate on the GPU. Sanity shares nothing
+across genes but the cell totals, so the counts can also be fed in chunks of
+genes and the survivors concatenated: the same result, with memory bounded by a
+chunk. On 10,000 cells with all 16,974 genes as candidates that kept 2,751, in
+8 s on an M1 Max GPU against 570 s on its ten CPU cores.
 
 It reads Sanity's log fold changes, not the log transcription quotients: S5
 inverts a zero-mean prior. On 64 simulated cells by 300 genes, fold changes give

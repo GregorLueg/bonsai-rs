@@ -1,19 +1,14 @@
 //! The tree an SPR sweep edits, with stable node ids.
 //!
-//! The arena [`Tree`] numbers nodes by level, so an accepted move renumbers it
-//! and everything keyed by node index with it: `O(n)` a move, and a number of
-//! moves that grows with `n`. Here a node keeps its id for as long as it
-//! exists, and the arena order the search depends on is kept per level: child
-//! order, which sets the bits of every row, and rank, which sets the beam
-//! search's start points.
+//! The arena [`Tree`] renumbers on every accepted move. Here a node keeps its id
+//! while it exists, and the arena order the search depends on is kept per
+//! level: child order, which sets the bits of every row, and rank, which sets
+//! the beam search's start points.
 //!
-//! What makes that cheap is how the arena numbers a level. Every assembly SPR
-//! makes numbers the nodes of a level by the order they had before, the
-//! nodes it creates last, so a move only reorders the nodes whose height it
-//! changed, and each of those lands at the front or the back of its new
-//! level. A level is therefore a sequence edited only at its ends, plus
-//! removals, kept as a slot array with room at both ends and a Fenwick tree
-//! over the occupied slots for rank and select.
+//! An assembly numbers a level by the previous order with new nodes last, so a
+//! move reorders only nodes whose height changed, and each lands at the front
+//! or back of its new level. A level is therefore a slot array with room at both
+//! ends and a Fenwick tree over the occupied slots for rank and select.
 
 use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};
@@ -21,10 +16,9 @@ use rustc_hash::FxHashMap;
 
 /// Least room kept free at each end of a level when it is laid out.
 ///
-/// A layout costs the level's size, and happens only when an end runs out of
-/// room; leaving at least the level's own size free at each end makes that
-/// amortised constant per insertion. The floor keeps tiny levels from being
-/// laid out again on every move.
+/// Leaving at least the level's own size free at each end makes relayout
+/// amortised constant per insertion; the floor stops tiny levels relaying out
+/// on every move.
 const LEVEL_SLACK_MIN: usize = 16;
 
 ////////////

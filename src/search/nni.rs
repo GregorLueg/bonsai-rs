@@ -1,64 +1,30 @@
 //! Nearest-neighbour interchanges, generalised to polytomies
 //! (SPEC.md section 9.4).
 //!
-//! The move is three lines: pick an internal edge `k-l` with both ends
-//! internal, delete `k` and move all of its subtrees onto `l`, then run the
-//! star primitive on `l`. For four subtrees that is exactly the classical
-//! interchange, and `test_a_classical_interchange_reconnects_four_subtrees`
-//! pins it.
+//! Pick an internal edge `k-l` with both ends internal, delete `k`, move all of
+//! its subtrees onto `l`, then run the star primitive on `l`. For four subtrees
+//! that is the classical interchange.
 //!
-//! ### Why the collapse costs nothing
+//! The collapse is free: deleting `k` changes the tree only strictly inside
+//! `l`'s subtree and above `k`'s children, so every effective leaf the star
+//! needs is already in the original tree's settled rows. Each of `k`'s children
+//! sits on a branch of `t_c + t_k`, since diffusion times add along a path.
 //!
-//! Deleting `k` changes the tree only strictly inside `l`'s subtree and
-//! strictly above `k`'s children. So the effective leaf of every subtree the
-//! star needs is already in the *original* tree's settled rows: `l`'s remaining
-//! children and `k`'s children keep their down rows, and `l`'s upstream side
-//! keeps its up row. Nothing is repruned to propose a move, and one settled
-//! pair of sweeps serves every edge of a round. What the collapse does change
-//! is the branch to the centre for each of `k`'s children, which becomes
-//! `t_c + t_k`: diffusion times add along a path, so that is the length that
-//! leaves each subtree where it was.
-//!
-//! ### Two phases
-//!
-//! The random phase samples the pair to merge inside the star rather than
-//! taking the best ([`StarSelection::Weighted`]) and accepts the result
-//! unconditionally, which is meant to escape a local optimum. How much it
-//! actually escapes depends hard on the feature count, and at the counts this
-//! crate expects the answer is "not much": see [`StarSelection::Weighted`] for
-//! the measurement. The greedy phase scores an interchange at every eligible
-//! edge, performs the best, and repeats until none improves the tree.
+//! The random phase samples the merged pair ([`StarSelection::Weighted`]) and
+//! accepts unconditionally. The greedy phase scores every eligible edge,
+//! performs the best and repeats until none improves the tree.
 //!
 //! **Monotonicity.** The greedy phase never lowers the tree loglikelihood: a
-//! move is accepted only when its exact gain over the current tree clears
-//! [`StarParams::min_gain`], and that gain is the difference of two whole-tree
-//! loglikelihoods computed without sweeping either of them (see
-//! [`collapse_delta`]). The random phase gives no such guarantee and is not
-//! meant to; the collapse alone can lose a split that the resampled star does
-//! not put back.
+//! move is accepted only when its exact gain clears [`StarParams::min_gain`].
+//! The gain is never formed as a difference of whole-tree loglikelihoods; shared
+//! terms cancel symbolically and [`collapse_delta`] is three `O(p)` peels, so the
+//! rounding floor is `O(p eps)` at any `n`. The random phase gives no such
+//! guarantee.
 //!
-//! The gain is a *difference* of whole-tree loglikelihoods but it is never
-//! formed as one. Every term the two trees share cancels symbolically rather
-//! than numerically: the merge gains are `O(p)` sums over one pair each, and
-//! [`collapse_delta`] is three `O(p)` peels over the members of one star. So
-//! the rounding floor of an interchange gain is `O(p eps)` and not
-//! `O(n p eps)`, and [`StarParams::min_gain`] is the right floor for it at any
-//! `n`. [`crate::search::spr`] scores its candidates the other way, on the
-//! whole-tree figure, and needs a floor that scales with `n p`. Measured on
-//! realistic data at ten thousand cells, every accepted interchange here gained
-//! well clear of a nat and none was rounding.
-//!
-//! ### This is a topology search and only a topology search
-//!
-//! A collapse and re-resolution that puts the same subtrees back where they
-//! were is not an interchange at all: it is a reoptimisation of the three
-//! branches the star primitive creates at `l`, and it nearly always gains a
-//! little. Accepting those turns the greedy phase into an extremely expensive
-//! branch-length descent: started from the generating tree itself it runs for
-//! hundreds of rounds with the Robinson-Foulds distance to the truth pinned at
-//! zero throughout. So a proposal is discarded unless it changes the splits;
-//! branch lengths are search steps 4 and 7, which do the same job globally and
-//! for a fraction of the cost.
+//! **Topology only.** A proposal that puts the same subtrees back is a
+//! reoptimisation of the star's three new branches, not an interchange, and
+//! accepting it turns the phase into a slow branch-length descent. Such
+//! proposals are discarded; branch lengths belong to search steps 4 and 7.
 
 use crate::errors::BonsaiErrors;
 use crate::model::global::UpState;
@@ -86,84 +52,54 @@ use std::time::Instant;
 
 /// Smallest star an interchange can do anything with.
 ///
-/// One more than the three members the star primitive stops at: a collapse that
-/// leaves three members has nothing to merge, and splicing it back would only
-/// throw away the split that `k` carried. Those edges are skipped rather than
-/// proposed and rejected.
+/// One more than the three members the star primitive stops at: a collapse
+/// leaving three has nothing to merge. Such edges are skipped.
 const MIN_INTERCHANGE_MEMBERS: usize = 4;
 
 /// Default for [`NniParams::max_rounds`].
 ///
-/// A runaway guard and not a working limit. Every accepted greedy move raises
-/// the tree loglikelihood by more than [`StarParams::min_gain`] and the
-/// loglikelihood is bounded above, so the phase terminates on its own; this
-/// only bounds how long it can take to notice.
-///
-/// One round performs one move, so the requirement is the number of
-/// interchanges between the starting topology and the local optimum, and that
-/// grows with the leaf count. Measured from a ladder at the step 4 optimum,
-/// running to a Robinson-Foulds distance of zero from the generating tree, it
-/// comes out a shade under one round per leaf. The default therefore covers
-/// roughly ten thousand leaves; beyond that a caller should raise it rather
-/// than accept a truncated search.
+/// A runaway guard: every accepted move raises the loglikelihood by more than
+/// [`StarParams::min_gain`], so the phase terminates on its own. One round is
+/// one move and needs a shade under one round per leaf (measured from the step
+/// 4 optimum to Robinson-Foulds zero), so this covers roughly ten thousand
+/// leaves; raise it beyond that.
 const DEFAULT_MAX_ROUNDS: usize = 10_000;
 
 /// Default for [`NniParams::n_random`].
 ///
-/// Zero: the random phase is opt-in. It is a diversification budget traded
-/// against wall time, nothing in SPEC.md fixes one, and any constant here would
-/// be a number this crate invented and then had to defend.
-///
-/// It is also weaker than it looks at the feature counts this crate expects.
-/// The sampling weight is a softmax over tree loglikelihoods, whose gaps are
-/// `O(p)` nats, so it concentrates on the greedy pick as `p` grows. Measured
-/// over seeds at a fixed leaf count, the fraction that move the tree off its
-/// starting topology at all falls away by a couple of hundred features. So a
-/// budget buys real diversification on small feature sets and mostly buys
-/// branch-length reoptimisation on large ones.
+/// Zero: the random phase is opt-in and SPEC.md fixes no budget. The softmax
+/// over loglikelihoods concentrates on the greedy pick as `p` grows, so it
+/// diversifies only on small feature sets.
 const DEFAULT_RANDOM_MOVES: usize = 0;
 
 /// Default for [`NniParams::n_restarts`].
 ///
-/// Zero: one random phase, if any, then one greedy phase, which is the
-/// composition SPEC.md section 9.4 describes. Measured against iterated local
-/// search; see [`nni`].
+/// Zero: one random phase, if any, then one greedy phase (SPEC.md section 9.4).
 const DEFAULT_RESTARTS: usize = 0;
 
 /// Default for [`NniParams::temperature`].
 ///
 /// One is the specification's distribution: weights proportional to the
-/// likelihood of the resulting tree. Ours only in the sense of being the
-/// neutral setting; see [`nni_random`].
+/// likelihood of the resulting tree.
 pub const DEFAULT_RANDOM_TEMPERATURE: f64 = 1.0;
 
 /// Default for [`NniApprox::rescore_radius`].
 ///
-/// Measured 2026-09-25, steps 5 to 8 from the same step-4 tree with the
-/// default SPR, scored against the generating tree, on balanced,
-/// random-branch and unbalanced trees at noise 0.4, 1.0 and 1.6 at 4,096 by
-/// 1,000 and on the four Sanity-preprocessed configurations. At radius five
-/// the finished tree matched the exact phase on all thirteen: loglikelihood,
-/// Robinson-Foulds and distance recovery to the last printed digit. Step 6
-/// went 7.6 s to 1.5 s, 12.0 s to 2.1 s and 13.2 s to 2.3 s on the three noisy
-/// synthetic trees, 29.6 s to 5.9 s at 5,000 cells and 99.4 s to 16.5 s at
-/// 10,000. On step 6 alone, radius three lost 7.5 nats at 5,000 cells and
-/// radius two 0.01; five was identical at both sizes.
+/// Measured 2026-09-25 on thirteen datasets: radius five matched the exact
+/// phase in loglikelihood, Robinson-Foulds and distance recovery on all of them
+/// (radius three lost 7.5 nats at 5,000 cells).
 const DEFAULT_RESCORE_RADIUS: usize = 5;
 
 /// Knobs of the approximate greedy phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NniApprox {
     /// After a move, rescore only the edges within this many edges of a clade
-    /// the move created, and keep every other edge's gain from the round it
-    /// was last scored in.
+    /// the move created; other edges keep their cached gain.
     ///
-    /// Lazy greedy evaluation (Minoux, *Optimization Techniques*, 1978): the
-    /// leading cached gain is rescored on the current tree before it is taken,
-    /// and taken only if it still beats the runner-up, so every accepted move
-    /// is scored exactly. What a stale gain can do is hide an edge that has
-    /// become improving; a full scan runs whenever the cache has nothing left,
-    /// so the phase still stops only on a tree where no edge improves.
+    /// Lazy greedy evaluation (Minoux, 1978): the leading cached gain is
+    /// rescored before it is taken, so every accepted move is scored exactly. A
+    /// full scan runs whenever the cache has nothing left, so the phase stops
+    /// only where no edge improves.
     pub rescore_radius: usize,
 }
 
@@ -188,9 +124,7 @@ pub enum NniSearch {
     /// Score every eligible edge every round and take the best, as SPEC.md
     /// section 9.4 specifies.
     Exact,
-    /// Lazy rescoring, see [`NniApprox`]. The default: the same finished
-    /// tree as [`NniSearch::Exact`] on every dataset measured, and five to
-    /// eight times faster on the noisy ones.
+    /// Lazy rescoring, see [`NniApprox`]. The default.
     Approximate(NniApprox),
 }
 
@@ -208,9 +142,8 @@ impl Default for NniSearch {
 /// Tuning knobs for search step 6.
 #[derive(Clone, Copy, Debug)]
 pub struct NniParams {
-    /// Star primitive knobs. The greedy phase uses these as they stand; the
-    /// random phase overrides [`StarParams::selection`] with its own seed per
-    /// move and leaves everything else alone.
+    /// Star primitive knobs. The random phase overrides
+    /// [`StarParams::selection`] per move.
     pub star: StarParams,
     /// Number of randomised moves performed before the greedy phase.
     pub n_random: usize,
@@ -219,9 +152,8 @@ pub struct NniParams {
     /// Cap on greedy rounds.
     pub max_rounds: usize,
     /// Number of perturb-and-climb repeats after the first greedy phase, each
-    /// of `n_random` random moves from the best tree so far followed by a
-    /// greedy phase, keeping the best tree seen. Zero runs the two phases once
-    /// each, in the order the specification gives them.
+    /// of `n_random` random moves from the best tree so far then a greedy phase.
+    /// The best tree seen is kept.
     pub n_restarts: usize,
     /// Softmax temperature of the random phase's pair draw.
     pub temperature: f64,
@@ -257,13 +189,9 @@ impl Default for NniParams {
 pub struct NniResult {
     /// The tree the phase finished on.
     pub tree: Tree,
-    /// Its loglikelihood, from [`NodeState::prune`] on the tree itself.
-    ///
-    /// The exact greedy phase settles the tree at the top of every round and
-    /// stops on a round that finds no move, so what comes back is that round's
-    /// own sweep; a run truncated by [`NniParams::max_rounds`] returns the last
-    /// sweep plus the accepted gains instead. The approximate phase sweeps once
-    /// at the end.
+    /// Its loglikelihood, from [`NodeState::prune`] on the tree itself. A run
+    /// truncated by [`NniParams::max_rounds`] returns the last sweep plus the
+    /// accepted gains instead.
     pub loglik: f64,
     /// Number of moves performed.
     pub n_moves: usize,
@@ -282,10 +210,8 @@ type ScannedEdge<T> = (f64, Option<(f64, u32, CentreStar<T>)>);
 
 /// Where an interchange reads its effective leaves from.
 ///
-/// A settled pair of sweeps, or [`LazyRows`] over a store kept current move by
-/// move. Both give the same bits for every row ([`LazyRows`] is gated on that
-/// against a full settle), so which one a caller hands in changes the cost and
-/// never the answer.
+/// A settled pair of sweeps, or [`LiveRows`] over a store kept current move by
+/// move. Both give the same bits for every row.
 trait EdgeRows<T> {
     /// Down row of a node: its subtree collapsed onto it.
     ///
@@ -375,10 +301,8 @@ fn interchange_members(tree: &impl Topology, k: u32) -> Option<usize> {
 
 /// Build the star at `l` that deleting `k` leaves behind.
 ///
-/// The members are `l`'s other children on their own branches, then `k`'s
-/// children on `t_c + t_k`, then `l`'s upstream side. All of them are read off
-/// the *original* tree's settled rows; see the module docs for why that is
-/// sound.
+/// The members are `l`'s other children, then `k`'s children on `t_c + t_k`,
+/// then `l`'s upstream side, all read off the original tree's rows.
 ///
 /// ### Params
 ///
@@ -452,10 +376,7 @@ fn collapsed_star<T: BonsaiFloat>(
 /// The proposed tree, or `None` if the edge is not eligible, or the error the
 /// primitive or the arena failed with.
 ///
-/// The [`Splice::gain`] that comes back is measured against the *collapsed*
-/// tree and not against `tree`, because the collapse happened before the star
-/// was scored. Callers that need the gain of the move itself take the
-/// difference of two [`NodeState::prune`] calls, which is what both phases do.
+/// [`Splice::gain`] is measured against the collapsed tree, not `tree`.
 pub fn interchange_at<T: BonsaiFloat>(
     tree: &Tree,
     down: &NodeState<T>,
@@ -473,11 +394,10 @@ pub fn interchange_at<T: BonsaiFloat>(
 // Exact gain //
 ////////////////
 
-/// Scratch for the local peels, reused across the candidates of a round.
+/// Scratch for the local peels, reused across candidates.
 ///
-/// [`prune_general`] writes the peeled node's own effective leaf as well as
-/// returning its contribution. Nothing here reads the leaf, so the two
-/// destination rows exist only to be overwritten.
+/// [`prune_general`] writes the peeled node's effective leaf, which is never
+/// read.
 struct PeelScratch<T> {
     /// Effective means of the peeled node, written and discarded.
     means: Vec<T>,
@@ -538,23 +458,14 @@ impl<T: BonsaiFloat> PeelScratch<T> {
 
 /// What the collapse alone did to the loglikelihood.
 ///
-/// [`Splice::gain`] is exact against the *collapsed* tree, so the gain of the
-/// interchange itself is that plus this. Deleting `k` changes the tree only at
-/// `l`: rooted there, the loglikelihood is the contributions of the members'
-/// own subtrees, plus the contribution of everything outside, plus the
-/// contributions of the nodes of the local topology. The first two are
-/// identical either side of the collapse and cancel, so what is left is three
-/// peels over a handful of members and not two sweeps over the tree.
+/// The interchange's gain is [`Splice::gain`] (against the collapsed tree) plus
+/// this. Only the local topology differs: before, `k` peels its children and
+/// `l` peels its own children and upstream side; after, `l` peels the star's
+/// members. Everything else cancels, leaving three peels.
 ///
-/// Before, the local topology is `k` peeling its children and `l` peeling its
-/// own children and its upstream side. After, it is `l` peeling the collapsed
-/// star's members and nothing else.
-///
-/// **The kernel is [`prune_general`] on both sides, deliberately.**
-/// [`NodeState::prune`] would use the binary kernel for a binary `k`, and the
-/// two agree only to rounding. Nothing here is ever differenced against the
-/// tree's own sweep, only against another peel of this routine's, so the
-/// difference is exact in the algebra and loses nothing to the mismatch.
+/// The kernel is [`prune_general`] on both sides deliberately: it is only ever
+/// differenced against itself, never against [`NodeState::prune`], which may use
+/// the binary kernel and agrees only to rounding.
 ///
 /// ### Params
 ///
@@ -608,29 +519,15 @@ fn collapse_delta<T: BonsaiFloat>(
 /// Whether a resolved star puts back exactly the split the deleted edge
 /// carried, and so proposes no interchange at all.
 ///
-/// This is the structural form of the filter the module docs argue for, and it
-/// has to reject exactly what a split fingerprint of the spliced tree would.
-/// The two agree because the star region's splits are enumerable. Every member
-/// contributes the split "my leaves against the rest" on the edge above it, in
-/// the tree the star came from and in every tree the primitive can build from
-/// it. What differs is one split per internal node of the local topology: the
-/// edge `k-l` before, one edge per ancestor after. So the proposal changes
-/// nothing iff its ancestors carry the same bipartitions of the member set as
-/// `k` did.
+/// Rejects exactly what a [`crate::search::split_fingerprint`] comparison of the
+/// spliced tree would. Every member's own edge is shared, so only the splits of
+/// the star's ancestors against the edge `k-l` matter. Ancestors are nested, so
+/// a match is one ancestor covering `k`'s children (`K`) or all the other
+/// members (the complement, the same unrooted split). Membership is decided by
+/// counts: `|K|` members all in `K`, or `m - |K|` members none in `K`.
 ///
-/// Distinct ancestors are nested and so carry distinct bipartitions, which
-/// leaves exactly two ways to match: the one ancestor covers `k`'s children, or
-/// it covers all the other members. Both give the same *unrooted* split, and
-/// [`crate::search::split_fingerprint`] canonicalises a split against its
-/// complement, so both have to be rejected. Membership is decided on two counts
-/// rather than on a set: a subset of the members that has `|K|` members of
-/// which `|K|` are in `K` is `K`, and one with `m - |K|` members of which none
-/// are in `K` is its complement.
-///
-/// The triviality test is the fingerprint's: a split with fewer than two leaves
-/// on a side is carried by every tree over these leaves, so it is not part of
-/// the comparison. It can only bite where `k`'s own edge is trivial, which
-/// needs `l` to be a root of degree two with a leaf on its other side.
+/// Splits with fewer than two leaves on a side are trivial and skipped, as in
+/// the fingerprint.
 ///
 /// ### Params
 ///
@@ -723,14 +620,7 @@ fn scan_edge<T: BonsaiFloat>(
     if result.merges.is_empty() {
         return Ok(nothing);
     }
-    // A proposal that puts the same subtrees back where they were is not an
-    // interchange: it is a reoptimisation of the three branches the star
-    // primitive creates at `l`. Those nearly always gain a little, and taking
-    // them turns the phase into branch-length descent that steps 4 and 7 do
-    // properly and far more cheaply. Started from the generating tree itself,
-    // accepting them runs hundreds of rounds with the Robinson-Foulds distance
-    // pinned at zero throughout: every one of those rounds is branch lengths
-    // and none is topology.
+    // Discard proposals that leave the splits unchanged (see module docs).
     let k_lo = tree.children(l).len() - 1;
     let k_hi = k_lo + tree.children(k).len();
     let last = star.member_nodes.len() - 1;
@@ -761,11 +651,9 @@ fn scan_edge<T: BonsaiFloat>(
 
 /// Perform an interchange: resolve its star and splice the result in.
 ///
-/// Numbered by [`assemble`] rather than by
-/// [`crate::search::polytomy::splice_star`]'s post-order rebuild: a level keeps
-/// the order its nodes had, the ancestors the splice made last, so a move
-/// reorders only the nodes whose height it changed. That is what lets the lazy
-/// phase keep its tree up to date locally.
+/// Numbered by [`assemble`] rather than by the post-order rebuild of
+/// [`crate::search::polytomy::splice_star`], so a move reorders only nodes whose
+/// height changed. The lazy phase relies on that.
 ///
 /// ### Params
 ///
@@ -808,205 +696,9 @@ fn perform<T: BonsaiFloat>(
     Ok((next, to_old))
 }
 
-/////////////
-// Phases //
-/////////////
-
-/// The random phase: `n_random` interchanges with the merge sampled rather than
-/// chosen, accepted whatever they do to the tree.
-///
-/// The edge is drawn uniformly from the eligible ones and the star's own seed
-/// is drawn from the same stream, so the whole phase is a function of
-/// [`NniParams::seed`] and the tree. Nothing here reduces over rayon, and the
-/// sampling inside the star is done over a fixed candidate order, so the result
-/// does not depend on the thread count.
-///
-/// ### Params
-///
-/// * `tree` - Tree to move away from; not modified
-/// * `leaves` - The leaf data
-/// * `params` - Knobs, or `None` for the defaults, whose `n_random` is zero
-///
-/// ### Returns
-///
-/// The tree the phase finished on, which may be worse than the one it started
-/// from, or the error the primitive or the arena failed with.
-pub fn nni_random<T: BonsaiFloat>(
-    tree: &Tree,
-    leaves: Leaves<'_, T>,
-    params: Option<NniParams>,
-) -> Result<NniResult, BonsaiErrors> {
-    let params = params.unwrap_or_default();
-    let mut rng = SplitMix64::new(params.seed);
-    let mut tree = tree.clone();
-    let mut n_moves = 0usize;
-
-    for _ in 0..params.n_random {
-        let eligible: Vec<u32> = tree
-            .internal_postorder()
-            .filter(|&k| interchange_members(&tree, k).is_some())
-            .collect();
-        if eligible.is_empty() {
-            break;
-        }
-        let draw = (rng.uniform() * eligible.len() as f64) as usize;
-        let k = eligible[draw.min(eligible.len() - 1)];
-        let star = StarParams {
-            selection: StarSelection::Weighted {
-                seed: rng.next_u64(),
-                temperature: params.temperature,
-            },
-            ..params.star
-        };
-
-        let (down, up, _) = settle(&tree, leaves)?;
-        if let Some(spliced) = interchange_at(&tree, &down, &up, k, Some(star))? {
-            tree = spliced.tree;
-            n_moves += 1;
-        }
-    }
-
-    let loglik = tree_loglik(&tree, leaves)?;
-    Ok(NniResult {
-        tree,
-        loglik,
-        n_moves,
-        rounds: 0,
-    })
-}
-
-/// The greedy phase: score an interchange at every eligible edge, perform the
-/// best, repeat until none improves the tree.
-///
-/// Every candidate is scored by the exact loglikelihood gain of the tree it
-/// would produce, so the accepted move is an improvement in the quantity that
-/// actually matters rather than in the star primitive's local gain, which is
-/// measured against the collapsed tree and not against this one. That makes the
-/// phase monotone by construction. A candidate whose splits match the current
-/// tree's is discarded before it is scored; see the module docs.
-///
-/// Edges are visited in ascending node order and ties go to the lower node, so
-/// the round's winner is fixed. The scan is sequential, and it is the one place
-/// in the search that could be parallel and is not: every candidate reads the
-/// same settled rows and writes nothing, so only the reduction over gains would
-/// need ordering. It has not been worth it since the topology filter took a
-/// round to linear in the leaf count.
-///
-/// ### A round is linear in the leaf count
-///
-/// Nothing whole-tree happens per candidate. The exact gain is
-/// [`Splice::gain`] plus [`collapse_delta`], both of which read a handful of
-/// members; the topology filter is [`rebuilds_the_same_splits`], which counts
-/// members under the star's own ancestors instead of splicing a tree and
-/// fingerprinting it. Only the winner is ever spliced, once, at the end of the
-/// round. What is left per round is the one settling sweep every candidate
-/// reads its rows from, and the star primitive itself once per edge.
-///
-/// A round is linear in the leaf count on this arrangement, against
-/// superlinear when the filter spliced a tree per candidate.
-///
-/// **What was expensive was not what it looked like.** The `O(n p)` re-prune
-/// per candidate is nearly free at this point in the search, because the
-/// topology filter discards almost everything before it: near convergence at
-/// most one eligible edge per round changes a split at all. The cost was the
-/// filter itself, which spliced a whole tree and fingerprinted it to answer a
-/// question about one star's ancestors. Scoring on the exact gain rather than
-/// on a re-prune is also what makes the *other* end of the search cheap, where
-/// the tree is far from converged and a large fraction of proposals do change
-/// a split.
-///
-/// ### Params
-///
-/// * `tree` - Tree to improve; not modified
-/// * `leaves` - The leaf data
-/// * `params` - Knobs, or `None` for the defaults
-///
-/// ### Returns
-///
-/// The improved tree, whose loglikelihood is never below the input's, or the
-/// error the primitive or the arena failed with.
-pub fn nni_greedy<T: BonsaiFloat>(
-    tree: &Tree,
-    leaves: Leaves<'_, T>,
-    params: Option<NniParams>,
-) -> Result<NniResult, BonsaiErrors> {
-    let params = params.unwrap_or_default();
-    if let NniSearch::Approximate(approx) = params.search {
-        return nni_lazy(tree, leaves, params, approx.rescore_radius);
-    }
-    let mut tree = tree.clone();
-    let mut best: Option<f64> = None;
-    let mut n_moves = 0usize;
-    let mut rounds = 0usize;
-
-    while rounds < params.max_rounds {
-        rounds += 1;
-        let (down, up, loglik) = settle(&tree, leaves)?;
-        best = Some(loglik);
-        let below = leaves_below(&tree);
-
-        // Every edge is scored against the same settled rows and nothing in the
-        // scan writes to the tree, so the candidates are independent and the
-        // round is parallel. The reduction keeps only the running best rather
-        // than collecting, because a `CentreStar` carries its members' rows and
-        // one per edge would be gigabytes at atlas scale.
-        //
-        // **Determinism.** The sequential scan took the first strict maximum in
-        // `internal_postorder`, which the arena invariant makes ascending node
-        // order, so the reduction breaks ties on the lower node id and the
-        // winner is the same at any thread count. No float is summed across
-        // candidates, so there is nothing else for the order to change.
-        let edges: Vec<u32> = tree.internal_postorder().collect();
-        let winner = edges
-            .par_iter()
-            .map_init(
-                || PeelScratch::<T>::new(leaves.n_features),
-                |scratch, &k| {
-                    let rows = Settled {
-                        down: &down,
-                        up: &up,
-                    };
-                    scan_edge(&tree, &rows, &below, k, params.star, scratch).map(|(_, p)| p)
-                },
-            )
-            .try_reduce(
-                || None,
-                |a, b| {
-                    Ok(match (a, b) {
-                        (None, other) | (other, None) => other,
-                        (Some(x), Some(y)) => {
-                            if y.0 > x.0 || (y.0 == x.0 && y.1 < x.1) {
-                                Some(y)
-                            } else {
-                                Some(x)
-                            }
-                        }
-                    })
-                },
-            )?;
-
-        match winner {
-            None => break,
-            Some((gain, _, star)) => {
-                tree = perform(&tree, &star, params.star)?.0;
-                best = Some(loglik + gain);
-                n_moves += 1;
-            }
-        }
-    }
-
-    let loglik = match best {
-        Some(loglik) => loglik,
-        // Only reachable at `max_rounds` zero, where the loop never ran.
-        None => tree_loglik(&tree, leaves)?,
-    };
-    Ok(NniResult {
-        tree,
-        loglik,
-        n_moves,
-        rounds,
-    })
-}
+////////////////
+// Lazy phase //
+////////////////
 
 /// A cached gain as a sort key, highest first.
 #[derive(Clone, Copy, Debug)]
@@ -1105,114 +797,6 @@ impl Leaders {
     }
 }
 
-/// One node's up row, from its parent's.
-///
-/// [`crate::search::spr::LazyRows`]'s expressions over the live tree, so the
-/// bits are the up sweep's.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `store` - Its down rows
-/// * `c` - The node
-/// * `above` - Its parent's up row, `None` at the root
-///
-/// ### Returns
-///
-/// The node's up row.
-fn up_row_of<T: BonsaiFloat>(
-    tree: &LiveTree,
-    store: &RowStore<T>,
-    c: u32,
-    above: Option<&Row<T>>,
-) -> Row<T> {
-    let Some(a) = tree.parent(c) else {
-        return root_up(store.n_features());
-    };
-    let above = above.expect("a parent's up row is formed before its children's");
-    let kids = tree.children(a);
-    let side = if kids.len() == 2 {
-        let o = if kids[0] == c { kids[1] } else { kids[0] };
-        UpSide::Sibling(tree.branch(o), store.means(o), store.precisions(o))
-    } else {
-        UpSide::Parent(
-            store.means(a),
-            store.precisions(a),
-            tree.branch(c),
-            store.means(c),
-            store.precisions(c),
-        )
-    };
-    up_step(
-        tree.parent(a).is_none(),
-        tree.branch(a),
-        (&above.0, &above.1),
-        side,
-    )
-}
-
-/// Form the up rows of some nodes and of every ancestor of them.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `store` - Its down rows
-/// * `nodes` - The nodes whose up rows are wanted
-/// * `up` - Rows formed so far this round, extended
-fn fill_up<T: BonsaiFloat>(
-    tree: &LiveTree,
-    store: &RowStore<T>,
-    nodes: impl Iterator<Item = u32>,
-    up: &mut FxHashMap<u32, Row<T>>,
-) {
-    let mut need: Vec<u32> = Vec::new();
-    let mut seen: FxHashSet<u32> = FxHashSet::default();
-    for v in nodes {
-        let mut u = v;
-        while !up.contains_key(&u) && seen.insert(u) {
-            need.push(u);
-            match tree.parent(u) {
-                Some(a) => u = a,
-                None => break,
-            }
-        }
-    }
-    // A parent is taller than its children, so tallest first is top-down.
-    need.sort_unstable_by_key(|&u| std::cmp::Reverse(tree.height(u)));
-    for u in need {
-        let row = up_row_of(tree, store, u, tree.parent(u).map(|a| &up[&a]));
-        up.insert(u, row);
-    }
-}
-
-/// Form the up row of every internal node, a level at a time.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `store` - Its down rows
-///
-/// ### Returns
-///
-/// Up rows by node id.
-fn fill_up_all<T: BonsaiFloat>(tree: &LiveTree, store: &RowStore<T>) -> FxHashMap<u32, Row<T>> {
-    let mut up: FxHashMap<u32, Row<T>> = FxHashMap::default();
-    for h in (1..=tree.n_levels() as u32).rev() {
-        let nodes = tree.level_nodes(h);
-        let rows: Vec<(u32, Row<T>)> = nodes
-            .par_iter()
-            .map(|&c| {
-                (
-                    c,
-                    up_row_of(tree, store, c, tree.parent(c).map(|a| &up[&a])),
-                )
-            })
-            .collect();
-        up.extend(rows);
-    }
-    up
-}
-
 /// What the lazy phase keeps about the tree between moves, by node id.
 struct Lazy<T> {
     /// The tree.
@@ -1230,11 +814,8 @@ struct Lazy<T> {
 impl<T: BonsaiFloat> Lazy<T> {
     /// Perform an interchange in place, as [`perform`] numbers it.
     ///
-    /// The collapse deletes `k` and the splice hangs the star's members under
-    /// the ancestors the primitive made; only those ancestors, the centre and
-    /// the path above it change their rows or their heights. Leaf sets move
-    /// between them: with the upstream side merged, an ancestor takes over the
-    /// centre's old leaf set and the centre the deleted node's.
+    /// Only the ancestors the primitive made, the centre and the path above it
+    /// change rows or heights.
     ///
     /// ### Params
     ///
@@ -1444,27 +1025,127 @@ impl<T: BonsaiFloat> Lazy<T> {
     }
 }
 
+/// One node's up row, from its parent's.
+///
+/// [`crate::search::spr::LazyRows`]'s expressions over the live tree, so the
+/// bits are the up sweep's.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `store` - Its down rows
+/// * `c` - The node
+/// * `above` - Its parent's up row, `None` at the root
+///
+/// ### Returns
+///
+/// The node's up row.
+fn up_row_of<T: BonsaiFloat>(
+    tree: &LiveTree,
+    store: &RowStore<T>,
+    c: u32,
+    above: Option<&Row<T>>,
+) -> Row<T> {
+    let Some(a) = tree.parent(c) else {
+        return root_up(store.n_features());
+    };
+    let above = above.expect("a parent's up row is formed before its children's");
+    let kids = tree.children(a);
+    let side = if kids.len() == 2 {
+        let o = if kids[0] == c { kids[1] } else { kids[0] };
+        UpSide::Sibling(tree.branch(o), store.means(o), store.precisions(o))
+    } else {
+        UpSide::Parent(
+            store.means(a),
+            store.precisions(a),
+            tree.branch(c),
+            store.means(c),
+            store.precisions(c),
+        )
+    };
+    up_step(
+        tree.parent(a).is_none(),
+        tree.branch(a),
+        (&above.0, &above.1),
+        side,
+    )
+}
+
+/// Form the up rows of some nodes and of every ancestor of them.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `store` - Its down rows
+/// * `nodes` - The nodes whose up rows are wanted
+/// * `up` - Rows formed so far this round, extended
+fn fill_up<T: BonsaiFloat>(
+    tree: &LiveTree,
+    store: &RowStore<T>,
+    nodes: impl Iterator<Item = u32>,
+    up: &mut FxHashMap<u32, Row<T>>,
+) {
+    let mut need: Vec<u32> = Vec::new();
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    for v in nodes {
+        let mut u = v;
+        while !up.contains_key(&u) && seen.insert(u) {
+            need.push(u);
+            match tree.parent(u) {
+                Some(a) => u = a,
+                None => break,
+            }
+        }
+    }
+    // A parent is taller than its children, so tallest first is top-down.
+    need.sort_unstable_by_key(|&u| std::cmp::Reverse(tree.height(u)));
+    for u in need {
+        let row = up_row_of(tree, store, u, tree.parent(u).map(|a| &up[&a]));
+        up.insert(u, row);
+    }
+}
+
+/// Form the up row of every internal node, a level at a time.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `store` - Its down rows
+///
+/// ### Returns
+///
+/// Up rows by node id.
+fn fill_up_all<T: BonsaiFloat>(tree: &LiveTree, store: &RowStore<T>) -> FxHashMap<u32, Row<T>> {
+    let mut up: FxHashMap<u32, Row<T>> = FxHashMap::default();
+    for h in (1..=tree.n_levels() as u32).rev() {
+        let nodes = tree.level_nodes(h);
+        let rows: Vec<(u32, Row<T>)> = nodes
+            .par_iter()
+            .map(|&c| {
+                (
+                    c,
+                    up_row_of(tree, store, c, tree.parent(c).map(|a| &up[&a])),
+                )
+            })
+            .collect();
+        up.extend(rows);
+    }
+    up
+}
+
 /// The greedy phase with cached gains, [`NniSearch::Approximate`].
 ///
-/// Round one scores every edge. After a move, only the edges within `radius`
-/// of the clades the move created lose their cached gain and are rescored; the
-/// rest keep the gain from the round they were last scored in. The move itself
-/// is chosen lazily: the leading cached gain is rescored on the current tree
-/// and taken only if it still beats the runner-up, otherwise its fresh gain goes
-/// back in the cache and the next leader is tried. When the cache holds nothing
-/// improving, the next round is a full scan, and a full scan that finds
-/// nothing ends the phase, which is the same stopping rule as the exact phase.
+/// Round one scores every edge. After a move, only edges within `radius` of the
+/// clades it created lose their cached gain. The leading cached gain is
+/// rescored and taken only if it still beats the runner-up. When the cache holds
+/// nothing improving the next round is a full scan, and a full scan that finds
+/// nothing ends the phase.
 ///
-/// The tree is a [`LiveTree`] for the length of the phase, so a move changes
-/// the rows, words and counts of the nodes on the paths it touched and nothing
-/// else. Down rows are settled once and kept in a [`RowStore`]; up rows are
-/// formed per round along the chains the scanned edges read, all of them on a
-/// full scan. Both are the sweep's own bits, so the moves are the ones a settle
-/// per round would make.
-///
-/// Edges are keyed by [`leaf_words`] of their lower end, as the cache is.
-/// Everything that decides a move is sequential and the parallel scans collect
-/// in edge order, so the result does not depend on the thread count.
+/// The tree is a [`LiveTree`] throughout, with down rows settled once in a
+/// [`RowStore`] and up rows formed per round along the chains the scans read.
+/// Both carry the sweep's own bits, so the moves match a settle per round.
+/// Cached gains are keyed by [`leaf_words`] of the lower end. Move decisions are
+/// sequential, so the result is the same at any thread count.
 ///
 /// ### Params
 ///
@@ -1614,8 +1295,7 @@ fn nni_lazy<T: BonsaiFloat>(
         }
     }
 
-    // One sweep at the end rather than one a round: the rows' own sum agrees
-    // with it only to rounding, and callers compare against sweeps.
+    // Sweep once: the rows' own sum agrees with a sweep only to rounding.
     let tree = lazy.tree.to_tree()?.0;
     let loglik = tree_loglik(&tree, leaves)?;
     Ok(NniResult {
@@ -1628,8 +1308,7 @@ fn nni_lazy<T: BonsaiFloat>(
 
 /// Every node within `radius` edges of some nodes, the nodes included.
 ///
-/// [`mark_near_new_clades`] over the live tree, from the created clades
-/// alone, so it touches only the neighbourhood it marks.
+/// Breadth-first over the live tree, touching only the neighbourhood it marks.
 ///
 /// ### Params
 ///
@@ -1744,6 +1423,167 @@ fn check_interchange<T: BonsaiFloat>(
     Ok(())
 }
 
+////////////
+// Phases //
+////////////
+
+/// The random phase: `n_random` interchanges with the merge sampled rather than
+/// chosen, accepted whatever they do to the tree.
+///
+/// The edge is drawn uniformly from the eligible ones and the star's seed from
+/// the same stream, so the phase is a function of [`NniParams::seed`] and the
+/// tree at any thread count.
+///
+/// ### Params
+///
+/// * `tree` - Tree to move away from; not modified
+/// * `leaves` - The leaf data
+/// * `params` - Knobs, or `None` for the defaults, whose `n_random` is zero
+///
+/// ### Returns
+///
+/// The tree the phase finished on, which may be worse than the one it started
+/// from, or the error the primitive or the arena failed with.
+pub fn nni_random<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+    params: Option<NniParams>,
+) -> Result<NniResult, BonsaiErrors> {
+    let params = params.unwrap_or_default();
+    let mut rng = SplitMix64::new(params.seed);
+    let mut tree = tree.clone();
+    let mut n_moves = 0usize;
+
+    for _ in 0..params.n_random {
+        let eligible: Vec<u32> = tree
+            .internal_postorder()
+            .filter(|&k| interchange_members(&tree, k).is_some())
+            .collect();
+        if eligible.is_empty() {
+            break;
+        }
+        let draw = (rng.uniform() * eligible.len() as f64) as usize;
+        let k = eligible[draw.min(eligible.len() - 1)];
+        let star = StarParams {
+            selection: StarSelection::Weighted {
+                seed: rng.next_u64(),
+                temperature: params.temperature,
+            },
+            ..params.star
+        };
+
+        let (down, up, _) = settle(&tree, leaves)?;
+        if let Some(spliced) = interchange_at(&tree, &down, &up, k, Some(star))? {
+            tree = spliced.tree;
+            n_moves += 1;
+        }
+    }
+
+    let loglik = tree_loglik(&tree, leaves)?;
+    Ok(NniResult {
+        tree,
+        loglik,
+        n_moves,
+        rounds: 0,
+    })
+}
+
+/// The greedy phase: score an interchange at every eligible edge, perform the
+/// best, repeat until none improves the tree.
+///
+/// Every candidate is scored by the exact loglikelihood gain ([`Splice::gain`]
+/// plus [`collapse_delta`]), so the phase is monotone. Candidates whose splits
+/// match the current tree's are discarded first. A round is one settling sweep
+/// plus one star resolution per edge; only the winner is spliced.
+///
+/// Edges are scanned in parallel against the same settled rows and ties go to
+/// the lower node id, so the winner is the same at any thread count.
+///
+/// ### Params
+///
+/// * `tree` - Tree to improve; not modified
+/// * `leaves` - The leaf data
+/// * `params` - Knobs, or `None` for the defaults
+///
+/// ### Returns
+///
+/// The improved tree, whose loglikelihood is never below the input's, or the
+/// error the primitive or the arena failed with.
+pub fn nni_greedy<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+    params: Option<NniParams>,
+) -> Result<NniResult, BonsaiErrors> {
+    let params = params.unwrap_or_default();
+    if let NniSearch::Approximate(approx) = params.search {
+        return nni_lazy(tree, leaves, params, approx.rescore_radius);
+    }
+    let mut tree = tree.clone();
+    let mut best: Option<f64> = None;
+    let mut n_moves = 0usize;
+    let mut rounds = 0usize;
+
+    while rounds < params.max_rounds {
+        rounds += 1;
+        let (down, up, loglik) = settle(&tree, leaves)?;
+        best = Some(loglik);
+        let below = leaves_below(&tree);
+
+        // Reduce to the running best rather than collecting: a `CentreStar`
+        // carries its members' rows. Ties go to the lower node id, as a
+        // sequential scan in arena order would.
+        let edges: Vec<u32> = tree.internal_postorder().collect();
+        let winner = edges
+            .par_iter()
+            .map_init(
+                || PeelScratch::<T>::new(leaves.n_features),
+                |scratch, &k| {
+                    let rows = Settled {
+                        down: &down,
+                        up: &up,
+                    };
+                    scan_edge(&tree, &rows, &below, k, params.star, scratch).map(|(_, p)| p)
+                },
+            )
+            .try_reduce(
+                || None,
+                |a, b| {
+                    Ok(match (a, b) {
+                        (None, other) | (other, None) => other,
+                        (Some(x), Some(y)) => {
+                            if y.0 > x.0 || (y.0 == x.0 && y.1 < x.1) {
+                                Some(y)
+                            } else {
+                                Some(x)
+                            }
+                        }
+                    })
+                },
+            )?;
+
+        match winner {
+            None => break,
+            Some((gain, _, star)) => {
+                tree = perform(&tree, &star, params.star)?.0;
+                best = Some(loglik + gain);
+                n_moves += 1;
+            }
+        }
+    }
+
+    let loglik = match best {
+        Some(loglik) => loglik,
+        // `max_rounds` zero: the loop never ran.
+        None => tree_loglik(&tree, leaves)?,
+    };
+    Ok(NniResult {
+        tree,
+        loglik,
+        n_moves,
+        rounds,
+    })
+}
+
 /// Search step 6: the random phase, then the greedy phase.
 ///
 /// ### Params
@@ -1778,9 +1618,8 @@ pub fn nni<T: BonsaiFloat>(
         );
     }
 
-    // Iterated local search: perturb the best tree so far, climb, keep the
-    // better of the two. Each restart draws from its own seed so that the
-    // walks differ, and the whole thing is still a function of `params.seed`.
+    // Iterated local search; each restart has its own seed derived from
+    // `params.seed`.
     let mut n_moves = best.n_moves;
     for restart in 0..params.n_restarts {
         let started = Instant::now();

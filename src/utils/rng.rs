@@ -1,18 +1,9 @@
 //! The crate's deterministic pseudo-random source.
 //!
-//! Fixtures, simulated datasets and benchmarks all need reproducible
-//! pseudo-randomness and nothing else: no distributional quality beyond
-//! plausible-looking spread, no cryptographic property, and above all no
-//! dependency whose next release would silently rewrite every expected value in
-//! the test suite. Splitmix64 is three lines of arithmetic, produces identical
-//! output on every platform, and is independent of thread count.
-//!
-//! Two forms of the same stream are offered. [`SplitMix64`] is stateful and is
-//! what a generator loop wants. [`splitmix64_at`] is stateless, so element `i`
-//! is a pure function of `i`, which is what a benchmark cross-checked against
-//! an external reference wants: the other side can produce the same stream
-//! without replicating a loop. `splitmix64_at(i)` is by construction the first
-//! draw of `SplitMix64::new(i)`.
+//! Splitmix64: reproducible on every platform and independent of thread count,
+//! with no dependency to rewrite expected test values. [`SplitMix64`] is
+//! stateful; [`splitmix64_at`] is stateless (element `i` is the first draw of
+//! `SplitMix64::new(i)`), so an external reference can reproduce a stream.
 
 ///////////////
 // Constants //
@@ -32,8 +23,8 @@ const MANTISSA_BITS: u32 = 53;
 
 /// Mantissa bits used for the open interval `(0, 1)`.
 ///
-/// One fewer, so that the half-bit offset that opens the upper end is still
-/// representable; see [`SplitMix64::uniform_nonzero`].
+/// One fewer, so the half-bit offset stays representable; see
+/// [`SplitMix64::uniform_nonzero`].
 const OPEN_MANTISSA_BITS: u32 = 52;
 
 //////////////
@@ -42,9 +33,7 @@ const OPEN_MANTISSA_BITS: u32 = 52;
 
 /// A splitmix64 stream.
 ///
-/// Three lines of state advance and mixing, no dependency, identical output
-/// everywhere. Seeded directly with the caller's seed, so distinct seeds give
-/// distinct streams from the first draw.
+/// Seeded directly with the caller's seed.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SplitMix64 {
     /// Stream position; advanced by [`SPLITMIX_GAMMA`] per draw.
@@ -93,19 +82,9 @@ impl SplitMix64 {
 
     /// Draw a uniform on the open interval `(0, 1)`.
     ///
-    /// Needed wherever a logarithm is taken of the variate, which is both
-    /// Box-Muller and the exponential inverse transform.
-    ///
-    /// One bit shorter than [`SplitMix64::uniform`], and offset by half a bit,
-    /// which is what keeps both ends open. `(bits + 1) / 2^53` is exactly `1.0`
-    /// on the largest of the `2^53` mantissas, whose logarithm is zero, and an
-    /// exponential of exactly zero is a variance of zero that the simulator
-    /// divides by. Half a bit does not fix that at 53:
-    /// the spacing just below `2^53` is `1`, so `2^53 - 0.5` rounds straight
-    /// back up to `2^53`. At 52 it is `0.5`, the offset survives, and the
-    /// extreme draws are `2^-53` and `1 - 2^-53`. One draw in `2^53` either way,
-    /// so this was never reachable in practice; it is fixed because the
-    /// alternative is a documented guarantee that is not one.
+    /// For logarithms of the variate. Uses 52 mantissa bits plus a half-bit
+    /// offset: at 53 bits `2^53 - 0.5` rounds back to `2^53` and would return
+    /// `1.0`. Extremes are `2^-53` and `1 - 2^-53`.
     ///
     /// ### Returns
     ///
@@ -118,11 +97,8 @@ impl SplitMix64 {
 
     /// Draw a standard normal variate by Box-Muller.
     ///
-    /// The second variate of the pair is discarded rather than cached. Caching
-    /// would halve the cost but would make the stream position depend on the
-    /// parity of previous calls, and this module interleaves normal and uniform
-    /// draws; a fixed two-uniforms-per-normal cost keeps the stream trivially
-    /// auditable.
+    /// The second variate is discarded so the stream position does not depend
+    /// on call parity.
     ///
     /// ### Returns
     ///
@@ -180,8 +156,7 @@ impl SplitMix64 {
 
     /// Draw an index uniformly from `0..n`.
     ///
-    /// Uses the low bits of a 64-bit draw. The modulo bias is on the order of
-    /// `n / 2^64` and is irrelevant for the leaf counts this module handles.
+    /// Modulo bias is of order `n / 2^64`.
     ///
     /// ### Params
     ///
@@ -198,9 +173,8 @@ impl SplitMix64 {
 
 /// One draw from the counter-based form of the stream.
 ///
-/// Stateless: element `index` is a pure function of `index`, so an external
-/// reference implementation can reproduce the stream without a loop. Equal to
-/// the first [`SplitMix64::uniform`] draw of a stream seeded at `index`.
+/// Equal to the first [`SplitMix64::uniform`] draw of a stream seeded at
+/// `index`.
 ///
 /// ### Params
 ///
@@ -261,8 +235,7 @@ mod tests {
 
     /// The seed whose first raw draw is a given word.
     ///
-    /// Splitmix64's mixing is a bijection, so the corners of the mantissa are
-    /// reachable by inverting it rather than by searching for a seed.
+    /// The mixing is a bijection, so it can be inverted.
     ///
     /// ### Params
     ///
@@ -282,10 +255,8 @@ mod tests {
 
     #[test]
     fn test_the_open_uniform_never_reaches_either_end() {
-        // `(bits + 1) / 2^53` is exactly `1.0` on the largest of the `2^53`
-        // mantissas, and `ln(1) == 0` makes
-        // `exponential` return zero from a routine documented as strictly
-        // positive. The simulator then divides by the square root of it.
+        // Corner mantissas must not give `ln(u) == 0`, else `exponential`
+        // returns zero.
         for out in [u64::MAX, 0, 2048, u64::MAX - 2047] {
             let seed = seed_for(out);
             assert_eq!(

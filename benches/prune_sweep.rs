@@ -1,30 +1,13 @@
 //! Timing harness for the pruning sweep, and the numerical check against the
-//! numpy reference in `reference/bonsai_ref.py`.
+//! numpy reference in `reference/bonsai_ref.py`. Both sides draw leaf data from
+//! the same splitmix64 stream, so the loglikelihoods are comparable.
 //!
-//! Both sides generate leaf data from the same counter-based splitmix64 stream,
-//! so the loglikelihoods are comparable to the last bit that the arithmetic
-//! allows. Run the two and compare:
+//! Balanced binary and ladder trees are swept, in `f64` and `f32` storage.
 //!
 //! ```sh
 //! cargo bench --bench prune_sweep
 //! uv run --with numpy reference/bonsai_ref.py --leaves 8192 --features 2000
 //! ```
-//!
-//! Two tree shapes are swept. Balanced binary is the friendly case: sibling
-//! rows sit next to each other and the sweep streams. The ladder is the
-//! pathological one, one node per level and maximally deep, which is what bounds
-//! the damage when a real dataset produces a deep laddery tree.
-//!
-//! Both storage widths are timed because `f32` is the fastest path and the one
-//! most likely to be used at scale, so it needs a measurement at scale of its
-//! own rather than an extrapolation from the `f64` column.
-//!
-//! **The whole prune is a couple of per cent of the pipeline**, measured and
-//! flat in feature count, so nothing done to the numbers below can buy more
-//! than that. `benches/steps.rs` is where the time actually is.
-//!
-//! Plain `main`, no criterion. The sweep is deterministic and long enough that
-//! best-of-N over a handful of repeats is stable.
 
 use bonsai_rs::model::likelihood::NodeState;
 use bonsai_rs::tree::Tree;
@@ -34,8 +17,7 @@ use std::time::Instant;
 /// Leaf counts swept, all powers of two so the balanced binary builder applies.
 const LEAF_COUNTS: [usize; 3] = [1024, 4096, 8192];
 
-/// Feature counts swept. 2000 is the scale the paper works at after the
-/// signal-to-noise filter.
+/// Feature counts swept.
 const FEATURE_COUNTS: [usize; 2] = [500, 2000];
 
 /// Repeats per configuration; the reported time is the best of these.
@@ -63,8 +45,7 @@ fn make_fixture(n_leaves: usize, n_features: usize) -> (Vec<f64>, Vec<f64>) {
 
 /// Best-of-N wall time for a closure, with a finiteness check on its result.
 ///
-/// The check is not decoration: a sweep that silently did no work would
-/// otherwise report as an excellent timing.
+/// The finiteness check catches a sweep that silently did no work.
 ///
 /// ### Params
 ///
@@ -111,9 +92,7 @@ fn main() {
 
                 let mut flat32 = NodeState::new(n, n_features, &means32, &precisions32).unwrap();
                 let (seq32, loglik32) = time(|| flat32.prune(&tree));
-                // `f32` storage still accumulates in `f64`, so the two agree far
-                // better than `f32` epsilon; loose enough to pass, tight enough
-                // that a storage path gone wrong fails.
+                // `f32` storage accumulates in `f64`, so the two agree well within this.
                 assert!((loglik32 - loglik).abs() <= 1e-4 * loglik.abs());
 
                 println!(

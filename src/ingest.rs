@@ -1,31 +1,20 @@
 //! Ingest: turning a measured dataset into what the pruning recursion consumes.
 //!
-//! Implements SPEC.md sections 3.1, 3.3 and 3.4. Three jobs, in the order a
-//! caller meets them:
+//! Implements SPEC.md sections 3.1, 3.3 and 3.4:
 //!
 //! 1. [`from_sanity`] converts Sanity posteriors into likelihood means and
-//!    error bars (S5), if that is where the data came from.
+//!    error bars (S5).
 //! 2. [`prepare`] estimates the per-feature variance `v[g]` (S8, S9), scores
-//!    every feature by signal-to-noise (S6, S10, S11), drops the features that
-//!    fail the threshold, and divides the survivors by `sqrt(v[g])` (S21).
-//! 3. The result is handed straight to
-//!    [`crate::model::likelihood::NodeState::new`].
+//!    features by signal-to-noise (S6, S10, S11), drops those below the
+//!    threshold and divides the survivors by `sqrt(v[g])` (S21).
 //!
-//! ### Units, which are the thing to get right here
+//! ### Units
 //!
-//! Two unit systems meet in this module and confusing them is the most likely
-//! silent defect in the crate.
-//!
-//! * **Raw units** are whatever the caller measured in. `means`, `sds`, the
-//!   Sanity posteriors, and every `v[g]` anywhere in this file are raw.
-//! * **Transformed units** are raw divided by `sqrt(v[g])`, so the diffusion
-//!   prior of SPEC.md section 2 has unit variance per feature and `v[g]`
-//!   vanishes from every kernel. Everything downstream of ingest is
-//!   transformed.
-//!
-//! Every field of [`PreparedData`] says which of the two it is in, and the two
-//! `transformed_` fields are the only ones that are transformed.
-//! [`PreparedData::restore_scale`] is the way back.
+//! **Raw units** are the caller's: `means`, `sds`, Sanity posteriors and every
+//! `v[g]` in this file. **Transformed units** are raw divided by `sqrt(v[g])`;
+//! everything downstream of ingest is transformed. Only the two `transformed_`
+//! fields of [`PreparedData`] are; [`PreparedData::restore_scale`] is the way
+//! back.
 
 use crate::prelude::*;
 use crate::utils::kernels::edge_newton;
@@ -36,110 +25,32 @@ use rayon::prelude::*;
 // Constants //
 ///////////////
 
-/// Features per chunk of the per-feature pass.
-///
-/// The input is row-major `[cell][feature]` and the estimator works down a
-/// feature column, so columns are gathered a chunk at a time rather than one at
-/// a time: 128 consecutive `f32` features span eight cache lines, so a chunk
-/// reads each line once and uses all of it, where one feature at a time touches
-/// one line per cell per feature.
+/// Features per chunk of the per-feature pass: 128 `f32` features span eight
+/// cache lines, so a column gather reads each line once.
 const INGEST_BLOCK: usize = 128;
 
-/// Iteration budget for the per-feature variance solve.
-///
-/// Same role as `MAX_NEWTON_ITER` in [`crate::model::branch`]: the bracket
-/// halves on every safeguarded step, so bisection alone exhausts any plausible
-/// bracket to `f64` precision in under 60 steps. A runaway guard, not a working
-/// limit.
+/// Iteration budget for the per-feature variance solve; a runaway guard, since
+/// bisection alone converges to `f64` precision in under 60 steps.
 const MAX_VARIANCE_ITER: usize = 100;
 
-/// Relative convergence tolerance on `v[g]`.
-///
-/// Set well below the precision the signal-to-noise ratio needs, so the
-/// stopping point of the solve is never what decides whether a feature is
-/// retained.
+/// Relative convergence tolerance on `v[g]`, well below what the
+/// signal-to-noise ratio needs.
 const VARIANCE_TOL: f64 = 1e-12;
 
 /// Default signal-to-noise threshold for retaining a feature.
 ///
-/// One, the paper's threshold (SPEC.md section 3.3), adopted 2026-09-25 so that
-/// a default run sees the gene panel the published method would. `S[g]` is the
-/// mean ratio of posterior signal variance to measurement error variance, so
-/// `S[g] = 1` is the point at which a feature carries as much signal as noise.
-/// It was `0.25` before, on the separation measured below; on Sanity-processed
-/// Baron data at 5,000 cells that kept 4,591 genes against 2,701 at `1`, and
-/// search time is linear in the gene count.
-///
-/// ### What was measured
-///
-/// `tree::simulate::simulate_binary` at 400 features, of which half were then
-/// replaced by pure noise: the same error bars, but means drawn from those
-/// error bars alone with no true position behind them. The two groups' `S`
-/// distributions are what the threshold has to separate. `noise_sd` is in
-/// transformed units, so `noise_sd = 1` is a feature whose measurement error
-/// equals the spread of the data and whose informative features should score
-/// `S = 1` by construction.
-///
-/// ```text
-///          informative features          pure-noise features
-/// cells    noise_sd  min S   5th pct     v[g] = 0   max S   95th pct
-///    64        0.1    91.4    105.2         55%      0.48      0.29
-///    64        0.5     3.16     4.03
-///    64        1.0     0.50     0.78
-///   128        1.0     0.68     0.89         53%      0.31      0.23
-///   512        1.0     0.99     1.14         51%      0.15      0.10
-/// ```
-///
-/// The pure-noise columns do not vary with `noise_sd`, because `S` for a
-/// feature that is only noise is scale free; they shrink with the cell count
-/// like the sampling error of a variance, so about half of those features solve
-/// to `v[g] = 0` and drop out on their own and the rest have `S` bounded by
-/// roughly `2.7 * sqrt(2/n)`.
-///
-/// `0.25` sits above the 95th percentile of the pure-noise scores at every cell
-/// count tested and below the 5th percentile of the informative scores at every
-/// cell count and noise level tested. `1` does not: in the hardest row it
-/// discards most of the informative panel, since a feature carrying exactly as
-/// much signal as noise scores `1` only in expectation and scatters below it at
-/// finite `n`. So on small or noisy datasets a caller should expect `1` to drop
-/// informative features, and can pass `0.25` through
-/// [`IngestParams::min_signal_to_noise`] to keep them.
-///
-/// ### On tree recovery
-///
-/// Recovery of `search::star::star_tree` against `noise_sd`, five seeds per
-/// cell, mean Robinson-Foulds:
-///
-/// | `noise_sd` | 64 leaves, of 122 | 128 leaves, of 250 |
-/// |---|---|---|
-/// | 0.10 | 0.0 | 0.4 |
-/// | 0.25 | 0.4 | 1.2 |
-/// | 0.50 | 3.2 | 12.8 |
-/// | 1.00 | 32.0 | 99.2 |
-/// | 2.00 | 96.0 | 212.4 |
-/// | 4.00 | 118.8 | 245.0 |
-///
-/// So the primitive recovers the tree essentially perfectly below `noise_sd`
-/// 0.25 and collapses past 1. The cliff sits where measurement noise equals the
-/// per-feature signal variance, which after the transform of section 3.1 is
-/// exactly `noise_sd = 1`, i.e. unit signal-to-noise. That is the cliff this
-/// filter exists to keep features away from.
-///
-/// The two are not directly comparable, `S` being a per-feature aggregate
-/// against a noise level uniform across features, but the recovery cliff sits
-/// nearer `1` than `0.25`, which is the other argument for the paper's value.
+/// The paper's threshold (SPEC.md section 3.3). `S[g]` is the mean ratio of
+/// posterior signal variance to measurement error variance. Small or noisy
+/// datasets lose informative features at `1`; pass a lower value through
+/// [`IngestParams::min_signal_to_noise`] to keep them (`0.25` sat above the 95th
+/// percentile of pure-noise scores in `simulate_binary` runs, 2026-09-25).
 pub const DEFAULT_MIN_SIGNAL_TO_NOISE: f64 = 1.0;
 
 /// Largest variance amplification `v / (v - eps^2)` [`from_sanity`] converts.
 ///
-/// Ours. The conversion of SPEC.md section 3.4 multiplies
-/// both the posterior mean and the posterior variance by this factor, so it
-/// diverges as the posterior approaches the prior and is undefined once
-/// `eps^2 >= v`. At the cap the returned error bar is about 32 times the
-/// posterior one, which already makes the cell effectively uninformative; the
-/// term `w * mu^2` that reaches the pruning recursion grows linearly in the
-/// factor, so letting it run to `1e6` would spend six digits of the `f64`
-/// accumulation on a cell that says nothing.
+/// Ours. The S5 conversion diverges as the posterior approaches the prior and
+/// is undefined once `eps^2 >= v`. At the cap the error bar is about 32 times
+/// the posterior one, and the `w * mu^2` term grows linearly in the factor.
 pub const MAX_SANITY_AMPLIFICATION: f64 = 1.0e3;
 
 ////////////////
@@ -424,20 +335,11 @@ fn fill_deviations(mu: &[f64], sig2: &[f64], v: f64, d2: &mut [f64]) {
 /// ```
 ///
 /// This is the branch-length condition of SPEC.md section 6 with
-/// `s -> sig_i^2`, `d -> (mu_i-mubar)^2`, `t -> v` and an overall sign flip, so
-/// it shares [`edge_newton`] and mirrors
-/// [`crate::model::branch::optimise_edge`] step for step. It could not *call*
-/// that function: `d` is not a constant here, because `mubar` depends on the
-/// unknown, so `d` has to be rebuilt at every iterate.
-///
-/// Rebuilding it keeps the problem one-dimensional rather than two-dimensional
-/// because S8 and S9 are the two partial derivatives of one objective,
-/// `-1/2 sum_i [log(v+sig_i^2) + (mu_i-mubar)^2/(v+sig_i^2)]`. S8 zeroes the
-/// `mubar` partial, so by the envelope theorem the total derivative of the
-/// profiled objective in `v` is exactly the `v` partial with `mubar(v)`
-/// substituted. The value `edge_newton` returns is therefore exact; only its
-/// *derivative* misses the `dmubar/dv` term, which makes the Newton step a
-/// quasi-Newton one. The safeguard that is already there covers that.
+/// `s -> sig_i^2`, `d -> (mu_i-mubar)^2`, `t -> v` and a sign flip, so it
+/// shares [`edge_newton`], but `d` depends on `v` through `mubar` and is rebuilt
+/// at every iterate. By the envelope theorem (S8 zeroes the `mubar` partial) the
+/// value is exact; the derivative omits `dmubar/dv`, so the Newton step is
+/// quasi-Newton and the bisection safeguard covers it.
 ///
 /// ### Params
 ///
@@ -709,20 +611,12 @@ pub fn prepare<T: BonsaiFloat>(
 ///
 /// ### The ill-conditioned case
 ///
-/// Both lines share the amplification `v / (v - eps^2)`, which diverges as the
-/// posterior widens towards the prior and is meaningless once `eps^2 >= v`.
-/// This is not a corner case: it is why the reference grew a Sanity mode
-/// returning the posterior-maximising `v[g]` instead of its expectation.
-///
-/// A feature is **dropped** if any one of its cells exceeds
-/// `params.max_sanity_amplification`, and every dropped index is returned in
-/// [`SanityLikelihood::dropped`] rather than clamped away. The whole feature
-/// rather than the cell, because the model wants a rectangular matrix and
-/// because `v[g]` is a per-feature quantity: one saturated posterior says the
-/// `v[g]` is not to be trusted for the rest of the column either. Clamping was
-/// rejected because it would put a fabricated error bar into the likelihood
-/// with no way for the caller to tell; refusing the whole run was rejected
-/// because a handful of saturated features in a large panel is normal.
+/// Both lines share the amplification `v / (v - eps^2)`, meaningless once
+/// `eps^2 >= v`. A feature is **dropped** if any cell exceeds
+/// `params.max_sanity_amplification`, and the index is returned in
+/// [`SanityLikelihood::dropped`]. Whole features, not cells: the model wants a
+/// rectangular matrix and `v[g]` is per feature. Nothing is clamped, so no
+/// fabricated error bar reaches the likelihood.
 ///
 /// ### Params
 ///
@@ -806,21 +700,12 @@ pub fn from_sanity<T: BonsaiFloat>(
 
 /// Whether one Sanity gene survives [`from_sanity`] then [`prepare`].
 ///
-/// Both of the ingest's gene filters depend on that gene's posteriors alone:
-/// the S5 conversion drops a gene if any cell's amplification `v / (v - eps^2)`
-/// exceeds `params.max_sanity_amplification`, and selection drops it if its
-/// signal-to-noise ratio `S[g]` (S6) is below `params.min_signal_to_noise`. So
-/// the decision can be taken gene by gene while Sanity runs, which is what
-/// `sanity_select` and `sanity_gpu_select` are for: only the genes that pass
-/// are ever stored.
-///
-/// Takes `f64` because the Sanity predicates see the posteriors before they
-/// are narrowed. [`from_sanity`] later scores the stored values again, so a gene
-/// right at a threshold can still be dropped there; nothing rejected here can
-/// reach the tree.
-///
-/// Two passes over the cells and no allocation: the first forms the
-/// precision-weighted mean the score is centred on, the second the score.
+/// Both ingest gene filters depend on that gene's posteriors alone (S5
+/// amplification cap, S6 signal-to-noise threshold), so `sanity_select` and
+/// `sanity_gpu_select` can decide per gene while Sanity runs. Takes `f64`
+/// because it sees the posteriors before they are narrowed: a gene at a
+/// threshold can still be dropped later by [`from_sanity`]; nothing rejected
+/// here reaches the tree. Two passes over the cells, no allocation.
 ///
 /// ### Params
 ///

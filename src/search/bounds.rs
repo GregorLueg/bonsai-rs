@@ -1,54 +1,23 @@
-//! Upper bounds on merge scores
+//! Upper bounds on merge scores (SPEC.md section 10).
 //!
-//! **Not an optimisation.** The naive search is `O(n^3 p)`: every round scores
-//! every pair, because a merge moves the root and the root enters every other
-//! pair's score through the peel of SPEC.md section 8.1. The candidate
-//! restriction of [`crate::search::candidates`] takes out one factor of `n`.
-//! This module takes out most of another, by not rescoring pairs that provably
-//! cannot win.
+//! A pair's gain depends on the centre only through the peeled remainder
+//! `(MR, WR)`, hence through the centre's effective leaf `(M_r, W_r)`. The gain
+//! is linearised in the centre's movement and maximised over the ellipsoid of
+//! SPEC.md section 10.3, giving per pair its gain and a slack per unit of centre
+//! movement. This prunes most rescoring on top of the candidate restriction of
+//! [`crate::search::candidates`].
 //!
-//! ### What the bound is
+//! **Deviation: the bound tracks the centre.** Section 10.4 adds a fixed
+//! ellipsoid's whole slack to every gain. Here the distance the centre actually
+//! travelled is accumulated per round and a pair's bound is its gain plus that
+//! distance times its unit slack. `nsteps` then only decides when the
+//! linearisation is redrawn; see [`DEFAULT_NSTEPS`].
 //!
-//! A pair's gain `dL` depends on the centre only through the peeled remainder
-//! `(MR, WR)`, and that in turn only through the centre's own effective leaf
-//! `(M_r, W_r)`. Linearise `dL` in a movement `(xi_mu, xi_w)` of the centre and
-//! maximise the linear part over the ellipsoid of plausible movements that
-//! SPEC.md section 10.3 derives. What comes out is two numbers per pair: the
-//! gain where it was scored, and how fast that gain can rise per unit of centre
-//! movement.
+//! Not a strict bound: the linearisation can underestimate.
 //!
-//! **Deviation: the bound tracks the centre rather than assuming the worst.**
-//! Section 10.4 draws a fixed ellipsoid, adds its whole slack to every gain,
-//! and asks each round whether the centre is still inside. But the maximum of a
-//! linear form over a ball of radius `R` is `R` times its maximum over the unit
-//! ball, so the same information gives an exact bound at whatever radius the
-//! centre has actually reached. So the ellipsoid is not a region to be inside;
-//! it is a metric, the distance travelled in it is accumulated round by round,
-//! and a pair's bound is its gain plus that distance times its unit slack. A
-//! pair scored last round is bounded to last round's gain and not to the worst
-//! case of a whole schedule of merges, which is where most of the pruning
-//! comes from. It also means a pair scored mid-generation needs no special
-//! treatment: its bound is its own gain in the round it was scored in.
-//!
-//! `nsteps` then decides one thing only: how far the centre may travel before
-//! the *linearisation* is redone. See [`DEFAULT_NSTEPS`].
-//!
-//! ### Honesty about what this is not
-//!
-//! It is not a strict mathematical bound. The linearisation can underestimate.
-//! Measured by scoring every offered pair every round, counting how often a
-//! true gain exceeds its recorded bound, and replaying the primitive's walk to
-//! count how often that cost the answer: on this crate's fixtures the first
-//! number is about one in a thousand and the second is zero. Both are
-//! tabulated, with the diagnosis, in [`DEFAULT_NSTEPS`].
-//!
-//! ### The derivative
-//!
-//! The flattened `d(dL)/d(W[g,r])` of the SI is a seven-term expression and is
-//! not transcribed here. It is assembled instead by the chain rule through the
-//! peel, which is four one-line partials, with `d(dL)/d(MR)` and
-//! `d(dL)/d(WR)` read off SPEC.md section 8.3. Every one of them is pinned
-//! against central differences in this module's tests.
+//! The SI's seven-term derivative is not transcribed; it is assembled by the
+//! chain rule through the peel (partials from SPEC.md section 8.3) and pinned
+//! against central differences in the tests.
 
 use crate::errors::BonsaiErrors;
 use crate::model::merge::EffLeaf;
@@ -64,142 +33,34 @@ use std::collections::HashMap;
 /// Where the online schedule starts `nsteps`: how far the centre may travel,
 /// in the metric of SPEC.md section 10.3, before every bound is redrawn.
 ///
-/// One merge moves the centre about two to three of these units, so this is
-/// `nsteps` in the section's sense to within that constant. It does not control
-/// how loose a bound is: a bound grows exactly in step with the distance the
-/// centre has actually travelled since the pair was scored. What it controls is
-/// how far the *linearisation* is stretched before it is redone, and therefore
-/// the trade between redrawing often and walking deep.
+/// One merge moves the centre about two to three of these units. It controls
+/// how far the linearisation is stretched before it is redone, not how loose a
+/// bound is.
 ///
-/// ### Where these came from
+/// Ours, measured on clustered stars of 128 members by 200 features, four
+/// seeds: the fraction of the exhaustive `349,500` pairs scored is 0.275 at 6,
+/// 0.102 at 48 and 0.170 at 192, so 48 is the floor of the bowl.
 ///
-/// Ours, chosen by measurement over clustered stars of 128 members by 200
-/// features, four seeds, wrapping [`crate::search::star::AllPairs`] so the
-/// comparison is the `349,500` pairs a star scores exhaustively in 1.68
-/// seconds. "Bounded" is the pairs the provider scored to build bounds,
-/// "walked" the pairs the primitive's walk scored, and "scored" their sum,
-/// which is the whole cost.
-///
-/// | `nsteps` | redraws | bounded | walked | scored | fraction | seconds |
-/// |---|---|---|---|---|---|---|
-/// | 6 | 25.2 | 93,644 | 2,633 | 96,276 | 0.275 | 0.586 |
-/// | 12 | 14.0 | 56,134 | 5,045 | 61,179 | 0.175 | 0.411 |
-/// | 24 | 7.8 | 35,459 | 8,413 | 43,872 | 0.126 | 0.336 |
-/// | 48 | 4.2 | 24,963 | 10,573 | 35,536 | 0.102 | 0.289 |
-/// | 96 | 3.0 | 19,893 | 19,297 | 39,190 | 0.112 | 0.357 |
-/// | 192 | 2.0 | 17,351 | 42,157 | 59,508 | 0.170 | 0.594 |
-///
-/// A bowl with its floor at 48, where the two halves are within a factor of
-/// two of each other. That is a factor of ten in pairs and six in wall
-/// time, and it widens with the star: the exhaustive term is `O(n^3 p)` and
-/// this one is much flatter.
-///
-/// ### How it composes, and how it scales
-///
-/// Same fixtures at 200 features, defaults throughout, four seeds. The
-/// `k`-nearest-neighbour restriction of SPEC.md section 11 is the other
-/// half of the acceleration and the two multiply:
-///
-/// | members | exhaustive pairs | bounds only | with section 11 | seconds, exhaustive to both |
-/// |---|---|---|---|---|
-/// | 64 | 43,676 | 9,046 | 4,512 | 0.219 to 0.041 |
-/// | 128 | 349,500 | 37,618 | 14,480 | 1.683 to 0.133 |
-/// | 256 | 2,796,156 | 144,116 | 46,605 | 13.619 to 0.457 |
-///
-/// Sixty times fewer pairs and thirty times less wall time at 256 members,
-/// growing with `n`. The wall-time factor lags the pair-count factor
-/// because the walk is a sequence of small parallel scans while the
-/// exhaustive scan is one large one; see
-/// [`crate::search::star::BOUND_WALK_CHUNK`].
-///
-/// ### The online schedule
-///
-/// Its value is not the couple of per cent it buys at the right starting
-/// point. It is what a wrong starting point costs:
-///
-/// | start | fixed there | adaptive from there |
-/// |---|---|---|
-/// | 12 | 0.175 | 0.109 |
-/// | 48 | 0.102 | 0.108 |
-/// | 192 | 0.170 | 0.137 |
-///
-/// A default measured on one star size is a guess at another, and the
-/// schedule halves what that guess can cost. At the right value it is
-/// slightly worse than the fixed setting, because it spends the first
-/// rounds finding it.
-///
-/// ### Bound violations
-///
-/// The linearisation is not a strict bound and SPEC.md section 10.2 says
-/// so, so this is measured rather than assumed. Scoring every offered pair
-/// in every round and checking it against its recorded bound, four seeds, every offered pair checked against its recorded bound every
-/// round:
-///
-/// | members | features | checks | `nsteps` | violations | worst, nats | worst / best gain | misses |
-/// |---|---|---|---|---|---|---|---|
-/// | 48 | 64 | 73,680 | 1 | 0 | 0 | 0 | 0 |
-/// | 48 | 64 | 73,680 | 3 | 63 | 0.45 | 0.7% | 0 |
-/// | 48 | 64 | 73,680 | 12 | 96 | 2.08 | 3.6% | 0 |
-/// | 48 | 64 | 73,680 | 48 | 67 | 2.08 | 3.6% | 0 |
-/// | 48 | 64 | 73,680 | 768 | 90 | 2.08 | 3.6% | 0 |
-/// | 96 | 128 | 589,744 | 3 | 185 | 0.53 | 0.5% | 0 |
-/// | 96 | 128 | 589,744 | 12 | 234 | 1.41 | 1.2% | 0 |
-/// | 96 | 128 | 589,744 | 48 | 107 | 2.16 | 1.9% | 0 |
-/// | 96 | 128 | 589,744 | 768 | 82 | 2.17 | 1.9% | 0 |
-///
-/// **Violations happen: about one check in a thousand, by up to two nats
-/// against best gains of sixty to a hundred and seventy.** They appear the
-/// moment the centre travels further than about one merge and then
-/// plateau, which is the signature of a second-order term and not of a
-/// wrong derivative: at `nsteps <= 1` every round redraws, every bound is
-/// its own pair's gain, and the count is exactly zero. The plateau is
-/// because the walk rescores the top of the list every round and resets
-/// those bounds, so only pairs nobody is looking at drift far.
-///
-/// The suspect is the peel. `WR = W_r - Wd_k - Wd_l` is linear and exact,
-/// but `MR` is a ratio whose denominator is that difference, so for a pair
-/// carrying much of the centre's precision the second derivative is large.
-/// [`crate::search::star::peel`] flags the same conditioning for the same
-/// reason.
-///
-/// **What it costs is nothing, and that is also measured.** The "misses"
-/// column replays the primitive's walk over the true gains and counts the
-/// rounds where it would have stopped on a pair that was not the round's
-/// best. It is zero everywhere: a violated bound has never yet belonged to
-/// a pair anybody was going to pick. `test_bounded_search_matches_the_exhaustive_scan`
-/// is the same claim made structurally, over four star sizes, three seeds
-/// and four ellipsoid sizes.
+/// The linearisation is not a strict bound (SPEC.md section 10.2): about one
+/// check in a thousand is violated, by up to two nats, and never by a pair the
+/// walk would have picked.
+/// `test_bounded_search_matches_the_exhaustive_scan` pins that structurally.
 const DEFAULT_NSTEPS: f64 = 48.0;
 
 /// Smallest value the online sizing will shrink `nsteps` to.
 ///
-/// One merge moves the centre about two to three units of the metric, so below
-/// this every round redraws and the bounds pay for themselves twice over while
-/// pruning nothing: at `nsteps = 1` every round redraws and the star scores
-/// more pairs than the exhaustive scan.
+/// At `nsteps = 1` every round redraws and the star scores more pairs than the
+/// exhaustive scan.
 const NSTEPS_MIN: f64 = 1.0;
 
-/// Largest value the online sizing will grow `nsteps` to.
-///
-/// A pure runaway guard. The schedule is a hill-climb on a bowl and settles far
-/// below this on every fixture measured; the cap is here so that a star whose
-/// costs never cross cannot wander somewhere the linearisation is meaningless.
+/// Largest value the online sizing will grow `nsteps` to; a runaway guard.
 const NSTEPS_MAX: f64 = 512.0;
 
-/// Weight of the newest round in the two running cost averages.
-///
-/// The schedule compares what redraws cost against what the walk costs, and
-/// both are spiky: a redraw round scores thousands of pairs and the round after
-/// it scores a chunk. Averaging over roughly ten rounds is enough to see past
-/// that without lagging a whole star behind.
+/// Weight of the newest round in the two running cost averages (about ten
+/// rounds).
 const COST_DECAY: f64 = 0.1;
 
 /// Multiplier applied to `nsteps` on a round where the walk is the larger cost.
-///
-/// Paired with `GROW` at the reciprocal rate. Both are gentle because the
-/// schedule moves every round: at five per cent a step it takes fourteen
-/// consecutive rounds to move `nsteps` by a factor of two, which is slow enough
-/// that the two cost averages settle rather than chase each other.
 const SHRINK: f64 = 0.95;
 
 /// Multiplier applied to `nsteps` on a round where redrawing is.
@@ -207,10 +68,8 @@ const GROW: f64 = 1.05;
 
 /// Chunks a round must offer before its cost is taken as a signal.
 ///
-/// The walk cannot stop inside a chunk, so a round offering less than one chunk
-/// always scores everything and reads as maximally deep whatever the bounds
-/// did. The tail of every star is such a round. Four chunks is where the signal
-/// stops being dominated by the granularity.
+/// A round offering under one chunk always scores everything (the walk cannot
+/// stop inside a chunk), which reads as maximally deep.
 const ADAPT_MIN_CHUNKS: usize = 4;
 
 /////////////////
@@ -218,10 +77,6 @@ const ADAPT_MIN_CHUNKS: usize = 4;
 /////////////////
 
 /// One feature of one candidate pair, as the derivative sees it.
-///
-/// Grouped rather than passed loose because the derivative needs thirteen
-/// numbers and an argument list that long is a transcription hazard, which is
-/// the exact failure this module exists to avoid.
 #[derive(Clone, Copy, Debug)]
 struct Feature {
     /// Effective mean of the first child.
@@ -261,25 +116,11 @@ struct Branches {
 /// remainder quantities.
 ///
 /// SPEC.md section 8.3 differentiated with respect to `MR` and `WR`, holding
-/// the pair's own effective leaves and all five branch lengths fixed. Both
-/// stars contribute: `MR` enters through the two squared separations
-/// `d_kR` and `d_lR`, which are shared, and `WR` enters as `O3` before the
-/// merge and through `A3 = 1/(t_ar + 1/WR)` after it.
-///
-/// **Why the branch lengths may be held fixed.** `t_ak`, `t_al` and `t_ar` are
-/// the optimum of SPEC.md section 8.4 and so are functions of `MR` and `WR`,
-/// but the score is stationary in them there, so their movement contributes at
-/// second order. `t_rk` and `t_rl` are properties of the existing tree and do
-/// not move at all. The total `k`-to-`l` length is fixed by stage one, which
-/// never looks at the remainder.
-///
-/// The stationarity is not unconditional. `t_ar` can rest at zero and the split
-/// at either end of its bracket, and at a boundary the score is stationary only
-/// for movements that keep it there. A movement that frees it improves the true
-/// score by more than this predicts, which is one of the two things that can
-/// make a bound too small; the other is the curvature of the peel. See
-/// [`DEFAULT_NSTEPS`] for what the two of them together
-/// actually cost, which on the fixtures here is nothing.
+/// the pair's own effective leaves and all five branch lengths fixed. The
+/// branch lengths are at the optimum of SPEC.md section 8.4, so their movement
+/// is second order, except where `t_ar` or the split sit at a bracket end; that
+/// and the curvature of the peel are what can make a bound too small (see
+/// [`DEFAULT_NSTEPS`]).
 ///
 /// ### Params
 ///
@@ -332,15 +173,12 @@ fn remainder_partials(f: Feature, b: Branches) -> (f64, f64) {
 ///
 /// The chain rule through the peel of SPEC.md section 8.1. With
 /// `WR = W_r - Wd_k - Wd_l` and `MR = (M_r*W_r - Wd_k*M_k - Wd_l*M_l) / WR`,
-/// and the pair's own quantities held fixed, the four partials are
+/// and the pair's own quantities held fixed,
 ///
 /// ```text
 /// d(MR)/d(M_r) = W_r / WR        d(MR)/d(W_r) = (M_r - MR) / WR
 /// d(WR)/d(M_r) = 0               d(WR)/d(W_r) = 1
 /// ```
-///
-/// The second one is `d/dW_r [(M_r*W_r - c)/(W_r - c')]`, which collapses to
-/// `(M_r*WR - MR*WR)/WR^2` because the numerator is `MR*WR` by definition.
 ///
 /// ### Params
 ///
@@ -357,31 +195,17 @@ fn centre_partials(f: Feature, b: Branches) -> (f64, f64) {
     (d_m, d_w)
 }
 
-/// Per-feature scales that define the metric the centre's movement is measured
-/// in.
+/// Per-feature scales defining the metric the centre's movement is measured in.
 ///
-/// SPEC.md section 10.3, S41, with `nsteps` factored out. The centre is a
-/// precision-weighted mean over `nc` children; one merge removes two and adds
-/// one, moving the position by about `1/sqrt(nc * W[g,r])` and the precision by
-/// about `W[g,r]/nc`. Dividing a movement by these turns the two ellipsoids of
-/// S41 into unit balls, which is S42.
+/// SPEC.md section 10.3, S41, with `nsteps` factored out. One merge moves the
+/// centre's position by about `1/sqrt(nc * W[g,r])` and its precision by about
+/// `W[g,r]/nc`; dividing by these gives the unit balls of S42.
 ///
-/// **Deviation: the feature count belongs in the scales.** S41 writes them
-/// without it, which makes them per-feature sizes while the ellipsoid they
-/// define is a norm over all `p` features. A movement of exactly one merge's
-/// size in *every* feature then sits at radius `sqrt(p)` rather than at one, so
-/// the unit as written means a merge only at a single feature. Multiplying the
-/// mean scale by `sqrt(p)` and the precision scale by `sqrt(p)` fixes both, and
-/// is what is written below. The unit is then one merge's movement whatever the
-/// feature count, which is what makes a measured default carry from one dataset
-/// to another. At 200 features the unscaled form is out by `sqrt(200)` in the
-/// scale, so by 200 in the `nsteps` that would have to be asked for.
-///
-/// Measured on this crate's fixtures, one merge moves the centre about three of
-/// these units in the mean and two in the precision, so the derivation is right
-/// to a small constant and not to the digit. That constant is why
-/// [`DEFAULT_NSTEPS`] is measured rather than set to a merge
-/// count.
+/// **Deviation: the feature count belongs in the scales.** S41 gives
+/// per-feature sizes for a norm over all `p` features, so a one-merge movement
+/// in every feature would sit at radius `sqrt(p)`. Both scales are multiplied by
+/// `sqrt(p)` so the unit is one merge whatever `p`, which is what lets
+/// [`DEFAULT_NSTEPS`] carry across datasets.
 ///
 /// ### Params
 ///
@@ -399,19 +223,13 @@ fn metric_scales(w_c: f64, nc: f64, root_p: f64) -> (f64, f64) {
 
 /// Largest first-order increase in the gain per unit of centre movement.
 ///
-/// Rescaling the ellipsoid to a unit ball turns the linearised change into a
-/// dot product, and the maximum of a dot product over a unit ball is the
-/// vector's norm (SPEC.md section 10.3, S42 and S45). The two ellipsoids are
-/// independent, so they are returned separately and the caller adds them after
-/// weighting each by how far the centre has actually moved in that coordinate.
+/// The maximum of a dot product over a unit ball is the vector's norm (SPEC.md
+/// section 10.3, S42 and S45). The two ellipsoids are independent, so the
+/// slacks are returned separately.
 ///
-/// **Deviation.** S45 is written as a sum of absolute values, which is the
-/// maximum over the *box* that circumscribes the ellipsoid, not over the
-/// ellipsoid itself; the prose either side of it says "the vector's norm",
-/// which is the Euclidean one, and that is what is taken here. The difference
-/// is not cosmetic: the two differ by up to `sqrt(p)`, so at a few thousand
-/// features the box form inflates every bound by a factor of fifty and prunes
-/// nothing.
+/// **Deviation.** S45 is a sum of absolute values (the circumscribing box);
+/// the Euclidean norm is taken here. The box form inflates bounds by up to
+/// `sqrt(p)` and prunes nothing at thousands of features.
 ///
 /// ### Params
 ///
@@ -440,11 +258,8 @@ fn unit_slack(d_m: &[f64], d_w: &[f64], metric_w: &[f64], nc: f64) -> (f64, f64)
 
 /// How far the centre moved between two rounds, in the metric.
 ///
-/// Accumulated round by round rather than measured against the anchor, because
-/// what a bound needs is the distance from the centre *the pair was scored at*,
-/// and pairs are scored in different rounds. Summing the steps bounds every
-/// such distance at once by the triangle inequality, and does it far more
-/// tightly than adding two distances from a common anchor would.
+/// Steps are accumulated round by round: by the triangle inequality the sum
+/// bounds the distance from wherever each pair was scored.
 ///
 /// ### Params
 ///
@@ -485,12 +300,8 @@ fn metric_step(
 
 /// What is remembered about one pair between rounds.
 ///
-/// The bound at any later round is
-/// `gain + (path_m - born_m) * slack_m + (path_w - born_w) * slack_w`, because
-/// the maximum of a linear form over a ball of radius `R` is `R` times its
-/// maximum over the unit ball. So the bound tightens itself: it is exactly the
-/// gain in the round the pair was scored in, and grows only as fast as the
-/// centre actually travels.
+/// The bound at a later round is
+/// `gain + (path_m - born_m) * slack_m + (path_w - born_w) * slack_w`.
 #[derive(Clone, Copy, Debug)]
 struct Bound {
     /// The gain at the centre the pair was scored at.
@@ -640,34 +451,22 @@ fn bound_pair<T: BonsaiFloat>(
 
 /// Candidate pairs ordered by an upper bound on their merge score.
 ///
-/// Wraps another provider, which decides *which* pairs exist; this decides in
-/// what order they are worth scoring and when the answer is already known. So
-/// it composes with [`crate::search::candidates::KnnCandidates`], which is how
-/// it is meant to be run: section 11 removes one factor of `n` and section 10
-/// most of another.
+/// Wraps a provider that decides which pairs exist; this one orders them and
+/// lets the walk stop early. Composes with
+/// [`crate::search::candidates::KnnCandidates`].
 ///
 /// ### How a round goes
 ///
 /// 1. Ask the inner provider for the live pairs.
-/// 2. Add the step the centre took since last round to the running distance.
-/// 3. If that distance has passed `nsteps`, throw the table away and fix a new
-///    metric here.
-/// 4. Any pair with no entry, which is every pair after a redraw and the new
-///    ancestor's pairs otherwise, is scored now and given one.
-/// 5. Emit the pairs sorted by their bound at the current distance, descending.
+/// 2. Add the centre's step since last round to the running distance.
+/// 3. If that distance has passed `nsteps`, clear the table and fix a new
+///    metric.
+/// 4. Score every pair without an entry (all pairs after a redraw, else the
+///    new ancestor's) and give it one.
+/// 5. Emit pairs by bound at the current distance, descending.
 ///
-/// A pair scored this round is emitted at exactly its own gain, because the
-/// distance from where it was scored is zero. That is what stops a redraw round
-/// scoring everything twice: the whole table is exact, the top of the emitted
-/// list is the round's true best, and the primitive's walk stops in its first
-/// chunk.
-///
-/// ### Pairs whose entry is missing
-///
-/// A pair the table has no entry for is emitted with an infinite bound rather
-/// than a guess, so it is always scored. Nothing produces one today, since
-/// anything the inner provider offers is either in the table or scored above,
-/// but the alternative to being explicit about it is a silent prune.
+/// A pair scored this round is emitted at exactly its own gain. A pair with no
+/// entry is emitted with an infinite bound so it is always scored.
 #[derive(Clone, Debug)]
 pub struct EllipsoidBounds<C> {
     /// Which pairs exist.
@@ -763,26 +562,10 @@ impl<C> EllipsoidBounds<C> {
 
     /// Move `nsteps` towards the size that costs least.
     ///
-    /// SPEC.md section 10.5 reads the depth of the walk: deep means the bounds
-    /// are too loose, shallow means a looser one would do. **Depth alone is the
-    /// wrong signal and measurement says so.** The walk cannot stop inside a
-    /// chunk, so on a star of any size it bottoms out at one chunk and stays
-    /// there, the schedule reads every round as shallow, and `nsteps` grows
-    /// until it hits whatever cap it was given: a depth-only schedule ends
-    /// pinned at the cap from every starting value, so the cap and not the
-    /// schedule is choosing the answer.
-    ///
-    /// What is missing is the other half of the trade. A smaller ellipsoid
-    /// redraws more often and walks less; a larger one does the reverse; the
-    /// total is a bowl. So both costs are tracked as running averages and the
-    /// schedule walks downhill on their difference, which for a trade-off of
-    /// this shape puts the resting point at the bottom of the bowl. It lands at
-    /// `nsteps` near 60 on the fixtures in [`DEFAULT_NSTEPS`], where the
-    /// fixed-value sweep has its floor at 48.
-    ///
-    /// Rounds offering less than `ADAPT_MIN_CHUNKS` chunks are ignored: the
-    /// tail of every star is such a round and it reads as maximally deep
-    /// whatever the bounds did.
+    /// SPEC.md section 10.5 reads the walk depth, but depth alone pins `nsteps`
+    /// at the cap (the walk cannot stop inside a chunk). Instead both costs are
+    /// tracked as running averages and `nsteps` descends on their difference.
+    /// Rounds offering under `ADAPT_MIN_CHUNKS` chunks are ignored.
     ///
     /// ### Params
     ///
@@ -830,11 +613,8 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
         let p = round.n_features;
         let nc = round.members.len() as f64;
 
-        // The first round of a star, whoever owned this provider before. No
-        // ancestor exists yet exactly then, and node ids restart with the star,
-        // so nothing carried over from a previous one may be reused. The
-        // feature count is checked too, since a provider handed a differently
-        // shaped star would otherwise index a metric of the wrong length.
+        // A fresh star: nothing from a previous star may be reused (node ids restart).
+        // The feature count is checked so a differently shaped star cannot index a stale metric.
         let n_nodes = round.means.len() / p;
         let fresh_star =
             !self.anchored || self.metric_w.len() != p || round.members.len() == n_nodes;
@@ -852,10 +632,8 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
             self.path_w += step_w;
         }
 
-        // The linearisation is redrawn once the centre has travelled further
-        // than the schedule allows. That is the only thing `nsteps` decides:
-        // the bounds themselves are exact in the distance travelled, so a
-        // longer leash costs accuracy of the linearisation and nothing else.
+        // `nsteps` only decides when the linearisation is redrawn; the bounds
+        // themselves are exact in the distance travelled.
         let stale = self.path_m.max(self.path_w) >= self.nsteps;
         if fresh_star || stale {
             self.table.clear();
@@ -871,8 +649,7 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
         self.prev_w.clear();
         self.prev_w.extend_from_slice(round.centre_precisions);
 
-        // Everything without an entry is scored now: every pair after a
-        // redraw, and the new ancestor's pairs otherwise.
+        // Pairs without an entry: all of them after a redraw, else the new ancestor's.
         let missing: Vec<(usize, usize)> = self
             .raw
             .iter()
@@ -912,8 +689,7 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
         self.next_table.clear();
         for &(i, j) in &self.raw {
             let key = (round.members[i], round.members[j]);
-            // A pair the table cannot account for must always be scored, so it
-            // is emitted at the top with no bound at all rather than pruned.
+            // A pair without an entry is emitted at the top, never pruned.
             let bound = self.table.get(&key).copied();
             if let Some(bound) = bound {
                 self.next_table.insert(key, bound);
@@ -923,8 +699,7 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
         }
         std::mem::swap(&mut self.table, &mut self.next_table);
 
-        // Descending on the bound, ascending on the node ids, so the emitted
-        // order is a function of the star alone.
+        // Descending on the bound, ascending on node ids: order depends on the star alone.
         self.order
             .sort_by(|a, b| b.0.total_cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))));
         for &(bound, _, _, i, j) in &self.order {
@@ -934,10 +709,9 @@ impl<T: BonsaiFloat, C: CandidatePairs<T>> CandidatePairs<T> for EllipsoidBounds
         Ok(())
     }
 
-    /// Forward the merge to the inner provider.
+    /// Forward the merge to the inner provider. The bound table is rebuilt from
+    /// the offered pairs each round, so dead entries fall out on their own.
     ///
-    /// The bound table needs nothing here: the inner provider stops offering
-    /// pairs that mention either child, and the table is rebuilt from what is
     /// offered, so dead entries fall out on their own.
     ///
     /// ### Params

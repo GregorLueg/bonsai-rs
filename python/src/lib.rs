@@ -1,9 +1,7 @@
 //! Python bindings for `bonsai-rs`.
 //!
-//! Functions only, no handles: nothing here outlives a call. Every entry point
-//! returns a dict of numpy arrays that the Python layer turns into frozen
-//! dataclasses, so the typed surface lives in `bonsai_rs/` and this crate stays
-//! a thin FFI shim.
+//! Functions only, no handles. Every entry point returns a dict of numpy arrays
+//! that the Python layer turns into frozen dataclasses.
 
 use pyo3::prelude::*;
 
@@ -28,8 +26,7 @@ mod tree;
 /// Nothing, or the first registration error.
 #[pymodule]
 fn _bonsai_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Two versions: the bindings on their own line, so a docstring fix does not
-    // force a crates.io release, and the core crate the wheel vendored.
+    // Bindings and core crate are versioned separately.
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("__core_version__", bonsai_rs::VERSION)?;
     m.add("BonsaiError", m.py().get_type::<error::BonsaiError>())?;

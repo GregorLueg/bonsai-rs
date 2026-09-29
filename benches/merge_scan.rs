@@ -1,22 +1,10 @@
-//! Timing harness for one full round of candidate-pair scoring.
-//!
-//! This is the per-pair cost that decides whether the tree search is viable.
-//! The naive search scores every pair of the root's children every round, which
-//! SPEC.md section 10 gives as `O(n^3 p)`. `search::candidates` cuts a round to
-//! `n * k` pairs and `search::bounds` leaves only a handful of those rescored in
-//! a typical later round, with a full rescan when the ellipsoid is redrawn. So
-//! the number to know is the wall time of one full `n * k` scan: a run pays it
-//! once up front and once per redraw.
-//!
-//! The *phase* total, which is this plus the graph builds, the bound
-//! bookkeeping and the round loop, is what `benches/steps.rs` and
-//! `benches/pipeline.rs` report. This is only the kernel underneath it.
+//! Timing harness for one full round of candidate-pair scoring: the wall time
+//! of one `n * k` scan (SPEC.md section 10), paid once up front and once per
+//! ellipsoid redraw. Phase totals are in `benches/steps.rs`.
 //!
 //! ```sh
 //! cargo bench --bench merge_scan
 //! ```
-//!
-//! Plain `main`, no harness.
 
 use bonsai_rs::model::merge::{EffLeaf, MergeScratch, score_merge};
 use bonsai_rs::utils::rng::splitmix64_at;
@@ -29,11 +17,7 @@ const STAR_SIZES: [usize; 3] = [1024, 4096, 8192];
 /// Feature counts swept.
 const FEATURE_COUNTS: [usize; 2] = [500, 2000];
 
-/// Neighbours per node, which fixes the `n * k` pair count.
-///
-/// `KnnCandidatesParams::default` ships 16. This is deliberately measured at 10,
-/// the top of the paper's reported range, so the number stays comparable to
-/// earlier runs of this bench. Scale it linearly for any other `k`.
+/// Neighbours per node, which fixes the `n * k` pair count. Cost scales linearly in `k`.
 const NEIGHBOURS: usize = 10;
 
 /// Repeats per configuration; the reported time is the best of these.
@@ -48,9 +32,7 @@ fn main() {
 
     for &n in STAR_SIZES.iter() {
         for &p in FEATURE_COUNTS.iter() {
-            // Children of the star, clustered so that neighbouring indices are
-            // genuinely close: a scan over random pairs would spend all its time
-            // in the zero-branch early exit and flatter the timing.
+            // Clustered so neighbouring indices are close; random pairs would hit the zero-branch early exit.
             let total = (n * p) as u64;
             let m: Vec<f64> = (0..total)
                 .map(|i| {
@@ -63,16 +45,13 @@ fn main() {
                 .map(|i| 0.4 + splitmix64_at(total + i) * 2.0)
                 .collect();
 
-            // The peeled rest of the star. In the real search this is recomputed
-            // per pair by subtraction in O(p); here one representative is enough
-            // to make the arithmetic honest.
+            // One representative for the peeled rest of the star.
             let m_r: Vec<f64> = (0..p).map(|g| 1.0 + (g as f64 * 0.03).cos()).collect();
             let w_r: Vec<f64> = (0..p)
                 .map(|g| 0.7 + 0.2 * (g as f64 * 0.05).sin())
                 .collect();
 
-            // Candidate pairs: each node against the next NEIGHBOURS nodes,
-            // which the clustering above makes a plausible neighbour list.
+            // Each node against the next NEIGHBOURS nodes.
             let pairs: Vec<(usize, usize)> = (0..n)
                 .flat_map(|i| ((i + 1)..(i + 1 + NEIGHBOURS).min(n)).map(move |j| (i, j)))
                 .collect();
@@ -107,8 +86,6 @@ fn main() {
                 checksum = sum;
             }
 
-            // Checksum before reporting: a scan that silently did nothing would
-            // otherwise look like an excellent timing.
             assert!(checksum.is_finite(), "non-finite gain sum");
 
             println!(

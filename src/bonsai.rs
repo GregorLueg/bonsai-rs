@@ -1,29 +1,17 @@
 //! The whole algorithm: matrix in, tree out.
 //!
-//! Runs the seven steps of SPEC.md section 9 in order, then an eighth of our
-//! own. Everything below is orchestration; the arithmetic lives in `model`,
+//! Runs the seven steps of SPEC.md section 9, then an eighth of our own:
+//! collapse the zero-length internal edges that steps 4 to 7 leave behind
+//! (step 3 is the only other collapse and runs before them). It runs last so
+//! it cannot change what the search finds. The arithmetic lives in `model`,
 //! `search` and `tree`.
 //!
-//! **The eighth step is a deviation.** Step 3 is the only step that collapses
-//! zero-length edges and it runs before step 4, so every zero-length edge the
-//! branch solves create afterwards outlives the only pass that would remove
-//! one. See the comment on step 8 for why it runs last rather than earlier.
+//! ### Ordering constraints (not in the specification)
 //!
-//! ### Why the order is not negotiable
-//!
-//! Two of the steps only work where they are placed, and neither constraint is
-//! in the specification.
-//!
-//! Steps 5 and 6 must follow step 4. Both SPR and NNI reject a proposal whose
-//! topology fingerprint is unchanged, because otherwise they accept moves that
-//! only reoptimise branch lengths and never terminate on topology. Run before
-//! the branch lengths are optimised, that filter rejects the only improvements
-//! available and topology recovery gets *worse*.
-//!
-//! Step 3 must follow step 2 rather than being folded into it. Polytomies are
-//! created by step 2 when an optimal branch length comes out at zero, and the
-//! configuration that was optimal when it was created often is not once the
-//! centre has moved.
+//! Steps 5 and 6 must follow step 4: SPR and NNI reject proposals whose
+//! topology fingerprint is unchanged, which before the branch lengths are
+//! optimised rejects the only available improvements. Step 3 must follow step 2,
+//! since the centre moves after a polytomy is created.
 
 use std::time::Instant;
 
@@ -45,14 +33,35 @@ use crate::utils::traits::narrow;
 // Consts //
 ////////////
 
-/// Branch length the initial star hangs every leaf on, before step 1 optimises
-/// it.
-///
-/// Only a starting point for the optimiser, which converges from anywhere; step
-/// 1 replaces it entirely. One is the natural scale because the ingest
-/// transform of SPEC.md section 3.1 sets the per-feature signal variance to one,
-/// so a branch of one is a diffusion of one signal standard deviation.
+/// Branch length the initial star starts from; step 1 replaces it. One is the
+/// signal scale after the ingest transform (SPEC.md section 3.1).
 const INITIAL_STAR_BRANCH: f64 = 1.0;
+
+///////////////
+// StartTree //
+///////////////
+
+/// How the initial topology is built.
+///
+/// Search steps 1 and 2, or a linkage in their place; steps 3 to 7 are identical
+/// either way. The linkage is the default: on real Sanity-preprocessed input it
+/// beats the specified start on loglikelihood and Robinson-Foulds and is several
+/// times faster (`docs/PERFORMANCE.md`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartTree {
+    /// The star of SPEC.md section 9.1, agglomerated by the merge score.
+    ///
+    /// Chains on real input, increasingly with cell count, and steps 3 to 7 do
+    /// not recover from it (`docs/PERFORMANCE.md`). Kept because the paper
+    /// specifies it: choose it to reproduce the published method, not to build
+    /// the best tree.
+    GreedyMerge,
+    /// Ward linkage over a neighbour graph, [`crate::tree::linkage`].
+    ///
+    /// The default.
+    #[default]
+    Linkage,
+}
 
 //////////////////
 // BonsaiParams //
@@ -70,17 +79,11 @@ pub struct BonsaiParams {
     pub start: StartTree,
     /// Knobs for the linkage, ignored unless `start` selects it.
     pub linkage: LinkageParams,
-    /// The greedy star primitive and polytomy resolution.
-    ///
-    /// Steps 2 and 3 only. Steps 5 and 6 run the same primitive but take their
-    /// settings from `spr.star` and `nni.star`, so raising `min_gain` here
-    /// leaves their move-acceptance floor at the default.
+    /// The greedy star primitive and polytomy resolution, steps 2 and 3 only.
+    /// Steps 5 and 6 take theirs from `spr.star` and `nni.star`.
     pub star: StarParams,
-    /// Candidate-pair restriction.
-    ///
-    /// Not optional in practice. Scanning every pair makes step 2 `O(n^3 p)`
-    /// and 94 per cent of the runtime; measured, it scales as `n^2.9` without
-    /// this and the ellipsoid bounds of section 10, which always run.
+    /// Candidate-pair restriction. Without it step 2 is `O(n^3 p)`, measured
+    /// `n^2.9` and 94 per cent of the runtime.
     pub knn: KnnCandidatesParams,
     /// Global branch-length optimisation (section 6), steps 1, 4 and 7.
     pub branch: GlobalBranchParams,
@@ -90,59 +93,14 @@ pub struct BonsaiParams {
     pub nni: NniParams,
     /// Whether to reroot for display once the search is done (section 9.7).
     ///
-    /// The likelihood does not depend on the root (S14), so this changes only
-    /// how the tree is drawn. It is done last because a degree-two root is
-    /// degenerate for branch-length optimisation: only the sum of the two
-    /// branches below it is identifiable.
+    /// The likelihood does not depend on the root (S14). Done last because a
+    /// degree-two root is degenerate for branch-length optimisation.
     pub reroot: bool,
     /// Skip the per-node posteriors, leaving `node_means` and `node_sds` empty.
     ///
-    /// They are `2 * n_nodes * n_features` values, which at 100k cells and a
-    /// few thousand features is gigabytes a caller after the tree alone never
-    /// reads. The search does not depend on them.
+    /// They are `2 * n_nodes * n_features` values; the search does not depend on
+    /// them.
     pub skip_posteriors: bool,
-}
-
-///////////////
-// StartTree //
-///////////////
-
-/// How the initial topology is built.
-///
-/// Search steps 1 and 2, or a linkage in their place. The refinement of steps 3
-/// to 7 is identical either way.
-///
-/// **The linkage is the default and the specified start is not.** On synthetic
-/// data the two are interchangeable. On real Sanity-preprocessed input they are
-/// not: the linkage wins on the loglikelihood and on Robinson-Foulds at every
-/// size measured, and is several times faster. `docs/PERFORMANCE.md` has the
-/// table and the mechanism.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum StartTree {
-    /// The star of SPEC.md section 9.1, agglomerated by the merge score.
-    ///
-    /// **This chains on real input, and the chaining grows with the cell
-    /// count.** Leaf depth straight after step 2 runs an order of magnitude
-    /// above `log2(n)`; steps 3 to 7 do not recover from it, and the finished
-    /// tree is worse on the loglikelihood as well as on the topology.
-    ///
-    /// The cause is the merge criterion, not the order pairs are taken in. A
-    /// cluster's effective leaf carries `1/size` of the noise, so a large one
-    /// sits closer to every member than that member's own relatives do and
-    /// absorbs them one at a time. A Ward distance grows with cluster size and
-    /// has no such bias; the merge gain shrinks. Rescheduling the merges does
-    /// not reach it, and `docs/PERFORMANCE.md` records what was tried.
-    ///
-    /// Kept because it is what the paper specifies, so it is what a
-    /// reproduction of the published method has to run. Choose it to compare
-    /// against that method, not to build the best tree.
-    GreedyMerge,
-    /// Ward linkage over a neighbour graph, [`crate::tree::linkage`].
-    ///
-    /// The default. Stays close to `log2(n)` mean leaf depth at every size
-    /// measured, and hands steps 3 to 7 a tree they refine rather than repair.
-    #[default]
-    Linkage,
 }
 
 ////////////////
@@ -159,10 +117,8 @@ pub struct StepReport {
     pub loglik: f64,
     /// Change from the previous step.
     ///
-    /// Non-negative on every measured run, and `test_every_step_is_monotone`
-    /// checks it, but `record` does not assert it: a step that lost ground
-    /// should surface as a visible negative here rather than as a panic
-    /// crossing an FFI boundary.
+    /// Expected non-negative but not asserted, so a regression shows as a
+    /// negative here rather than a panic across FFI.
     pub gain: f64,
     /// Wall time of the step in seconds, including the loglikelihood
     /// evaluation that closes it.
@@ -280,40 +236,6 @@ fn star_of(n_leaves: usize) -> Result<Tree, BonsaiErrors> {
     Tree::from_parents(parent, branch, n_leaves)
 }
 
-/// Step 8: collapse the zero-length internal edges steps 4 to 7 leave behind,
-/// resolve what that exposes, reoptimise, and collapse once more.
-///
-/// The reoptimise can itself land an internal edge on exactly `t = 0`, which
-/// SPEC.md section 6 calls normal: one such edge on 10,000 Baron cells,
-/// measured 2026-09-29. The last collapse removes it. A zero-length edge puts
-/// both ends at the same point, so that collapse leaves the loglikelihood and
-/// every other edge's optimum exactly where the solve put them, and no second
-/// solve is needed. Afterwards no internal edge below the root is `0.0`.
-///
-/// ### Params
-///
-/// * `tree` - Tree after step 7; not modified
-/// * `leaves` - Transformed leaf data
-/// * `params` - Pipeline knobs, for the star and branch-length settings
-///
-/// ### Returns
-///
-/// The resolver's report with its tree replaced by the final one, and the
-/// loglikelihood, or the error the resolver, the solve or the arena failed
-/// with.
-pub fn collapse_step<T: BonsaiFloat>(
-    tree: &Tree,
-    leaves: Leaves<'_, T>,
-    params: &BonsaiParams,
-) -> Result<(crate::search::polytomy::PolytomyResult, f64), BonsaiErrors> {
-    let mut resolved = resolve_polytomies(tree, leaves, Some(params.star))?;
-    let loglik = optimise_all(&mut resolved.tree, leaves, params)?;
-    if let Some((collapsed, _)) = crate::search::polytomy::collapse_zero_edges(&resolved.tree)? {
-        resolved.tree = collapsed;
-    }
-    Ok((resolved, loglik))
-}
-
 /// Optimise every branch length in place.
 ///
 /// ### Params
@@ -365,14 +287,117 @@ fn posteriors<T: BonsaiFloat>(
     Ok((data.restore_scale(&means)?, data.restore_scale(&sds)?))
 }
 
+/// Steps 3 to 7, shared by [`bonsai_prepared`] and [`refine`].
+///
+/// ### Params
+///
+/// * `tree` - Tree to refine, consumed
+/// * `data` - Transformed means and precisions
+/// * `params` - Knobs, already resolved
+/// * `steps` - Step reports so far, appended to
+/// * `verbosity` - How much to print while running
+///
+/// ### Returns
+///
+/// The refined tree with its posteriors.
+fn refine_from<T: BonsaiFloat>(
+    mut tree: Tree,
+    data: &PreparedData<T>,
+    params: &BonsaiParams,
+    mut steps: Vec<StepReport>,
+    verbosity: Verbosity,
+) -> Result<BonsaiResult<T>, BonsaiErrors> {
+    let leaves = Leaves {
+        means: &data.transformed_means,
+        precisions: &data.transformed_precisions,
+        n_features: data.n_features(),
+    };
+
+    // Step 3. The collapse that exposes polytomies lives in `search::polytomy`.
+    let started = begin("Step 3: resolve polytomies", verbosity);
+    let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
+    tree = resolved.tree;
+    record(
+        "3 polytomy",
+        tree_loglik(&tree, leaves)?,
+        &mut steps,
+        verbosity,
+        started,
+    );
+
+    // Step 4: steps 5 and 6 depend on this, see the module docs.
+    let started = begin("Step 4: branch lengths", verbosity);
+    let loglik = optimise_all(&mut tree, leaves, params)?;
+    record("4 branch", loglik, &mut steps, verbosity, started);
+
+    // Step 5.
+    let started = begin("Step 5: SPR", verbosity);
+    tree = spr(&tree, leaves, Some(params.spr), verbosity)?.tree;
+    record(
+        "5 spr",
+        tree_loglik(&tree, leaves)?,
+        &mut steps,
+        verbosity,
+        started,
+    );
+
+    // Step 6.
+    let started = begin("Step 6: NNI", verbosity);
+    tree = nni(&tree, leaves, Some(params.nni), verbosity)?.tree;
+    record(
+        "6 nni",
+        tree_loglik(&tree, leaves)?,
+        &mut steps,
+        verbosity,
+        started,
+    );
+
+    // Step 7.
+    let started = begin("Step 7: branch lengths", verbosity);
+    let loglik = optimise_all(&mut tree, leaves, params)?;
+    record("7 branch", loglik, &mut steps, verbosity, started);
+
+    // Step 8, our deviation from SPEC.md section 9. Collapsing before step 5
+    // recovers slightly more topology at two orders of magnitude more time;
+    // after the search it cannot change what the search finds. Zero-length leaf
+    // edges survive by design.
+    let started = begin("Step 8: collapse zero-length edges", verbosity);
+    let (resolved, loglik) = collapse_step(&tree, leaves, params)?;
+    tree = resolved.tree;
+    record("8 collapse", loglik, &mut steps, verbosity, started);
+
+    // Display only (S14), so after the last branch-length step.
+    if params.reroot {
+        tree = reroot_for_display(&tree)?;
+    }
+
+    let (node_means, node_sds) = if params.skip_posteriors {
+        (Vec::new(), Vec::new())
+    } else {
+        let started = begin("Posteriors", verbosity);
+        let out = posteriors(&tree, leaves, data)?;
+        if verbosity.normal_verbosity() {
+            println!("  {} nodes ({:.2?})", tree.n_nodes(), started.elapsed());
+        }
+        out
+    };
+    Ok(BonsaiResult {
+        tree,
+        loglik,
+        features: data.features.clone(),
+        node_means,
+        node_sds,
+        steps,
+    })
+}
+
 ////////////
 // Bonsai //
 ////////////
 
 /// Reconstruct a tree from a matrix of measurements and their error bars.
 ///
-/// The whole pipeline: ingest, the seven search steps of, and the collapse this
-/// crate adds after them.
+/// The whole pipeline: ingest, the seven search steps, and the extra collapse.
 ///
 /// ### Params
 ///
@@ -457,12 +482,9 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
             let loglik = optimise_branch_lengths(&mut star, &mut state, Some(params.branch))?;
             record("1 star", loglik, &mut steps, verbosity, started);
 
-            // Step 2: greedily add ancestors. The star's optimised branch
-            // lengths carry over as the members' branches to the centre.
-            // Both restrictions on, which is what makes this step tractable.
-            // The bounds sit outside the neighbour graph: the graph decides
-            // which pairs exist, the bounds decide which of those need
-            // rescoring this round.
+            // Step 2: the star's branch lengths carry over as the members'
+            // branches. The graph decides which pairs exist, the bounds which
+            // need rescoring this round.
             let started = begin("Step 2: greedy merge", verbosity);
             let mut candidates = EllipsoidBounds::new(KnnCandidates::new(Some(params.knn)));
             let (tree, _) = star_tree_with(
@@ -486,9 +508,7 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
             tree
         }
         StartTree::Linkage => {
-            // Steps 1 and 2 at once, and neither of them scores anything with
-            // the model: the linkage supplies a topology and step 4 supplies
-            // the branch lengths.
+            // Steps 1 and 2 at once; step 4 supplies the branch lengths.
             let started = begin("Steps 1-2: linkage", verbosity);
             let tree = linkage_tree(leaves.means, n_cells, p, Some(params.linkage))?;
             record(
@@ -507,15 +527,9 @@ pub fn bonsai_prepared<T: BonsaiFloat>(
 
 /// Run the refinement steps on a tree that already exists.
 ///
-/// Resolve polytomies, optimise the branch lengths, SPR, NNI, optimise again.
-/// Steps 1 and 2 build a tree from nothing; this improves one that is already
-/// there.
-///
-/// That is what a caller with a tree from elsewhere wants. The paper
-/// recommends seeding the search with cells grouped by an external clustering,
-/// which is the same entry point.
-///
-/// The returned `steps` start at step 3, since 1 and 2 did not happen.
+/// Resolve polytomies, optimise the branch lengths, SPR, NNI, optimise again,
+/// collapse. For a tree from elsewhere, such as an external clustering; the
+/// returned `steps` start at step 3.
 ///
 /// ### Params
 ///
@@ -551,132 +565,35 @@ pub fn refine<T: BonsaiFloat>(
     )
 }
 
-//////////////
-// Internal //
-//////////////
-
-/// Steps 3 to 7, shared by [`bonsai_prepared`] and [`refine`].
+/// Step 8: collapse the zero-length internal edges steps 4 to 7 leave behind,
+/// resolve what that exposes, reoptimise, and collapse once more.
+///
+/// The reoptimise can land an internal edge on `t = 0` (SPEC.md section 6); the
+/// last collapse removes it without changing the loglikelihood or any other
+/// edge's optimum, so no second solve is needed.
 ///
 /// ### Params
 ///
-/// * `tree` - Tree to refine, consumed
-/// * `data` - Transformed means and precisions
-/// * `params` - Knobs, already resolved
-/// * `steps` - Step reports so far, appended to
-/// * `verbosity` - How much to print while running
+/// * `tree` - Tree after step 7; not modified
+/// * `leaves` - Transformed leaf data
+/// * `params` - Pipeline knobs, for the star and branch-length settings
 ///
 /// ### Returns
 ///
-/// The refined tree with its posteriors.
-fn refine_from<T: BonsaiFloat>(
-    mut tree: Tree,
-    data: &PreparedData<T>,
+/// The resolver's report with its tree replaced by the final one, and the
+/// loglikelihood, or the error the resolver, the solve or the arena failed
+/// with.
+pub fn collapse_step<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
     params: &BonsaiParams,
-    mut steps: Vec<StepReport>,
-    verbosity: Verbosity,
-) -> Result<BonsaiResult<T>, BonsaiErrors> {
-    let leaves = Leaves {
-        means: &data.transformed_means,
-        precisions: &data.transformed_precisions,
-        n_features: data.n_features(),
-    };
-
-    // Step 3: resolve the polytomies that a zero-length branch stands for. The
-    // collapse that finds them lives in `search::polytomy`; without it this step
-    // sees a structurally binary tree and does nothing.
-    let started = begin("Step 3: resolve polytomies", verbosity);
-    let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
-    tree = resolved.tree;
-    record(
-        "3 polytomy",
-        tree_loglik(&tree, leaves)?,
-        &mut steps,
-        verbosity,
-        started,
-    );
-
-    // Step 4: all branch lengths at once. Steps 5 and 6 depend on this having
-    // happened; see the module docs.
-    let started = begin("Step 4: branch lengths", verbosity);
-    let loglik = optimise_all(&mut tree, leaves, params)?;
-    record("4 branch", loglik, &mut steps, verbosity, started);
-
-    // Step 5.
-    let started = begin("Step 5: SPR", verbosity);
-    tree = spr(&tree, leaves, Some(params.spr), verbosity)?.tree;
-    record(
-        "5 spr",
-        tree_loglik(&tree, leaves)?,
-        &mut steps,
-        verbosity,
-        started,
-    );
-
-    // Step 6.
-    let started = begin("Step 6: NNI", verbosity);
-    tree = nni(&tree, leaves, Some(params.nni), verbosity)?.tree;
-    record(
-        "6 nni",
-        tree_loglik(&tree, leaves)?,
-        &mut steps,
-        verbosity,
-        started,
-    );
-
-    // Step 7.
-    let started = begin("Step 7: branch lengths", verbosity);
-    let loglik = optimise_all(&mut tree, leaves, params)?;
-    record("7 branch", loglik, &mut steps, verbosity, started);
-
-    // Step 8, a deviation. SPEC.md section 9 lists seven steps and this is an
-    // eighth: collapse the internal zero-length edges the branch solves leave
-    // behind, then reoptimise what the collapse changed.
-    //
-    // It exists because step 3 is the only step that collapses, and it runs
-    // before step 4. SPEC.md section 6 is explicit that a branch solve landing
-    // on `t = 0` is normal, so every zero-length edge steps 4 to 7 create
-    // outlives the only pass that would remove it.
-    //
-    // It runs last on purpose. Collapsing before step 5 instead recovers
-    // slightly more topology but costs two orders of magnitude more time,
-    // because a collapsed tree gives every nearby regraft a higher-degree star
-    // to resolve. Running after the search cannot change what the search finds,
-    // which is the property that makes this safe to do unconditionally.
-    //
-    // The collapse only ever *removes* structure, so it cannot invent a split
-    // the data does not support. What it cannot touch is a zero-length edge at
-    // a *leaf*, which is not an internal edge: those are the model declining to
-    // separate two cells it has no evidence to separate, and they survive this
-    // step by design.
-    let started = begin("Step 8: collapse zero-length edges", verbosity);
-    let (resolved, loglik) = collapse_step(&tree, leaves, params)?;
-    tree = resolved.tree;
-    record("8 collapse", loglik, &mut steps, verbosity, started);
-
-    // Rerooting is a display choice and carries no information (S14), so it
-    // happens after the last thing that cares about branch lengths.
-    if params.reroot {
-        tree = reroot_for_display(&tree)?;
+) -> Result<(crate::search::polytomy::PolytomyResult, f64), BonsaiErrors> {
+    let mut resolved = resolve_polytomies(tree, leaves, Some(params.star))?;
+    let loglik = optimise_all(&mut resolved.tree, leaves, params)?;
+    if let Some((collapsed, _)) = crate::search::polytomy::collapse_zero_edges(&resolved.tree)? {
+        resolved.tree = collapsed;
     }
-
-    let (node_means, node_sds) = if params.skip_posteriors {
-        (Vec::new(), Vec::new())
-    } else {
-        let started = begin("Posteriors", verbosity);
-        let out = posteriors(&tree, leaves, data)?;
-        if verbosity.normal_verbosity() {
-            println!("  {} nodes ({:.2?})", tree.n_nodes(), started.elapsed());
-        }
-        out
-    };
-    Ok(BonsaiResult {
-        tree,
-        loglik,
-        features: data.features.clone(),
-        node_means,
-        node_sds,
-        steps,
-    })
+    Ok((resolved, loglik))
 }
 
 ///////////

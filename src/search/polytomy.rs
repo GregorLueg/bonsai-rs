@@ -1,35 +1,18 @@
-//! Polytomy resolution (SPEC.md section 9.2), and the splice primitive the
-//! rest of the search is built on.
+//! Polytomy resolution (SPEC.md section 9.2) and the splice primitive the rest
+//! of the search is built on.
 //!
-//! ### The primitive
+//! Steps 3, 5 and 6 build a star around a node `X` ([`centre_star`]), resolve
+//! it with [`crate::search::star::resolve_star`] and splice the result back
+//! ([`splice_star`]). The star is `X`'s children plus its upstream side as one
+//! more member, read off [`UpState`], so "stop at three members" means
+//! "resolved" for internal nodes and the root alike.
 //!
-//! Steps 3, 5 and 6 of the search all do the same thing: take a node `X`, build
-//! a star from the things attached to it, resolve that star with
-//! [`crate::search::star::resolve_star`], and splice the result back into the
-//! tree. That is [`centre_star`] followed by [`splice_star`], and it is written
-//! once here.
-//!
-//! The star around `X` is its children **plus its upstream side as one more
-//! member**, the latter read off [`UpState`]. Counting the upstream side is
-//! what makes the primitive's "stop at three members" rule mean "resolved" for
-//! an internal node as well as for the root, which has no upstream side and
-//! whose members are just its children.
-//!
-//! ### The upstream member is not a node
-//!
-//! It is a stand-in for everything outside `X`'s subtree, and it sits exactly
-//! where `X`'s parent `P` sits. So when the star is spliced back, anything the
-//! resolution attached to the upstream member attaches to `P` itself; only the
-//! ancestors that ended up strictly between `X` and the upstream member become
-//! real new nodes, and they land on the edge above `X`. Treating the upstream
-//! member as a node of its own would duplicate `P`, orphan `P`'s other
-//! children and silently reroot the tree, which is what
-//! `test_a_resolution_with_nothing_to_gain_returns_the_same_tree` exists to
-//! catch.
-//!
-//! The star primitive returns its topology rooted at the centre, so the path
-//! from the centre out to the upstream member is the one part of it that has to
-//! be reversed on the way back in. Everything else keeps its star parent.
+//! The upstream member is not a node: it stands for everything outside `X`'s
+//! subtree and sits where `X`'s parent `P` sits. Anything attached to it
+//! attaches to `P`; only ancestors strictly between `X` and the upstream member
+//! become new nodes, on the edge above `X`. The path from the centre to the
+//! upstream member is the only part of the star topology reversed on the way
+//! back in.
 
 use crate::errors::BonsaiErrors;
 use crate::model::global::UpState;
@@ -44,44 +27,30 @@ use crate::utils::traits::BonsaiFloat;
 // Parameters //
 ////////////////
 
-/// Star size at which a centre is already resolved and nothing can be gained.
+/// Star size at which a centre is already resolved (SPEC.md section 9.1).
 ///
-/// The same number the star primitive stops at (SPEC.md section 9.1): three
-/// members around a centre is a degree-three node. Counting the upstream side
-/// as a member is what makes one number serve both the root and an internal
-/// node, so "more than two children" in SPEC.md section 9.2 becomes "more than
-/// three members" here and the root's trifurcation is correctly left alone.
-///
-/// `pub(crate)` because [`crate::search::spr`] reads it to decide whether a
-/// regraft left a polytomy behind that needs resolving.
+/// Counting the upstream side as a member makes one number serve root and
+/// internal nodes. Read by [`crate::search::spr`] to detect regrafts that leave
+/// a polytomy.
 pub(crate) const RESOLVED_STAR_MEMBERS: usize = 3;
 
-/// Runaway guard on the fixed-point loop, not a working limit.
+/// Runaway guard on the fixed-point loop; termination rests on the
+/// loglikelihood, so this should never bind (zero-branch stars settle in a
+/// handful of sweeps, measured).
 ///
-/// The loop's termination argument is the loglikelihood, not the sweep count,
-/// so this should never bind: swept over zero-branch stars across four decades
-/// of precision, the loop settles in a handful of sweeps every time. The same
-/// role as `MAX_NEWTON_ITER` in [`crate::model::branch`].
-///
-/// It exists because that argument is only sound while `min_gain` clears the
-/// per-feature rounding floor of a merge gain. [`resolve_polytomies`] now
-/// rejects a non-positive `min_gain`, which is the case that actually span, but
-/// a floor merely *too small* for the feature count is a caller error this
-/// cannot detect, and an unbounded loop crossing an FFI boundary takes the
-/// session with no interrupt point.
+/// [`resolve_polytomies`] rejects a non-positive `min_gain`; a floor merely too
+/// small for the feature count cannot be detected.
 const MAX_SWEEPS: usize = 64;
 
 ///////////////////
 // Input, output //
 ///////////////////
 
-/// The star around one node of a tree, ready for the primitive and for the
-/// splice back.
+/// The star around one node of a tree.
 ///
-/// Means and precisions are row-major `[member][feature]` and precisions are
-/// not diffusion corrected, matching [`Star`]. The upstream member, when there
-/// is one, is always **last**; `member_nodes` holds the centre's parent in that
-/// slot, which is where the upstream effective leaf sits.
+/// Row-major `[member][feature]`, precisions not diffusion corrected, matching
+/// [`Star`]. The upstream member, if any, is last, with the centre's parent in
+/// its `member_nodes` slot.
 #[derive(Clone, Debug)]
 pub struct CentreStar<T> {
     /// Node the star is centred on.
@@ -90,12 +59,8 @@ pub struct CentreStar<T> {
     pub member_nodes: Vec<u32>,
     /// Whether the last member is the upstream side rather than a child.
     pub has_upstream: bool,
-    /// Nodes that the star swallowed and that must disappear from the tree.
-    ///
-    /// Empty for a plain polytomy resolution. An interchange collapses one end
-    /// of an internal edge into the other and lists the deleted end here; its
-    /// children are members of the star, so nothing else refers to it once the
-    /// splice is done.
+    /// Nodes the star swallowed, removed from the tree on splice (an
+    /// interchange lists the collapsed end of its edge here).
     pub deleted: Vec<u32>,
     /// Effective means, `[member][feature]`, row-major.
     pub means: Vec<T>,
@@ -139,10 +104,8 @@ pub struct Splice {
     pub tree: Tree,
     /// Total loglikelihood gain claimed by the merges, in nats.
     ///
-    /// Exact against the tree the star was built from, because the upstream
-    /// member summarises the rest of that tree exactly (SPEC.md section 4). It
-    /// is *not* a gain against the caller's original tree where the caller
-    /// edited it first, as an interchange does.
+    /// Exact against the tree the star was built from (SPEC.md section 4), not
+    /// against the caller's original where it was edited first.
     pub gain: f64,
     /// Number of merges the primitive performed. Zero means the tree came back
     /// unchanged.
@@ -159,12 +122,8 @@ pub struct PolytomyResult {
     pub n_polytomies: usize,
     /// Number of resolutions that changed the tree.
     ///
-    /// Routinely larger than `n_polytomies`, and not a sign of anything wrong: a
-    /// resolution that leaves its new ancestor at zero distance from its centre
-    /// is collapsed at the top of the next sweep and makes a polytomy that was
-    /// not in the entry count. Within one sweep no node becomes a polytomy that
-    /// was not one already, since a resolution only lowers its own centre's
-    /// degree and the ancestors it creates are binary.
+    /// Routinely larger than `n_polytomies`: a new ancestor left at zero
+    /// distance from its centre is collapsed next sweep into a fresh polytomy.
     pub n_resolved: usize,
     /// Number of sweeps over the tree, the last of which found nothing.
     pub sweeps: usize,
@@ -174,13 +133,306 @@ pub struct PolytomyResult {
 // The primitive //
 ///////////////////
 
+/// Where every node of a rebuilt tree came from.
+///
+/// Walks up from each leaf in the input parent array and in the rebuilt tree
+/// in step; leaves keep their indices.
+///
+/// ### Params
+///
+/// * `parent` - The parent array [`rebuild`] was given
+/// * `out` - The tree it built
+/// * `n_old` - Node count of the tree the array was edited from; input indices
+///   at or above it are nodes the edit created
+///
+/// ### Returns
+///
+/// Per node of `out`, its node in the original tree or [`NO_NODE`] for a
+/// created one, or `MalformedTree` if the two walks disagree.
+fn map_back(parent: &[u32], out: &Tree, n_old: usize) -> Result<Vec<u32>, BonsaiErrors> {
+    let mut to_old = vec![NO_NODE; out.n_nodes()];
+    for leaf in 0..out.n_leaves() as u32 {
+        let (mut from, mut to) = (leaf, leaf);
+        while to_old[to as usize] == NO_NODE {
+            to_old[to as usize] = from;
+            match (parent[from as usize], out.parent(to)) {
+                (NO_NODE, None) => break,
+                (up, Some(next)) if up != NO_NODE => (from, to) = (up, next),
+                _ => {
+                    return Err(BonsaiErrors::MalformedTree {
+                        reason: format!("rebuild map lost step at leaf {leaf}"),
+                    });
+                }
+            }
+        }
+    }
+    for old in &mut to_old {
+        if *old != NO_NODE && *old as usize >= n_old {
+            *old = NO_NODE;
+        }
+    }
+    Ok(to_old)
+}
+
+/// Renumber an arbitrary parent array into the arena invariant and build it.
+///
+/// [`Tree::from_parents`] checks but does not fix that a parent index exceeds
+/// its children's, which a splice breaks, so nodes are renumbered in a
+/// post-order from the root. Unreached nodes (deleted ones) are dropped.
+///
+/// ### Params
+///
+/// * `parent` - Parent index per node, [`NO_NODE`] where there is none
+/// * `branch` - Branch above each node, same indexing
+/// * `root` - Node to walk from
+/// * `n_leaves` - Number of leaves, occupying indices `0..n_leaves`
+///
+/// ### Returns
+///
+/// The tree, or `MalformedTree` if the walk did not reach every leaf or the
+/// arena rejected the result.
+fn rebuild(
+    parent: &[u32],
+    branch: &[f64],
+    root: u32,
+    n_leaves: usize,
+) -> Result<Tree, BonsaiErrors> {
+    let n = parent.len();
+
+    let mut ptr = vec![0u32; n + 1];
+    for &par in parent {
+        if par != NO_NODE {
+            ptr[par as usize + 1] += 1;
+        }
+    }
+    for i in 0..n {
+        ptr[i + 1] += ptr[i];
+    }
+    let mut cursor = ptr.clone();
+    let mut kids = vec![0u32; ptr[n] as usize];
+    for (i, &par) in parent.iter().enumerate() {
+        if par != NO_NODE {
+            kids[cursor[par as usize] as usize] = i as u32;
+            cursor[par as usize] += 1;
+        }
+    }
+
+    let mut new_id = vec![NO_NODE; n];
+    let mut next = n_leaves as u32;
+    let mut n_seen_leaves = 0usize;
+    let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+    while let Some((node, expanded)) = stack.pop() {
+        if expanded {
+            if (node as usize) < n_leaves {
+                new_id[node as usize] = node;
+                n_seen_leaves += 1;
+            } else {
+                new_id[node as usize] = next;
+                next += 1;
+            }
+            continue;
+        }
+        stack.push((node, true));
+        let (lo, hi) = (ptr[node as usize] as usize, ptr[node as usize + 1] as usize);
+        // Pushed last-first so siblings keep their arena order; `search::spr`
+        // relies on it to recognise untouched subtrees.
+        for &child in kids[lo..hi].iter().rev() {
+            stack.push((child, false));
+        }
+    }
+    if n_seen_leaves != n_leaves {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!(
+                "the splice left {n_seen_leaves} of {n_leaves} leaves connected to the root"
+            ),
+        });
+    }
+
+    let n_new = next as usize;
+    let mut new_parent = vec![NO_NODE; n_new];
+    let mut new_branch = vec![0.0f64; n_new];
+    for old in 0..n {
+        let here = new_id[old];
+        if here == NO_NODE {
+            continue;
+        }
+        new_parent[here as usize] = match parent[old] {
+            NO_NODE => NO_NODE,
+            par => new_id[par as usize],
+        };
+        new_branch[here as usize] = branch[old];
+    }
+    Tree::from_parents(new_parent, new_branch, n_leaves)
+}
+
+/// Write a resolved star into a parent array, appending its new nodes.
+///
+/// [`splice_result`] without the rebuild, so non-overlapping stars can share
+/// one rebuild.
+///
+/// ### Params
+///
+/// * `parent` - Parent per node, grown by the star's new internal nodes
+/// * `branch` - Branch above each node, same indexing
+/// * `star` - The star that was resolved, in the array's node ids
+/// * `result` - What the primitive built
+fn apply_splice<T: BonsaiFloat>(
+    parent: &mut Vec<u32>,
+    branch: &mut Vec<f64>,
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+) {
+    let old = parent.len();
+    let n_new = result.parent.len() - star.member_nodes.len();
+    parent.resize(old + n_new, NO_NODE);
+    branch.resize(old + n_new, 0.0);
+
+    // Deleted nodes keep no parent and gain no children, so the rebuild never
+    // reaches them.
+    for &node in &star.deleted {
+        parent[node as usize] = NO_NODE;
+    }
+    for (node, up, t) in splice_edits(star, result, old as u32) {
+        parent[node as usize] = up;
+        branch[node as usize] = t;
+    }
+}
+
+/// [`splice_result`], plus each new node's node in the original tree, via
+/// [`map_back`].
+///
+/// ### Params
+///
+/// * `tree` - The tree the star was built from
+/// * `star` - The star that was resolved
+/// * `result` - What the primitive built
+///
+/// ### Returns
+///
+/// The spliced tree and, per node of it, its node in `tree` or [`NO_NODE`].
+fn splice_result_mapped<T: BonsaiFloat>(
+    tree: &Tree,
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+) -> Result<(Tree, Vec<u32>), BonsaiErrors> {
+    let mut parent: Vec<u32> = (0..tree.n_nodes())
+        .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
+        .collect();
+    let mut branch = tree.branches().to_vec();
+    apply_splice(&mut parent, &mut branch, star, result);
+    let out = rebuild(&parent, &branch, tree.root(), tree.n_leaves())?;
+    let to_old = map_back(&parent, &out, tree.n_nodes())?;
+    Ok((out, to_old))
+}
+
+/// The parent and branch every node a resolved star touches ends up with.
+///
+/// New ancestors are numbered `first_new` upwards in creation order. Shared
+/// with the masked views of [`crate::search::masked`].
+///
+/// ### Params
+///
+/// * `star` - The star that was resolved
+/// * `result` - What the primitive built
+/// * `first_new` - Id of the first new ancestor
+///
+/// ### Returns
+///
+/// One `(node, parent, branch)` per node whose parent or branch the splice
+/// sets.
+pub(crate) fn splice_edits<T: BonsaiFloat>(
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+    first_new: u32,
+) -> Vec<(u32, u32, f64)> {
+    let n = star.member_nodes.len();
+    let n_local = result.parent.len();
+    let map = |i: usize| -> u32 {
+        if i < n {
+            star.member_nodes[i]
+        } else {
+            first_new + (i - n) as u32
+        }
+    };
+    let mut edits = Vec::with_capacity(n_local + 1);
+
+    // Ancestors between centre and upstream member, nearest the upstream
+    // member first; their direction flips.
+    let upstream = star.has_upstream.then(|| n - 1);
+    let mut chain: Vec<u32> = Vec::new();
+    let mut on_chain = vec![false; n_local];
+    if let Some(u) = upstream {
+        let mut cur = result.parent[u];
+        while cur != NO_NODE {
+            chain.push(cur);
+            on_chain[cur as usize] = true;
+            cur = result.parent[cur as usize];
+        }
+    }
+
+    for i in 0..n_local {
+        if Some(i) == upstream || on_chain[i] {
+            continue;
+        }
+        let up = match result.parent[i] {
+            NO_NODE => star.centre,
+            up => map(up as usize),
+        };
+        edits.push((map(i), up, result.branch[i]));
+    }
+
+    if let Some(u) = upstream {
+        let above = star.member_nodes[u];
+        match chain.split_first() {
+            None => edits.push((star.centre, above, result.branch[u])),
+            Some((&top, _)) => {
+                edits.push((map(top as usize), above, result.branch[u]));
+                for j in 1..chain.len() {
+                    edits.push((
+                        map(chain[j] as usize),
+                        map(chain[j - 1] as usize),
+                        result.branch[chain[j - 1] as usize],
+                    ));
+                }
+                let bottom = chain[chain.len() - 1] as usize;
+                edits.push((star.centre, map(bottom), result.branch[bottom]));
+            }
+        }
+    }
+    edits
+}
+
+/// Map a resolved star back onto tree node ids and rebuild the arena.
+///
+/// Local index `i < n_members` is the member's own node (the upstream slot is
+/// the centre's parent); `n_members + a` is a new internal node.
+///
+/// ### Params
+///
+/// * `tree` - The tree the star was built from
+/// * `star` - The star that was resolved
+/// * `result` - What the primitive built
+///
+/// ### Returns
+///
+/// The spliced tree, or the error the arena failed with.
+pub(crate) fn splice_result<T: BonsaiFloat>(
+    tree: &Tree,
+    star: &CentreStar<T>,
+    result: &StarResult<T>,
+) -> Result<Tree, BonsaiErrors> {
+    let mut parent: Vec<u32> = (0..tree.n_nodes())
+        .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
+        .collect();
+    let mut branch = tree.branches().to_vec();
+    apply_splice(&mut parent, &mut branch, star, result);
+    rebuild(&parent, &branch, tree.root(), tree.n_leaves())
+}
+
 /// Build the star around a node: its children, plus its upstream side.
 ///
-/// The upstream member's effective leaf is [`UpState`]'s row for the centre,
-/// which sits at the centre's parent, and its branch to the centre is the
-/// centre's own upstream branch. That is exactly the convention [`Star`] wants,
-/// a precision that has not been diffusion corrected with the branch carried
-/// separately, so nothing is transformed on the way in.
+/// The upstream member is [`UpState`]'s row for the centre, with the centre's
+/// own branch, so nothing is transformed on the way in.
 ///
 /// ### Params
 ///
@@ -269,345 +521,47 @@ pub fn splice_star<T: BonsaiFloat>(
     })
 }
 
-/// [`splice_result`], plus where every node of the new tree came from: per
-/// node, its node in the tree the star was built from, recovered by walking up
-/// from each leaf in the spliced parent array and in the rebuilt tree in step.
-///
-/// ### Params
-///
-/// * `tree` - The tree the star was built from
-/// * `star` - The star that was resolved
-/// * `result` - What the primitive built
-///
-/// ### Returns
-///
-/// The spliced tree and, per node of it, its node in `tree` or [`NO_NODE`].
-fn splice_result_mapped<T: BonsaiFloat>(
-    tree: &Tree,
-    star: &CentreStar<T>,
-    result: &StarResult<T>,
-) -> Result<(Tree, Vec<u32>), BonsaiErrors> {
-    let mut parent: Vec<u32> = (0..tree.n_nodes())
-        .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
-        .collect();
-    let mut branch = tree.branches().to_vec();
-    apply_splice(&mut parent, &mut branch, star, result);
-    let out = rebuild(&parent, &branch, tree.root(), tree.n_leaves())?;
-    let to_old = map_back(&parent, &out, tree.n_nodes())?;
-    Ok((out, to_old))
-}
-
-/// Where every node of a rebuilt tree came from.
-///
-/// [`rebuild`] numbers the arena for itself, so the map is recovered by walking
-/// up from each leaf in the input parent array and in the rebuilt tree in step.
-/// Leaves keep their indices, and every internal node has a leaf below it, so
-/// each reachable node is paired exactly once.
-///
-/// ### Params
-///
-/// * `parent` - The parent array [`rebuild`] was given
-/// * `out` - The tree it built
-/// * `n_old` - Node count of the tree the array was edited from; input indices
-///   at or above it are nodes the edit created
-///
-/// ### Returns
-///
-/// Per node of `out`, its node in the original tree or [`NO_NODE`] for a
-/// created one, or `MalformedTree` if the two walks disagree.
-fn map_back(parent: &[u32], out: &Tree, n_old: usize) -> Result<Vec<u32>, BonsaiErrors> {
-    let mut to_old = vec![NO_NODE; out.n_nodes()];
-    for leaf in 0..out.n_leaves() as u32 {
-        let (mut from, mut to) = (leaf, leaf);
-        while to_old[to as usize] == NO_NODE {
-            to_old[to as usize] = from;
-            match (parent[from as usize], out.parent(to)) {
-                (NO_NODE, None) => break,
-                (up, Some(next)) if up != NO_NODE => (from, to) = (up, next),
-                _ => {
-                    return Err(BonsaiErrors::MalformedTree {
-                        reason: format!("rebuild map lost step at leaf {leaf}"),
-                    });
-                }
-            }
-        }
-    }
-    for old in &mut to_old {
-        if *old != NO_NODE && *old as usize >= n_old {
-            *old = NO_NODE;
-        }
-    }
-    Ok(to_old)
-}
-
-/// Map a resolved star back onto tree node ids and rebuild the arena.
-///
-/// Local index `i < n_members` is the member's own node, except the upstream
-/// slot which is the centre's parent; local index `n_members + a` is a new
-/// internal node. The one part of the star's topology that is not carried over
-/// as it stands is the path from the centre out to the upstream member, which
-/// the star holds pointing down and the tree needs pointing up.
-///
-/// ### Params
-///
-/// * `tree` - The tree the star was built from
-/// * `star` - The star that was resolved
-/// * `result` - What the primitive built
-///
-/// ### Returns
-///
-/// The spliced tree, or the error the arena failed with.
-pub(crate) fn splice_result<T: BonsaiFloat>(
-    tree: &Tree,
-    star: &CentreStar<T>,
-    result: &StarResult<T>,
-) -> Result<Tree, BonsaiErrors> {
-    let mut parent: Vec<u32> = (0..tree.n_nodes())
-        .map(|i| tree.parent(i as u32).unwrap_or(NO_NODE))
-        .collect();
-    let mut branch = tree.branches().to_vec();
-    apply_splice(&mut parent, &mut branch, star, result);
-    rebuild(&parent, &branch, tree.root(), tree.n_leaves())
-}
-
-/// Write a resolved star into a parent array, appending its new nodes.
-///
-/// The body of [`splice_result`] without the rebuild, so that several stars
-/// whose members do not overlap can be written into one array and rebuilt
-/// once. See [`splice_result`] for the index mapping.
-///
-/// ### Params
-///
-/// * `parent` - Parent per node, grown by the star's new internal nodes
-/// * `branch` - Branch above each node, same indexing
-/// * `star` - The star that was resolved, in the array's node ids
-/// * `result` - What the primitive built
-fn apply_splice<T: BonsaiFloat>(
-    parent: &mut Vec<u32>,
-    branch: &mut Vec<f64>,
-    star: &CentreStar<T>,
-    result: &StarResult<T>,
-) {
-    let old = parent.len();
-    let n_new = result.parent.len() - star.member_nodes.len();
-    parent.resize(old + n_new, NO_NODE);
-    branch.resize(old + n_new, 0.0);
-
-    // A deleted node keeps no parent and, since all of its children are members
-    // of the star, gains no children either, so the rebuild's walk never
-    // reaches it and it drops out of the arena.
-    for &node in &star.deleted {
-        parent[node as usize] = NO_NODE;
-    }
-    for (node, up, t) in splice_edits(star, result, old as u32) {
-        parent[node as usize] = up;
-        branch[node as usize] = t;
-    }
-}
-
-/// The parent and branch every node a resolved star touches ends up with.
-///
-/// The ancestors the primitive made are numbered `first_new` upwards in the
-/// order it made them. Shared by [`apply_splice`] and the masked views of
-/// [`crate::search::masked`], which apply the same edits to a view instead of
-/// an array.
-///
-/// ### Params
-///
-/// * `star` - The star that was resolved
-/// * `result` - What the primitive built
-/// * `first_new` - Id of the first new ancestor
-///
-/// ### Returns
-///
-/// One `(node, parent, branch)` per node whose parent or branch the splice
-/// sets.
-pub(crate) fn splice_edits<T: BonsaiFloat>(
-    star: &CentreStar<T>,
-    result: &StarResult<T>,
-    first_new: u32,
-) -> Vec<(u32, u32, f64)> {
-    let n = star.member_nodes.len();
-    let n_local = result.parent.len();
-    let map = |i: usize| -> u32 {
-        if i < n {
-            star.member_nodes[i]
-        } else {
-            first_new + (i - n) as u32
-        }
-    };
-    let mut edits = Vec::with_capacity(n_local + 1);
-
-    // The ancestors between the centre and the upstream member, nearest the
-    // upstream member first. These are the nodes whose direction flips.
-    let upstream = star.has_upstream.then(|| n - 1);
-    let mut chain: Vec<u32> = Vec::new();
-    let mut on_chain = vec![false; n_local];
-    if let Some(u) = upstream {
-        let mut cur = result.parent[u];
-        while cur != NO_NODE {
-            chain.push(cur);
-            on_chain[cur as usize] = true;
-            cur = result.parent[cur as usize];
-        }
-    }
-
-    for i in 0..n_local {
-        if Some(i) == upstream || on_chain[i] {
-            continue;
-        }
-        let up = match result.parent[i] {
-            NO_NODE => star.centre,
-            up => map(up as usize),
-        };
-        edits.push((map(i), up, result.branch[i]));
-    }
-
-    if let Some(u) = upstream {
-        // The upstream member is the centre's parent, and it keeps its own
-        // place in the tree: only what hangs off it changes.
-        let above = star.member_nodes[u];
-        match chain.split_first() {
-            None => edits.push((star.centre, above, result.branch[u])),
-            Some((&top, _)) => {
-                edits.push((map(top as usize), above, result.branch[u]));
-                for j in 1..chain.len() {
-                    edits.push((
-                        map(chain[j] as usize),
-                        map(chain[j - 1] as usize),
-                        result.branch[chain[j - 1] as usize],
-                    ));
-                }
-                let bottom = chain[chain.len() - 1] as usize;
-                edits.push((star.centre, map(bottom), result.branch[bottom]));
-            }
-        }
-    }
-    edits
-}
-
-/// Renumber an arbitrary parent array into the arena invariant and build it.
-///
-/// [`Tree::from_parents`] relabels internal nodes for itself but *checks*
-/// rather than fixes the requirement that a parent index exceed its children's,
-/// and a splice breaks that as soon as it puts a new node above the centre. So
-/// the nodes are numbered here in a post-order from the root, which gives the
-/// requirement by construction. Anything the walk does not reach, which is what
-/// a deleted node becomes, is dropped.
-///
-/// ### Params
-///
-/// * `parent` - Parent index per node, [`NO_NODE`] where there is none
-/// * `branch` - Branch above each node, same indexing
-/// * `root` - Node to walk from
-/// * `n_leaves` - Number of leaves, occupying indices `0..n_leaves`
-///
-/// ### Returns
-///
-/// The tree, or `MalformedTree` if the walk did not reach every leaf or the
-/// arena rejected the result.
-fn rebuild(
-    parent: &[u32],
-    branch: &[f64],
-    root: u32,
-    n_leaves: usize,
-) -> Result<Tree, BonsaiErrors> {
-    let n = parent.len();
-
-    let mut ptr = vec![0u32; n + 1];
-    for &par in parent {
-        if par != NO_NODE {
-            ptr[par as usize + 1] += 1;
-        }
-    }
-    for i in 0..n {
-        ptr[i + 1] += ptr[i];
-    }
-    let mut cursor = ptr.clone();
-    let mut kids = vec![0u32; ptr[n] as usize];
-    for (i, &par) in parent.iter().enumerate() {
-        if par != NO_NODE {
-            kids[cursor[par as usize] as usize] = i as u32;
-            cursor[par as usize] += 1;
-        }
-    }
-
-    let mut new_id = vec![NO_NODE; n];
-    let mut next = n_leaves as u32;
-    let mut n_seen_leaves = 0usize;
-    let mut stack: Vec<(u32, bool)> = vec![(root, false)];
-    while let Some((node, expanded)) = stack.pop() {
-        if expanded {
-            if (node as usize) < n_leaves {
-                new_id[node as usize] = node;
-                n_seen_leaves += 1;
-            } else {
-                new_id[node as usize] = next;
-                next += 1;
-            }
-            continue;
-        }
-        stack.push((node, true));
-        let (lo, hi) = (ptr[node as usize] as usize, ptr[node as usize + 1] as usize);
-        // Pushed last-first so the post-order visits siblings in their arena
-        // order. Siblings of equal height then keep their relative order
-        // through the relabelling, which is what lets `search::spr` recognise
-        // the subtrees a splice left alone by their children alone.
-        for &child in kids[lo..hi].iter().rev() {
-            stack.push((child, false));
-        }
-    }
-    if n_seen_leaves != n_leaves {
-        return Err(BonsaiErrors::MalformedTree {
-            reason: format!(
-                "the splice left {n_seen_leaves} of {n_leaves} leaves connected to the root"
-            ),
-        });
-    }
-
-    let n_new = next as usize;
-    let mut new_parent = vec![NO_NODE; n_new];
-    let mut new_branch = vec![0.0f64; n_new];
-    for old in 0..n {
-        let here = new_id[old];
-        if here == NO_NODE {
-            continue;
-        }
-        new_parent[here as usize] = match parent[old] {
-            NO_NODE => NO_NODE,
-            par => new_id[par as usize],
-        };
-        new_branch[here as usize] = branch[old];
-    }
-    Tree::from_parents(new_parent, new_branch, n_leaves)
-}
-
 ////////////////////////////
 // Step 3: the polytomies //
 ////////////////////////////
 
+/// Whether a node's star could change anything, read off the tree without
+/// building it (same test as [`CentreStar::is_polytomy`]).
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `node` - Internal node to test
+///
+/// ### Returns
+///
+/// True when the node carries more members than the primitive stops at.
+fn is_polytomy(tree: &Tree, node: u32) -> bool {
+    tree.children(node).len() + usize::from(tree.parent(node).is_some()) > RESOLVED_STAR_MEMBERS
+}
+
+/// Count the nodes whose star is bigger than the primitive stops at.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+///
+/// ### Returns
+///
+/// The number of polytomies, the root's trifurcation not among them.
+fn count_polytomies(tree: &Tree) -> usize {
+    tree.internal_postorder()
+        .filter(|&node| is_polytomy(tree, node))
+        .count()
+}
+
 /// Collapse every zero-length internal edge into the node above it.
 ///
-/// The polytomies SPEC.md section 9.2 goes looking for are not structural when
-/// they are made: the merge scan solves a branch length to zero and the arena
-/// still holds two separate nodes joined by an edge of length zero. A
-/// zero-length edge puts its two ends at the same point, so deleting the lower
-/// one and hanging its children off the upper one leaves the loglikelihood
-/// exactly unchanged and gives the upper node the degree the model says it
-/// already has. Without this, [`count_polytomies`] finds nothing on a tree the
-/// greedy merge has left structurally binary, which is the ordinary case, and
-/// step 3 of the search does nothing at all.
-///
-/// ### Exactly zero, not a tolerance
-///
-/// The two places a branch reaches zero are the early return in
-/// [`crate::model::branch::optimise_edge`], which fires when the two effective
-/// leaves already sit closer than their own error bars allow, and the ends of
-/// the split bracket in [`crate::model::merge`]. Both return a literal `0.0`,
-/// precisely so that this test can be exact. A tolerance would need a scale to
-/// be relative to, and nothing in
-/// SPEC.md fixes one: a branch that is merely short is a claim the model is
-/// entitled to make, and collapsing it would be editing the answer.
+/// The merge scan leaves structurally binary nodes joined by exact-zero edges
+/// ([`crate::model::branch::optimise_edge`] and the bracket ends in
+/// [`crate::model::merge`] return a literal `0.0`, so the test is exact, not a
+/// tolerance). Collapsing leaves the loglikelihood unchanged and exposes the
+/// polytomies step 3 resolves.
 ///
 /// ### Params
 ///
@@ -623,8 +577,8 @@ pub(crate) fn collapse_zero_edges(tree: &Tree) -> Result<Option<(Tree, Vec<u32>)
     let n_leaves = tree.n_leaves();
     let root = tree.root();
 
-    // A leaf is never collapsed, whatever its branch length: it carries an
-    // observation and has nowhere to put it. The root has no upstream branch.
+    // Leaves carry an observation and are never collapsed; the root has no
+    // upstream branch.
     let drop: Vec<bool> = (0..n)
         .map(|i| i >= n_leaves && i as u32 != root && tree.branch(i as u32) == 0.0)
         .collect();
@@ -636,11 +590,9 @@ pub(crate) fn collapse_zero_edges(tree: &Tree) -> Result<Option<(Tree, Vec<u32>)
     let mut branch = vec![0.0f64; n];
     for i in 0..n {
         if drop[i] {
-            // Left unreachable from the root, which is how `rebuild` drops it.
             continue;
         }
-        // A chain of zero-length edges collapses onto the node above the whole
-        // chain, so walk past every dropped ancestor rather than just one.
+        // Walk past every dropped ancestor: a chain collapses onto the node above it.
         let mut up = tree.parent(i as u32);
         while let Some(par) = up {
             if !drop[par as usize] {
@@ -659,69 +611,19 @@ pub(crate) fn collapse_zero_edges(tree: &Tree) -> Result<Option<(Tree, Vec<u32>)
 
 /// Resolve every polytomy in a tree (SPEC.md section 9.2).
 ///
-/// Merging creates zero-length branches, which collapse into polytomies. A
-/// zero-length edge does not change the likelihood, so the configuration was
-/// optimal when it was made; by the time the root has moved it often is not, so
-/// the star primitive is run again on every node carrying more members than it
-/// stops at.
+/// Each sweep collapses zero-length edges ([`collapse_zero_edges`]), then
+/// resolves the first node (ascending index, a post-order) whose star exceeds
+/// [`RESOLVED_STAR_MEMBERS`], and restarts because [`Tree::from_parents`]
+/// renumbers internal nodes. It runs to a fixed point: termination rests on
+/// every accepted resolution raising the loglikelihood by more than `min_gain`,
+/// the collapse leaving it alone, and finitely many topologies. Collapsing every
+/// sweep gave 3 to 4 times as many resolutions and closer recovery than
+/// collapsing once on entry.
 ///
-/// The collapse is [`collapse_zero_edges`] and it runs at the top of every
-/// sweep, because it is what makes the polytomies structural: a merge that put
-/// its new ancestor at zero distance from the centre leaves two nodes where the
-/// model has one, and nothing downstream of here would ever notice.
-///
-/// ### Order
-///
-/// Ascending node index, which the arena invariant makes a post-order, so a
-/// node is resolved only after everything below it has been. That is the same
-/// direction [`NodeState::prune`] settles the tree in: a centre's downstream
-/// members are then effective leaves of subtrees that have already been
-/// improved, and only its upstream member is stale. The alternative, root
-/// downwards, has it the other way round and stales the majority of the star.
-/// The order is otherwise free, which is why the choice is documented rather
-/// than defended: nothing in SPEC.md fixes it.
-///
-/// ### One pass or a fixed point
-///
-/// A fixed point, because a resolution changes the up-state of every node in
-/// the tree and a centre that had nothing to gain earlier could have something
-/// to gain later. Termination rests on the loglikelihood rather than on the
-/// degrees: every accepted resolution raises it by more than the primitive's
-/// `min_gain`, the collapse leaves it exactly alone, and it is bounded above by
-/// the best of finitely many topologies. The degree argument that used to sit
-/// here is no longer available, because the collapse can hand a node a degree
-/// it did not have before. What it does bound is a single sweep: a resolution
-/// only lowers its own centre's degree and every ancestor it creates is binary.
-/// The sweep restarts after each one because [`Tree::from_parents`] renumbers
-/// the internal nodes and a cursor into the old numbering means nothing.
-///
-/// **One pass is not enough, and the collapse is why.** Measured against the
-/// same runs with the collapse done once on entry rather than every sweep,
-/// collapsing every sweep makes three to four times as many resolutions, gains
-/// more, and ends closer to the generating tree.
-///
-/// A resolution that puts its new ancestor at zero distance from its centre has
-/// made another polytomy, and re-resolving it against the moved centre is worth
-/// two to four times the loglikelihood of stopping there. It costs four to five
-/// times as many resolutions, and a resolution is a sweep, so this is the
-/// expensive half of step 3. Structural recovery follows the loglikelihood on
-/// aggregate but not run by run: at the mildest collapse threshold two of six
-/// seeds came out with a worse Robinson-Foulds despite a four-fold larger gain,
-/// which is the data's noise rather than the search's doing.
-///
-/// ### What a sweep costs
-///
-/// One resolution per sweep. The down rows are settled once and kept in a
-/// [`RowStore`] that a collapse or a splice updates in the rows it changed,
-/// and each sweep's stars read their up rows through [`LazyRows`], so a sweep
-/// costs its stars and the `O(depth p)` chains above them rather than a settle
-/// of the whole tree. Every row is the settle's own bits, so the resolutions
-/// are the ones a settle per sweep makes. Measured 2026-09-26 on 25k
-/// Sanity-preprocessed cells, from the same tree: identical loglikelihood,
-/// 69 s to 3.5 s. Resolving several polytomies per sweep is still not
-/// available: a resolution changes every up row in the tree, so the second
-/// centre of a sweep would be resolved against stale rows and the answer would
-/// move.
+/// Down rows are settled once and kept in a [`RowStore`]; stars read up rows
+/// through [`LazyRows`], so a sweep costs its stars and `O(depth p)` chains
+/// rather than a full settle (69 s to 3.5 s on 25k cells, 2026-09-26, same
+/// loglikelihood). One resolution per sweep, since each changes every up row.
 ///
 /// ### Params
 ///
@@ -738,13 +640,8 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
     leaves: Leaves<'_, T>,
     params: Option<StarParams>,
 ) -> Result<PolytomyResult, BonsaiErrors> {
-    // The primitive itself terminates structurally, one merge a round down to
-    // three members, so it takes any floor including a negative one. This loop
-    // does not: it rests on every accepted resolution raising the loglikelihood
-    // by more than `min_gain`. At zero the primitive accepts a merge whose gain
-    // is a rounding artefact, the resolution lands the ancestor at zero distance
-    // from its centre, the next sweep's collapse folds it back, and the same
-    // merge is found again, on a six-leaf star, without ever terminating.
+    // At zero the primitive accepts rounding-artefact merges, the next collapse
+    // folds them back and the same merge recurs forever.
     let min_gain = params.unwrap_or_default().min_gain;
     if !min_gain.is_finite() || min_gain <= 0.0 {
         return Err(BonsaiErrors::BadParameter {
@@ -762,19 +659,13 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
     let mut n_resolved = 0usize;
     let mut sweeps = 0usize;
 
-    // Settled once. A collapse or a splice then rewrites only the down rows it
-    // changed, and each sweep forms up rows only along the chains its stars
-    // read; both are the sweep's own bits, so every resolution is the one a
-    // settle per sweep would make, at `O(depth p)` a sweep instead of `O(n p)`.
     let (down, _) = crate::search::settled_down(&tree, leaves)?;
     let mut store = RowStore::from_state(&down, tree.n_nodes());
     drop(down);
 
     loop {
         sweeps += 1;
-        // A no-op on the first sweep, since the entry tree was collapsed above.
-        // Later sweeps need it because a resolution can itself place an
-        // ancestor at zero distance from its centre.
+        // No-op on the first sweep; later resolutions can create zero edges.
         if let Some((collapsed, to_old)) = collapse_zero_edges(&tree)? {
             store.accept(&collapsed, &to_old, &tree)?;
             tree = collapsed;
@@ -784,19 +675,12 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
 
         let mut accepted: Option<(Tree, Vec<u32>)> = None;
         for node in tree.internal_postorder() {
-            // The degree test first, off the tree, and the star only for a node
-            // that passes it. `CentreStar::is_polytomy` reads nothing the tree
-            // does not already hold, and building a star copies `O(deg * p)`
-            // rows, so asking it the other way round copied the whole tree's
-            // rows once a sweep to answer a question about node degrees.
+            // Degree test off the tree first: building a star copies `O(deg p)` rows.
             if !is_polytomy(&tree, node) {
                 continue;
             }
             let star = lazy_centre_star(&tree, &rows, node)?;
-            // Splicing builds a tree, which is `O(n)`; the primitive that
-            // decides whether there is anything to splice is `O(deg^3 p)` over
-            // a handful of members. So resolve first and splice only the
-            // resolution that is kept.
+            // Splicing is `O(n)`, so resolve first and splice only a kept result.
             let result = resolve_star(star.view(), params)?;
             if !result.merges.is_empty() {
                 let (next, to_old) = splice_result_mapped(&tree, &star, &result)?;
@@ -824,39 +708,6 @@ pub fn resolve_polytomies<T: BonsaiFloat>(
         n_resolved,
         sweeps,
     })
-}
-
-/// Whether resolving a node's star could change anything, read off the tree.
-///
-/// The same test as [`CentreStar::is_polytomy`] and the reason that one exists
-/// as well: a sweep needs the answer for every node and the star for almost
-/// none of them.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `node` - Internal node to test
-///
-/// ### Returns
-///
-/// True when the node carries more members than the primitive stops at.
-fn is_polytomy(tree: &Tree, node: u32) -> bool {
-    tree.children(node).len() + usize::from(tree.parent(node).is_some()) > RESOLVED_STAR_MEMBERS
-}
-
-/// Count the nodes whose star is bigger than the primitive stops at.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-///
-/// ### Returns
-///
-/// The number of polytomies, the root's trifurcation not among them.
-fn count_polytomies(tree: &Tree) -> usize {
-    tree.internal_postorder()
-        .filter(|&node| is_polytomy(tree, node))
-        .count()
 }
 
 ///////////

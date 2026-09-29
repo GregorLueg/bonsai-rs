@@ -1,36 +1,15 @@
 //! Two properties of the merge score that decide how the star can be
-//! accelerated.
+//! accelerated: reducibility (does merging a mutually nearest pair ever lift
+//! another pair above it, which decides whether batch merging is safe) and
+//! feature subsampling (does the argmax of a round survive a subset of features).
 //!
-//! Both need the same thing, an exhaustive star primitive that can be
-//! interrogated round by round, so they share one scaffold here. It reproduces
-//! SPEC.md sections 4 and 8.1 over the public `score_merge`, which means it is
-//! a second transcription of the recursion and not a call into
-//! `search::star`; the `check_scaffold` assertion at the top of the run is what
-//! keeps the two honest.
-//!
-//! ### Reducibility
-//!
-//! An objective is reducible when merging a mutually nearest pair never lifts
-//! another pair above the score the merged pair had. That is the condition
-//! under which nearest-neighbour chaining and Boruvka-style batch merging give
-//! the same dendrogram as the round-by-round scan. If it holds here, a batch
-//! of mutually best pairs can be merged in one round without a certificate.
-//! If it does not, the count and size of the inversions say how much
-//! verification a batch needs.
-//!
-//! ### Feature subsampling
-//!
-//! The gain is a sum over features, so it can be estimated on `p'` of them and
-//! rescaled. What matters is not the error in the gain but whether the argmax
-//! over a round's candidates survives, and what a wrong pick costs in nats.
-//!
-//! **Run on a quiet machine.** Check `uptime` first.
+//! Both share an exhaustive star scaffold, a second transcription of SPEC.md
+//! sections 4 and 8.1 over `score_merge`; `check_scaffold` asserts it agrees
+//! with `search::star`.
 //!
 //! ```sh
 //! cargo bench --bench approx_star
 //! ```
-//!
-//! Plain `main`, no harness.
 
 use bonsai_rs::model::merge::{EffLeaf, MergeScratch, score_merge};
 use bonsai_rs::search::star::{Star, resolve_star};
@@ -43,21 +22,13 @@ use std::time::Instant;
 // Parameters //
 ////////////////
 
-/// Leaf counts for the reducibility scan.
-///
-/// Small on purpose: this is an exhaustive scan re-run after every merge, so
-/// it is `O(n^3 p)` twice over. The property it measures is structural and
-/// does not need the sizes a timing would.
+/// Leaf counts for the reducibility scan; small, as it is an exhaustive `O(n^3 p)` rescan.
 const REDUCIBILITY_LEAVES: [usize; 2] = [64, 128];
 
-/// Features for the reducibility scan. Inversions are a property of the score's
-/// shape, not of how many features it sums over.
+/// Features for the reducibility scan.
 const REDUCIBILITY_FEATURES: usize = 200;
 
-/// Leaves and features for the subsampling scan.
-///
-/// Two thousand features because that is where the crate expects to work and
-/// the whole question is what fraction of them a ranking pass needs.
+/// Leaves for the subsampling scan.
 const SUBSAMPLE_LEAVES: usize = 128;
 
 /// Features for the subsampling scan.
@@ -142,10 +113,8 @@ fn peel(mc: &[f64], wc: &[f64], k: &Member, l: &Member, p: usize) -> (Vec<f64>, 
 
 /// Every pair's gain at the current centre, over the given feature columns.
 ///
-/// Passing a subset of columns is what the subsampling scan needs: the branch
-/// lengths are then optimised against the subset too, which is what a
-/// subsampled implementation would actually do, and the gain is rescaled by
-/// `p / p'` on the way out.
+/// With a column subset, branch lengths are optimised against the subset and the
+/// gain is rescaled by `p / p'`.
 ///
 /// ### Params
 ///
@@ -157,7 +126,6 @@ fn peel(mc: &[f64], wc: &[f64], k: &Member, l: &Member, p: usize) -> (Vec<f64>, 
 ///
 /// One gain per unordered pair, in `(i, j)` ascending order.
 fn scan(members: &[Member], columns: Option<&[usize]>, p: usize) -> Vec<((usize, usize), f64)> {
-    // Gather once per member rather than once per pair.
     let (view, q) = match columns {
         None => (members.to_vec(), p),
         Some(cols) => {
@@ -205,9 +173,7 @@ fn scan(members: &[Member], columns: Option<&[usize]>, p: usize) -> Vec<((usize,
 
 /// Replace two members by the ancestor the merge inserts (SPEC.md section 4).
 ///
-/// The effective mean is formed as a convex combination, not as a ratio of
-/// weighted sums, for the reason `CLAUDE.md` gives: the result is pinned
-/// between the two child means and cannot cancel.
+/// The effective mean is a convex combination, not a ratio of weighted sums (see `CLAUDE.md`).
 ///
 /// ### Params
 ///
@@ -291,9 +257,7 @@ fn fixture(n: usize, p: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
 /// Merge greedily and count how often a merge lifts another pair above the
 /// score the merged pair had.
 ///
-/// An inversion is what makes batch merging unsafe, so both the count and the
-/// worst excess matter: a handful of inversions worth a millinat is a different
-/// answer from a handful worth ten nats.
+/// An inversion is what makes batch merging unsafe.
 ///
 /// ### Params
 ///
@@ -426,8 +390,7 @@ fn subsampling(n: usize, p: usize, seed: u64, tally: &mut [SubsampleTally]) {
     let (means, precisions) = fixture(n, p, seed);
     let mut members = initial_members(&means, &precisions, n, p);
 
-    // Five checkpoints spread over the star, because the first round is the
-    // easiest one and a method judged on it alone flatters itself.
+    // Checkpoints spread over the star; the first round is the easiest.
     let total_rounds = n - MIN_CENTRE_MEMBERS;
     let checkpoints: Vec<usize> = (1..=5).map(|i| i * total_rounds / 6).collect();
 
@@ -506,10 +469,7 @@ fn subsampling(n: usize, p: usize, seed: u64, tally: &mut [SubsampleTally]) {
 
 /// Assert the scaffold reproduces the shipped primitive's first merge.
 ///
-/// This file transcribes SPEC.md sections 4 and 8.1 a second time so it can
-/// look inside a round, and a second transcription is a second chance to get
-/// it wrong. Both the pair chosen and its gain have to match
-/// [`resolve_star`]'s, or nothing below means anything.
+/// Both the pair chosen and its gain must match [`resolve_star`]'s.
 fn check_scaffold() {
     let (n, p) = (32usize, 64usize);
     let (means, precisions) = fixture(n, p, 7);

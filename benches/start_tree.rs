@@ -1,33 +1,17 @@
-//! Does search step 2 have to exist?
+//! Does search step 2 have to exist? Compares starting trees for steps 3 to 7:
+//! greedy (steps 1 and 2), UPGMA, Ward, the graph linkage that ships, and a
+//! random topology as the null. Also per-step scaling, an SPR ablation, linkage
+//! drift against the dense chain, and a KNN backend crossover.
 //!
-//! Steps 5, 6 and 7 are a local search and step 2 only supplies the tree they
-//! start from. Step 2 is 31 to 49 per cent of a run and scales `n^1.65`, so if
-//! a cheap starting tree lands in the same place after refinement then the
-//! greedy agglomeration is replaceable by something linear.
-//!
-//! Four starts, all refined by the identical steps 3 to 7:
-//!
-//! - **greedy**, the current steps 1 and 2, as the baseline;
-//! - **average**, UPGMA on Euclidean distance between the transformed means;
-//! - **ward**, the same chain on squared Euclidean with Ward's update;
-//! - **random**, a uniformly random binary topology, as the null.
-//!
-//! The linkages are built here rather than in `src/` on purpose. This is an
-//! experiment, and nothing about it should ship until the table says it should.
-//! Both are exact under nearest-neighbour chaining because both objectives are
-//! reducible (Bruynooghe 1977, Murtagh 1983), so the `O(n^2)` chain gives the
-//! same dendrogram as the `O(n^3)` naive scan.
-//!
-//! What to read: `RF` against the generating tree is the answer, `loglik` is
-//! the tiebreak, and `build` against `refine` says what would be saved.
-//!
-//! **Run on a quiet machine.** Check `uptime` first.
+//! The dense linkages are nearest-neighbour chains, exact because both
+//! objectives are reducible (Bruynooghe 1977, Murtagh 1983). `RF` to the
+//! generating tree is the answer, `loglik` the tiebreak. Blocks: `size`,
+//! `noise`, `steps`, `spr`, `drift` (`quick` skips the k and cadence sweeps),
+//! `backend`; no argument runs all.
 //!
 //! ```sh
-//! cargo bench --bench start_tree
+//! cargo bench --bench start_tree -- [block ...]
 //! ```
-//!
-//! Plain `main`, no harness.
 
 use bonsai_rs::model::global::{collapse_onto_every_node, optimise_branch_lengths};
 use bonsai_rs::model::likelihood::NodeState;
@@ -54,27 +38,19 @@ use std::time::Instant;
 // Parameters //
 ////////////////
 
-/// Leaf counts swept. The top end is where `benches/pipeline.rs` stops, so the
-/// baseline column is comparable to the published table.
+/// Leaf counts swept; the top end matches `benches/pipeline.rs`.
 const LEAVES: [usize; 4] = [256, 512, 1024, 2048];
 
-/// Feature counts swept. Recovery improves with features, so a start that only
-/// works at 2000 is not a start.
+/// Feature counts swept.
 const FEATURES: [usize; 2] = [200, 2000];
 
-/// Simulation seeds per configuration. Robinson-Foulds moves by a few splits
-/// between seeds, so a single one decides nothing.
+/// Simulation seeds per configuration.
 const SEEDS: [u64; 5] = [31, 32, 33, 34, 35];
 
 /// Measurement noise in transformed units, matching `benches/pipeline.rs`.
 const NOISE: f64 = 0.3;
 
 /// Leaf count for the noise sweep.
-///
-/// The size sweep runs at one noise level, where every start recovers nearly
-/// the whole topology. That is a regime where the starts cannot be told apart,
-/// so it cannot be the only evidence: this block holds the size fixed and turns
-/// the noise up until the search stops being easy.
 const NOISE_SWEEP_LEAVES: usize = 512;
 
 /// Features for the noise sweep.
@@ -84,85 +60,46 @@ const NOISE_SWEEP_FEATURES: usize = 2000;
 const NOISES: [f64; 4] = [0.3, 0.6, 1.0, 1.6];
 
 /// Leaf counts for the per-step scaling block.
-///
-/// The published per-step attribution is at 200 features and stops at 2048,
-/// where polytomy resolution reads `n^2.83` and the interchanges `n^2.60`. Both
-/// are round counts, and the round counts fall as the feature axis grows, so
-/// those exponents say nothing about the regime the crate is meant for. This
-/// block is at 2000 features from a Ward start and goes far enough to fit one.
 const STEP_LEAVES: [usize; 5] = [1024, 2048, 4096, 8192, 16384];
 
 /// Features for the per-step scaling block.
 const STEP_FEATURES: usize = 2000;
 
-/// Seeds for the per-step scaling block. Two, because the top size is an
-/// `O(n^2 p)` linkage over a 2 GB distance matrix and the exponent is what is
-/// wanted, not a tight mean.
+/// Seeds for the per-step scaling block; two, as the top size builds a 2 GB distance matrix.
 const STEP_SEEDS: [u64; 2] = [31, 32];
 
 /// Wall-clock ceiling for one configuration of the per-step block.
-///
-/// Past this the sweep stops growing, so an unattended run cannot turn into an
-/// overnight one. Same guard `benches/pipeline.rs` uses.
 const STEP_BUDGET_SECONDS: f64 = 1200.0;
 
-/// Placement queries per size in the beam block.
-///
-/// SPR is the only superlinear step left and its cost is `rounds` x `O(n)`
-/// candidates x the nodes the placement beam scores. Rounds are flat at two to
-/// four, so the exponent lives in the beam, and this measures it directly:
-/// a cell already in the tree, placed back onto it.
+/// Placement queries per size in the beam block: cells already in the tree, placed back onto it.
 const BEAM_QUERIES: usize = 32;
 
 /// Leaf count for the SPR ablation at raised noise.
-///
-/// Small enough that four noise levels are minutes rather than an hour, and
-/// large enough that a difference of a few splits is not one tree's luck.
 const SPR_NOISE_LEAVES: usize = 2048;
 
 /// Leaf counts for the linkage drift block.
 const DRIFT_LEAVES: [usize; 4] = [512, 1024, 2048, 4096];
 
 /// Neighbour counts swept in the drift block.
-///
-/// The graph linkage reaches the same Robinson-Foulds distance as the dense one
-/// after refinement and yet costs SPR three to seven times more, so the
-/// starting trees differ in a way `RF` to the truth does not see. This sweep
-/// asks in what way, and how much `k` it takes to close.
 const DRIFT_K: [usize; 5] = [8, 16, 32, 64, 128];
 
-/// Neighbour count held fixed while the rebuild cadence is swept.
-///
-/// Sixteen, the shipped default, where the `k` sweep chains worst: depth 131
-/// against 12 at 4096 leaves. If a cadence collapses that back to `log2(n)` the
-/// design survives at `O(n k p)`; if not, agglomeration is the wrong shape.
+/// Neighbour count held fixed while the rebuild cadence is swept (the shipped default).
 const CADENCE_K: usize = 16;
 
 /// Live-count fractions swept as the rebuild trigger. Zero never redraws on
 /// the count and leaves only the dead-end redraw.
 const CADENCE_FRACTIONS: [f64; 4] = [0.0, 0.5, 0.75, 0.9];
 
-/// Leaf count for the hard-regime rows of the drift block.
-///
-/// The balanced fixture at noise 0.3 is the easy regime: every round is one
-/// level and the union lists cover four. Rule 7 says test the hard one too, so
-/// the same columns are reported at raised noise and on the unbalanced
-/// generator, where Ward itself chains and the rounds have to keep up.
+/// Leaf count for the hard-regime rows of the drift block (raised noise, unbalanced generator).
 const HARD_LEAVES: usize = 2048;
 
 /// Noise levels for the unbalanced rows of the drift block.
 const HARD_UNBALANCED_NOISES: [f64; 2] = [0.3, 1.0];
 
 /// Leaf counts for the backend crossover block.
-///
-/// `resolve_backend` hands sizes above 4096 to kmknn, which measured 43.82 s
-/// at 8192 by 2000 against 1.34 s for exhaustive at 4096. That threshold is a
-/// placeholder and this block is where its replacement comes from.
 const BACKEND_LEAVES: [usize; 3] = [4096, 8192, 16384];
 
-/// Backends compared in the crossover block. Exhaustive is the reference the
-/// others are scored against, since it is exact and their trees should match
-/// it up to recall.
+/// Backends compared in the crossover block; exhaustive is the exact reference.
 const BACKENDS: [KnnBackend; 3] = [
     KnnBackend::Exhaustive,
     KnnBackend::Kmknn,
@@ -173,11 +110,8 @@ const BACKENDS: [KnnBackend; 3] = [
 /// backend that exceeds it is not run at the next size.
 const BACKEND_BUDGET_SECONDS: f64 = 120.0;
 
-/// Members left attached to the root when a linkage stops.
-///
-/// Three, not two. A binary dendrogram's root is degree two in the unrooted
-/// sense, which carries no information and which `search::spr` refuses to prune
-/// a child of. The greedy star primitive stops at three for the same reason.
+/// Members left attached to the root when a linkage stops. A degree-two root
+/// carries no information and `search::spr` refuses to prune a child of it.
 const ROOT_MEMBERS: usize = 3;
 
 /// Which starting tree a row measures.
@@ -212,15 +146,27 @@ impl Start {
     }
 }
 
+/// One graph-linkage configuration against the dense chain, averaged over
+/// `STEP_SEEDS`.
+#[derive(Clone, Copy, Default)]
+struct DriftRow {
+    /// Build seconds.
+    secs: f64,
+    /// Robinson-Foulds to the dense Ward tree.
+    to_dense: f64,
+    /// Robinson-Foulds to the generating tree.
+    to_truth: f64,
+    /// Maximum leaf depth.
+    depth: f64,
+}
+
 /////////////
 // Linkage //
 /////////////
 
 /// Full squared-Euclidean distance matrix over the transformed means.
 ///
-/// Row-major `n * n`, with the diagonal at infinity so an argmin never returns
-/// the point itself. `O(n^2 p)`, which is the part of this that would have to
-/// go through a neighbour graph if any of it ever shipped.
+/// Row-major `n * n`, diagonal at infinity so an argmin never returns the point itself.
 ///
 /// ### Params
 ///
@@ -254,9 +200,7 @@ fn squared_distances(means: &[f64], n: usize, p: usize) -> Vec<f64> {
 
 /// Agglomerate by nearest-neighbour chaining under a Lance-Williams update.
 ///
-/// The chain walks to a mutually nearest pair, merges it, and updates the row
-/// of the surviving slot in place. Both objectives here are reducible, so the
-/// pair the chain finds is the pair the naive scan would have found.
+/// Both objectives are reducible, so the chain finds the pair the naive scan would.
 ///
 /// ### Params
 ///
@@ -276,8 +220,7 @@ fn linkage_tree(means: &[f64], n: usize, p: usize, ward: bool) -> Tree {
         d.par_iter_mut().for_each(|x| *x = x.sqrt());
     }
 
-    // Slot `i` holds a live cluster; `node_of[i]` is the arena node summarising
-    // it. Merging writes into the first slot and retires the second.
+    // Slot `i` holds a live cluster and `node_of[i]` its arena node; merging keeps the first slot.
     let mut active = vec![true; n];
     let mut size = vec![1.0f64; n];
     let mut node_of: Vec<u32> = (0..n as u32).collect();
@@ -353,8 +296,6 @@ fn linkage_tree(means: &[f64], n: usize, p: usize, ward: bool) -> Tree {
 
 /// A uniformly random binary topology over `n` leaves.
 ///
-/// The null: whatever refinement recovers from here is recovered from nothing.
-///
 /// ### Params
 ///
 /// * `n` - Number of cells
@@ -393,10 +334,6 @@ fn random_tree(n: usize, seed: u64) -> Tree {
     let branch = vec![1.0f64; parent.len()];
     Tree::from_parents(parent, branch, n).expect("random tree")
 }
-
-//////////
-// Main //
-//////////
 
 /// Build one starting tree and report what it cost.
 ///
@@ -477,8 +414,7 @@ fn run(n: usize, p: usize, noise: f64) -> Vec<(Start, f64, f64, f64, f64)> {
         }))
         .expect("simulation");
 
-        // `simulate` already returns transformed units, so ingest is bypassed
-        // exactly as `benches/pipeline.rs` bypasses it.
+        // Simulated data is already in transformed units: ingest is bypassed.
         let data = PreparedData {
             transformed_means: sim.means.clone(),
             transformed_precisions: sim.precisions(),
@@ -527,10 +463,8 @@ fn run(n: usize, p: usize, noise: f64) -> Vec<(Start, f64, f64, f64, f64)> {
 
 /// Steps 3 to 7 timed one at a time, from a Ward start.
 ///
-/// `bonsai::refine` runs these as one call, so the split has to be replicated
-/// here the way `benches/steps.rs` replicates it. The order is the pipeline's
-/// and is not negotiable: the interchange and regraft filters reject every
-/// improvement available until the branch lengths are optimised.
+/// `bonsai::refine` runs these as one call, so the split is replicated here as
+/// in `benches/steps.rs`, in the pipeline's order.
 ///
 /// ### Params
 ///
@@ -605,10 +539,7 @@ fn step_split(n: usize, seed: u64, dense: bool) -> ([f64; 6], f64) {
 
 /// What one size costs and recovers with SPR and without it, plus the beam.
 ///
-/// Both arms share the Ward start and steps 3 and 4, so the only difference is
-/// whether step 5 runs. If they reach the same Robinson-Foulds then SPR is
-/// buying nothing at this noise level and a tree-distance limit is the fix
-/// rather than a rewrite.
+/// Both arms share the Ward start and steps 3 and 4; only step 5 differs.
 ///
 /// ### Params
 ///
@@ -636,7 +567,7 @@ fn spr_ablation(n: usize, seed: u64, noise: f64) -> ([f64; 3], [f64; 3], f64) {
         n_features: p,
     };
 
-    // Shared prefix: the Ward start, polytomy resolution and step 4.
+    // Shared prefix: start tree, polytomy resolution, step 4.
     let mut base = graph_linkage(&sim.means, n, p, None).expect("linkage");
     base = resolve_polytomies(&base, leaves, None)
         .expect("step 3")
@@ -645,8 +576,7 @@ fn spr_ablation(n: usize, seed: u64, noise: f64) -> ([f64; 3], [f64; 3], f64) {
         NodeState::new(base.n_nodes(), p, leaves.means, leaves.precisions).expect("state");
     optimise_branch_lengths(&mut base, &mut state, None).expect("step 4");
 
-    // Both arms finish with the interchanges and step 7, so the only thing that
-    // differs is step 5.
+    // Both arms finish with steps 6 and 7.
     let finish = |mut tree: Tree| -> (f64, f64) {
         tree = nni(&tree, leaves, None, Verbosity::Quiet)
             .expect("step 6")
@@ -669,9 +599,7 @@ fn spr_ablation(n: usize, seed: u64, noise: f64) -> ([f64; 3], [f64; 3], f64) {
     let (rf_without, ll_without) = finish(base);
     let without = [t0.elapsed().as_secs_f64(), rf_without, ll_without];
 
-    // The beam, on the tree the full pipeline actually produced. The query is a
-    // cell already in the tree, which is the fixture `model::place`'s own
-    // tolerance measurement used.
+    // Beam size on the full pipeline's tree.
     let (eff_m, eff_w) =
         collapse_onto_every_node(&with_tree, leaves.means, leaves.precisions, p).expect("collapse");
     let mut scored = 0usize;
@@ -702,11 +630,7 @@ fn spr_ablation(n: usize, seed: u64, noise: f64) -> ([f64; 3], [f64; 3], f64) {
 
 /// Deepest root-to-leaf path, in edges.
 ///
-/// The explanatory variable `RF` cannot see. SPR proposes through
-/// `spr::LazyRows`, which recomputes the rows on the path from the cut to the
-/// root, so its cost per candidate is `O(depth * p)`. A linkage that chains
-/// rather than balances is therefore expensive to refine even when it is no
-/// less accurate.
+/// SPR cost per candidate is `O(depth * p)`, so depth matters where `RF` does not see it.
 ///
 /// ### Params
 ///
@@ -728,20 +652,6 @@ fn max_depth(tree: &Tree) -> usize {
         })
         .max()
         .unwrap_or(0)
-}
-
-/// One graph-linkage configuration against the dense chain, averaged over
-/// `STEP_SEEDS`.
-#[derive(Clone, Copy, Default)]
-struct DriftRow {
-    /// Build seconds.
-    secs: f64,
-    /// Robinson-Foulds to the dense Ward tree.
-    to_dense: f64,
-    /// Robinson-Foulds to the generating tree.
-    to_truth: f64,
-    /// Maximum leaf depth.
-    depth: f64,
 }
 
 /// The balanced fixture at `STEP_FEATURES`.
@@ -813,218 +723,9 @@ fn drift_rows(
     (rows, dense_truth, dense_depth)
 }
 
-fn main() {
-    // Each block on its own, because the whole thing is hours and the three
-    // answer different questions. No argument runs all of them.
-    let want: Vec<String> = std::env::args().skip(1).collect();
-    let size = want.is_empty() || want.iter().any(|a| a == "size");
-    let noise_sweep = want.is_empty() || want.iter().any(|a| a == "noise");
-    let steps_sweep = want.is_empty() || want.iter().any(|a| a == "steps");
-    let spr_block = want.is_empty() || want.iter().any(|a| a == "spr");
-    let drift_block = want.is_empty() || want.iter().any(|a| a == "drift");
-    let backend_block = want.is_empty() || want.iter().any(|a| a == "backend");
-
-    println!("threads {}", rayon::current_num_threads());
-
-    if size {
-        println!("\n=== size sweep, noise {NOISE} ===");
-        println!(
-            "{:>7} {:>6} {:>8} {:>9} {:>9} {:>9} {:>7} {:>14}",
-            "leaves", "feat", "start", "build s", "refine s", "total s", "RF", "loglik"
-        );
-        for &p in FEATURES.iter() {
-            for &n in LEAVES.iter() {
-                for (start, build, refine_s, rf, loglik) in run(n, p, NOISE) {
-                    println!(
-                        "{n:>7} {p:>6} {:>8} {build:>9.2} {refine_s:>9.2} {:>9.2} {rf:>7.1} {loglik:>14.1}",
-                        start.name(),
-                        build + refine_s
-                    );
-                }
-                println!("{:>7} {:>6} {:>8} (of {} splits)", "", "", "", 2 * (n - 3));
-            }
-        }
-    }
-
-    if noise_sweep {
-        println!(
-            "\n=== noise sweep, {NOISE_SWEEP_LEAVES} leaves by {NOISE_SWEEP_FEATURES} features ==="
-        );
-        println!(
-            "{:>7} {:>8} {:>9} {:>9} {:>9} {:>7} {:>14}",
-            "noise", "start", "build s", "refine s", "total s", "RF", "loglik"
-        );
-        for &noise in NOISES.iter() {
-            for (start, build, refine_s, rf, loglik) in
-                run(NOISE_SWEEP_LEAVES, NOISE_SWEEP_FEATURES, noise)
-            {
-                println!(
-                    "{noise:>7.1} {:>8} {build:>9.2} {refine_s:>9.2} {:>9.2} {rf:>7.1} {loglik:>14.1}",
-                    start.name(),
-                    build + refine_s
-                );
-            }
-        }
-        println!(
-            "{:>7} {:>8} (of {} splits)",
-            "",
-            "",
-            2 * (NOISE_SWEEP_LEAVES - 3)
-        );
-    }
-
-    if steps_sweep {
-        // Both starts, interleaved per seed so the ratio between them holds
-        // whatever the machine is doing. The graph start is only a fix if the
-        // SPR column comes back to what the dense start gives it.
-        let starts = [(true, "dense ward"), (false, "graph linkage")];
-        let mut previous = [None::<(usize, [f64; 6])>; 2];
-        let mut over_budget = false;
-        println!("\n=== per-step split, {STEP_FEATURES} features ===");
-        println!(
-            "{:>7} {:>13} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
-            "leaves",
-            "start",
-            "linkage",
-            "3 poly",
-            "4 branch",
-            "5 spr",
-            "6 nni",
-            "7 branch",
-            "total s",
-            "RF"
-        );
-        for &n in STEP_LEAVES.iter() {
-            let mut t = [[0.0f64; 6]; 2];
-            let mut rf = [0.0f64; 2];
-            for &seed in STEP_SEEDS.iter() {
-                for (which, &(dense, _)) in starts.iter().enumerate() {
-                    let (one, one_rf) = step_split(n, seed, dense);
-                    for k in 0..6 {
-                        t[which][k] += one[k] / STEP_SEEDS.len() as f64;
-                    }
-                    rf[which] += one_rf / STEP_SEEDS.len() as f64;
-                }
-            }
-            for (which, &(_, name)) in starts.iter().enumerate() {
-                let t = t[which];
-                let total: f64 = t.iter().sum();
-                println!(
-                    "{n:>7} {name:>13} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {total:>9.2} {:>7.1}",
-                    t[0], t[1], t[2], t[3], t[4], t[5], rf[which]
-                );
-                if let Some((prev_n, prev)) = previous[which] {
-                    let factor = (n / prev_n) as f64;
-                    print!("{:>7} {:>13}", "", "exps");
-                    for k in 0..6 {
-                        // Below a tenth of a second the ratio is timer noise,
-                        // not an exponent, and printing one invites it to be
-                        // quoted.
-                        let e = if prev[k] > 0.1 {
-                            (t[k] / prev[k]).ln() / factor.ln()
-                        } else {
-                            f64::NAN
-                        };
-                        print!(" {e:>9.2}");
-                    }
-                    println!("   {:>9.2}   (n^exponent)", {
-                        let prev_total: f64 = prev.iter().sum();
-                        (total / prev_total).ln() / factor.ln()
-                    });
-                }
-                previous[which] = Some((n, t));
-                over_budget |= total > STEP_BUDGET_SECONDS;
-            }
-            if over_budget {
-                println!("        (budget reached, stopping)");
-                break;
-            }
-        }
-    }
-
-    if spr_block {
-        println!("\n=== is SPR earning its 67 per cent? {STEP_FEATURES} features, Ward start ===");
-        println!(
-            "{:>7} {:>9} {:>7} {:>14} {:>9} {:>7} {:>14} {:>10} {:>9}",
-            "leaves", "spr s", "RF", "loglik", "no-spr s", "RF", "loglik", "beam nodes", "of tree"
-        );
-        let mut previous: Option<(usize, f64)> = None;
-        for &n in STEP_LEAVES.iter() {
-            let reps = STEP_SEEDS.len() as f64;
-            let (mut with, mut without, mut beam) = ([0.0f64; 3], [0.0f64; 3], 0.0f64);
-            for &seed in STEP_SEEDS.iter() {
-                let (w, wo, b) = spr_ablation(n, seed, NOISE);
-                for k in 0..3 {
-                    with[k] += w[k] / reps;
-                    without[k] += wo[k] / reps;
-                }
-                beam += b / reps;
-            }
-            println!(
-                "{n:>7} {:>9.2} {:>7.1} {:>14.1} {:>9.2} {:>7.1} {:>14.1} {beam:>10.1} {:>8.1}%",
-                with[0],
-                with[1],
-                with[2],
-                without[0],
-                without[1],
-                without[2],
-                100.0 * beam / (2.0 * n as f64)
-            );
-            if let Some((prev_n, prev_beam)) = previous {
-                let factor = (n / prev_n) as f64;
-                println!(
-                    "{:>7} beam n^{:.2}",
-                    "",
-                    (beam / prev_beam).ln() / factor.ln()
-                );
-            }
-            previous = Some((n, beam));
-            if with[0] > STEP_BUDGET_SECONDS {
-                println!("        (budget reached, stopping)");
-                break;
-            }
-        }
-
-        // Noise 0.3 recovers the whole topology from the Ward start alone, so it
-        // cannot show SPR earning anything. Turn the noise up to where recovery
-        // breaks and ask again.
-        println!("\n=== the same ablation where recovery breaks, {SPR_NOISE_LEAVES} leaves ===");
-        println!(
-            "{:>7} {:>9} {:>7} {:>14} {:>9} {:>7} {:>14} {:>10}",
-            "noise", "spr s", "RF", "loglik", "no-spr s", "RF", "loglik", "splits won"
-        );
-        for &noise in NOISES.iter() {
-            let reps = STEP_SEEDS.len() as f64;
-            let (mut with, mut without) = ([0.0f64; 3], [0.0f64; 3]);
-            for &seed in STEP_SEEDS.iter() {
-                let (w, wo, _) = spr_ablation(SPR_NOISE_LEAVES, seed, noise);
-                for k in 0..3 {
-                    with[k] += w[k] / reps;
-                    without[k] += wo[k] / reps;
-                }
-            }
-            println!(
-                "{noise:>7.1} {:>9.2} {:>7.1} {:>14.1} {:>9.2} {:>7.1} {:>14.1} {:>10.1}",
-                with[0],
-                with[1],
-                with[2],
-                without[0],
-                without[1],
-                without[2],
-                without[1] - with[1]
-            );
-        }
-        println!("{:>7} (of {} splits)", "", 2 * (SPR_NOISE_LEAVES - 3));
-    }
-
-    if drift_block {
-        drift(want.iter().any(|a| a == "quick"));
-    }
-
-    if backend_block {
-        backends();
-    }
-}
+//////////
+// Blocks //
+//////////
 
 /// The drift, cadence and hard-regime tables.
 ///
@@ -1032,13 +733,7 @@ fn main() {
 ///
 /// * `quick` - Skip the `k` and cadence sweeps and run the hard regime alone
 fn drift(quick: bool) {
-    // The graph linkage costs SPR three to seven times what the dense one does
-    // while reaching the same Robinson-Foulds distance after refinement, so the
-    // two starting trees differ in something RF cannot see. `to dense` is how
-    // far the sparsity has moved the topology, `to truth` says whether the move
-    // is even in the wrong direction, and `depth` is the variable SPR's cost
-    // keys on, since a proposal recomputes the rows from the cut to the root.
-    // The backend is pinned to exhaustive so sparsity is the only thing varying.
+    // Backend pinned to exhaustive so sparsity is the only variable.
     if !quick {
         println!("\n=== linkage drift against the dense chain, {STEP_FEATURES} features ===");
         println!(
@@ -1070,10 +765,6 @@ fn drift(quick: bool) {
             );
         }
 
-        // Same columns with `k` pinned and the rebuild cadence swept instead.
-        // The headline is depth: the graph goes stale between rebuilds, so if
-        // redrawing it more often is enough then the chaining is a cadence
-        // problem and the `O(n k p)` design stands.
         println!("\n=== rebuild cadence at k = {CADENCE_K}, {STEP_FEATURES} features ===");
         println!(
             "{:>7} {:>6} {:>9} {:>10} {:>10} {:>8} {:>8}",
@@ -1099,10 +790,7 @@ fn drift(quick: bool) {
         }
     }
 
-    // The hard regime: raised noise on the balanced generator, then the
-    // unbalanced one, where Ward itself chains and `dense d` is far above
-    // `log2(n)`. The graph linkage has to track the dense tree here too, and
-    // a depth far above the dense one is the caterpillar coming back.
+    // Hard regime: raised noise on the balanced generator, then the unbalanced one.
     println!(
         "\n=== hard regime at {HARD_LEAVES} leaves, k = {CADENCE_K}, {STEP_FEATURES} features ==="
     );
@@ -1190,5 +878,215 @@ fn backends() {
             );
             skip[slot] = secs[slot] > BACKEND_BUDGET_SECONDS;
         }
+    }
+}
+
+//////////
+// Main //
+//////////
+
+fn main() {
+    // Full run is hours; select blocks by argument.
+    let want: Vec<String> = std::env::args().skip(1).collect();
+    let size = want.is_empty() || want.iter().any(|a| a == "size");
+    let noise_sweep = want.is_empty() || want.iter().any(|a| a == "noise");
+    let steps_sweep = want.is_empty() || want.iter().any(|a| a == "steps");
+    let spr_block = want.is_empty() || want.iter().any(|a| a == "spr");
+    let drift_block = want.is_empty() || want.iter().any(|a| a == "drift");
+    let backend_block = want.is_empty() || want.iter().any(|a| a == "backend");
+
+    println!("threads {}", rayon::current_num_threads());
+
+    if size {
+        println!("\n=== size sweep, noise {NOISE} ===");
+        println!(
+            "{:>7} {:>6} {:>8} {:>9} {:>9} {:>9} {:>7} {:>14}",
+            "leaves", "feat", "start", "build s", "refine s", "total s", "RF", "loglik"
+        );
+        for &p in FEATURES.iter() {
+            for &n in LEAVES.iter() {
+                for (start, build, refine_s, rf, loglik) in run(n, p, NOISE) {
+                    println!(
+                        "{n:>7} {p:>6} {:>8} {build:>9.2} {refine_s:>9.2} {:>9.2} {rf:>7.1} {loglik:>14.1}",
+                        start.name(),
+                        build + refine_s
+                    );
+                }
+                println!("{:>7} {:>6} {:>8} (of {} splits)", "", "", "", 2 * (n - 3));
+            }
+        }
+    }
+
+    if noise_sweep {
+        println!(
+            "\n=== noise sweep, {NOISE_SWEEP_LEAVES} leaves by {NOISE_SWEEP_FEATURES} features ==="
+        );
+        println!(
+            "{:>7} {:>8} {:>9} {:>9} {:>9} {:>7} {:>14}",
+            "noise", "start", "build s", "refine s", "total s", "RF", "loglik"
+        );
+        for &noise in NOISES.iter() {
+            for (start, build, refine_s, rf, loglik) in
+                run(NOISE_SWEEP_LEAVES, NOISE_SWEEP_FEATURES, noise)
+            {
+                println!(
+                    "{noise:>7.1} {:>8} {build:>9.2} {refine_s:>9.2} {:>9.2} {rf:>7.1} {loglik:>14.1}",
+                    start.name(),
+                    build + refine_s
+                );
+            }
+        }
+        println!(
+            "{:>7} {:>8} (of {} splits)",
+            "",
+            "",
+            2 * (NOISE_SWEEP_LEAVES - 3)
+        );
+    }
+
+    if steps_sweep {
+        // Starts interleaved per seed so their ratio is robust to machine load.
+        let starts = [(true, "dense ward"), (false, "graph linkage")];
+        let mut previous = [None::<(usize, [f64; 6])>; 2];
+        let mut over_budget = false;
+        println!("\n=== per-step split, {STEP_FEATURES} features ===");
+        println!(
+            "{:>7} {:>13} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+            "leaves",
+            "start",
+            "linkage",
+            "3 poly",
+            "4 branch",
+            "5 spr",
+            "6 nni",
+            "7 branch",
+            "total s",
+            "RF"
+        );
+        for &n in STEP_LEAVES.iter() {
+            let mut t = [[0.0f64; 6]; 2];
+            let mut rf = [0.0f64; 2];
+            for &seed in STEP_SEEDS.iter() {
+                for (which, &(dense, _)) in starts.iter().enumerate() {
+                    let (one, one_rf) = step_split(n, seed, dense);
+                    for k in 0..6 {
+                        t[which][k] += one[k] / STEP_SEEDS.len() as f64;
+                    }
+                    rf[which] += one_rf / STEP_SEEDS.len() as f64;
+                }
+            }
+            for (which, &(_, name)) in starts.iter().enumerate() {
+                let t = t[which];
+                let total: f64 = t.iter().sum();
+                println!(
+                    "{n:>7} {name:>13} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {total:>9.2} {:>7.1}",
+                    t[0], t[1], t[2], t[3], t[4], t[5], rf[which]
+                );
+                if let Some((prev_n, prev)) = previous[which] {
+                    let factor = (n / prev_n) as f64;
+                    print!("{:>7} {:>13}", "", "exps");
+                    for k in 0..6 {
+                        // Below 0.1 s the ratio is timer noise.
+                        let e = if prev[k] > 0.1 {
+                            (t[k] / prev[k]).ln() / factor.ln()
+                        } else {
+                            f64::NAN
+                        };
+                        print!(" {e:>9.2}");
+                    }
+                    println!("   {:>9.2}   (n^exponent)", {
+                        let prev_total: f64 = prev.iter().sum();
+                        (total / prev_total).ln() / factor.ln()
+                    });
+                }
+                previous[which] = Some((n, t));
+                over_budget |= total > STEP_BUDGET_SECONDS;
+            }
+            if over_budget {
+                println!("        (budget reached, stopping)");
+                break;
+            }
+        }
+    }
+
+    if spr_block {
+        println!("\n=== is SPR earning its cost? {STEP_FEATURES} features, Ward start ===");
+        println!(
+            "{:>7} {:>9} {:>7} {:>14} {:>9} {:>7} {:>14} {:>10} {:>9}",
+            "leaves", "spr s", "RF", "loglik", "no-spr s", "RF", "loglik", "beam nodes", "of tree"
+        );
+        let mut previous: Option<(usize, f64)> = None;
+        for &n in STEP_LEAVES.iter() {
+            let reps = STEP_SEEDS.len() as f64;
+            let (mut with, mut without, mut beam) = ([0.0f64; 3], [0.0f64; 3], 0.0f64);
+            for &seed in STEP_SEEDS.iter() {
+                let (w, wo, b) = spr_ablation(n, seed, NOISE);
+                for k in 0..3 {
+                    with[k] += w[k] / reps;
+                    without[k] += wo[k] / reps;
+                }
+                beam += b / reps;
+            }
+            println!(
+                "{n:>7} {:>9.2} {:>7.1} {:>14.1} {:>9.2} {:>7.1} {:>14.1} {beam:>10.1} {:>8.1}%",
+                with[0],
+                with[1],
+                with[2],
+                without[0],
+                without[1],
+                without[2],
+                100.0 * beam / (2.0 * n as f64)
+            );
+            if let Some((prev_n, prev_beam)) = previous {
+                let factor = (n / prev_n) as f64;
+                println!(
+                    "{:>7} beam n^{:.2}",
+                    "",
+                    (beam / prev_beam).ln() / factor.ln()
+                );
+            }
+            previous = Some((n, beam));
+            if with[0] > STEP_BUDGET_SECONDS {
+                println!("        (budget reached, stopping)");
+                break;
+            }
+        }
+
+        // Noise 0.3 recovers the topology without SPR; repeat where recovery breaks.
+        println!("\n=== the same ablation where recovery breaks, {SPR_NOISE_LEAVES} leaves ===");
+        println!(
+            "{:>7} {:>9} {:>7} {:>14} {:>9} {:>7} {:>14} {:>10}",
+            "noise", "spr s", "RF", "loglik", "no-spr s", "RF", "loglik", "splits won"
+        );
+        for &noise in NOISES.iter() {
+            let reps = STEP_SEEDS.len() as f64;
+            let (mut with, mut without) = ([0.0f64; 3], [0.0f64; 3]);
+            for &seed in STEP_SEEDS.iter() {
+                let (w, wo, _) = spr_ablation(SPR_NOISE_LEAVES, seed, noise);
+                for k in 0..3 {
+                    with[k] += w[k] / reps;
+                    without[k] += wo[k] / reps;
+                }
+            }
+            println!(
+                "{noise:>7.1} {:>9.2} {:>7.1} {:>14.1} {:>9.2} {:>7.1} {:>14.1} {:>10.1}",
+                with[0],
+                with[1],
+                with[2],
+                without[0],
+                without[1],
+                without[2],
+                without[1] - with[1]
+            );
+        }
+        println!("{:>7} (of {} splits)", "", 2 * (SPR_NOISE_LEAVES - 3));
+    }
+
+    if drift_block {
+        drift(want.iter().any(|a| a == "quick"));
+    }
+
+    if backend_block {
+        backends();
     }
 }

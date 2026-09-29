@@ -1,9 +1,8 @@
 //! The reconstruction entry points: Sanity, the S5 conversion, Bonsai, the
 //! chain from counts and the simulator.
 //!
-//! Every numeric entry point dispatches on the input's element type and runs
-//! generic over it, so `float32` in means `float32` storage all the way down.
-//! Reductions are `f64` either way; that is the core's policy, not ours.
+//! Every numeric entry point dispatches on the input's element type, so
+//! `float32` in means `float32` storage throughout.
 
 // Aliased: this file's `bonsai` and `from_sanity` are the Python entry points.
 use bonsai_rs::bonsai::bonsai as bonsai_run;

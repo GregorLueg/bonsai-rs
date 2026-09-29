@@ -1,23 +1,16 @@
 //! The tree arena.
 //!
-//! Nodes live in flat `Vec`s addressed by `u32`. The layout carries one
-//! invariant that the rest of the crate leans on hard:
+//! Nodes live in flat `Vec`s addressed by `u32`. Invariant:
 //!
 //! > Leaves occupy indices `0..n_leaves`. Internal nodes follow, ordered by
 //! > height above the leaves, so every non-root node has a strictly larger
 //! > parent index and each level is a contiguous index range.
 //!
-//! Three things fall out of that. Ascending index order is a valid post-order,
-//! so the pruning sweep is a bare linear scan with no traversal and no
-//! recursion. A parent row lies strictly above all of its children's rows, so
-//! borrowing it for writing while reading them is a `split_at_mut` rather than
-//! an unsafe alias. And a whole level is one contiguous block of rows, so the
-//! sweep's reads stay local and a level is independent enough to be walked in
-//! any order.
+//! Consequences: ascending index order is a post-order, a parent row can be
+//! borrowed mutably via `split_at_mut` while its children are read, and a level
+//! is one contiguous block whose nodes are independent.
 //!
-//! [`Tree::from_parents`] enforces the ordering by relabelling internal nodes,
-//! which is free for callers: internal rows are always computed by the sweep,
-//! never supplied, so no caller-held data is indexed by an internal node.
+//! [`Tree::from_parents`] enforces the ordering by relabelling internal nodes.
 
 pub mod cluster;
 pub mod distance;
@@ -58,11 +51,8 @@ pub struct Tree {
 impl Tree {
     /// Build a tree from a parent array and its branch lengths.
     ///
-    /// Internal nodes are relabelled into level order, so the caller does not
-    /// have to supply them that way; only the requirement that every parent
-    /// index exceeds its children's is checked rather than fixed, since a
-    /// violation there means the input is not describing a tree the way this
-    /// arena expects.
+    /// Internal nodes are relabelled into level order; every parent index must
+    /// exceed its children's, which is checked rather than fixed.
     ///
     /// ### Params
     ///
@@ -126,11 +116,8 @@ impl Tree {
             });
         }
 
-        // Branch lengths are diffusion times, so a negative or non-finite one is
-        // not a tree this crate can score. Rejecting here rather than at use is
-        // the difference between an error and `prune` quietly returning `NaN`:
-        // `1 + t * w` is exactly zero at `t = -1/w`, and every downstream
-        // kernel divides by it. The root's own entry is unused and not checked.
+        // Negative or non-finite branches would make `prune` return `NaN`
+        // (`1 + t * w` is zero at `t = -1/w`). The root's entry is unused.
         for (i, &len) in branch.iter().enumerate() {
             if parent[i] == NO_NODE {
                 continue;
@@ -145,8 +132,7 @@ impl Tree {
             }
         }
 
-        // Height above the leaves. Ascending index order is already a valid
-        // post-order at this point, so one forward scan settles every node.
+        // Ascending index is already a post-order, so one forward scan suffices.
         let mut height = vec![0u32; n_nodes];
         for i in 0..n_nodes {
             if let Some(par) = (parent[i] != NO_NODE).then(|| parent[i] as usize) {
@@ -154,10 +140,8 @@ impl Tree {
             }
         }
 
-        // Relabel internal nodes into level order. Sorting by height alone would
-        // be enough for correctness; the index tiebreak keeps the permutation
-        // deterministic and keeps siblings adjacent, which is what makes a
-        // parent's two child rows land near each other in memory.
+        // The index tiebreak keeps the permutation deterministic and siblings
+        // adjacent.
         let mut order: Vec<u32> = (n_leaves..n_nodes).map(|i| i as u32).collect();
         order.sort_unstable_by_key(|&i| (height[i as usize], i));
 
@@ -179,7 +163,6 @@ impl Tree {
         let parent = new_parent;
         let branch = new_branch;
 
-        // Level boundaries in the relabelled indexing.
         let mut level_ptr = vec![n_leaves as u32];
         for w in order.windows(2) {
             if height[w[1] as usize] != height[w[0] as usize] {
@@ -188,9 +171,8 @@ impl Tree {
         }
         level_ptr.push(n_nodes as u32);
 
-        // The invariant guarantees acyclicity and connectedness: every non-root
-        // node points strictly upwards in index, so following parents always
-        // terminates, and it can only terminate at the single root.
+        // Acyclic and connected by the invariant: parents strictly increase in
+        // index and only the single root terminates.
         let mut counts = vec![0u32; n_nodes + 1];
         for &par in &parent {
             if par != NO_NODE {
@@ -241,15 +223,10 @@ impl Tree {
     /// [`Tree::from_parents`] for arrays already in the arena order.
     ///
     /// "Already in order" means every parent index exceeds its children's and
-    /// the internal nodes' heights never decrease with index, which makes
-    /// `from_parents`' relabelling the identity. SPR rebuilds an arena per
-    /// candidate from arrays it has numbered that way itself, and skipping the
-    /// sort, the relabel copies and the range checks there took step 5 from
-    /// 42.3 s to 41.4 s at 5,000 cells and 125.3 s to 121.3 s at 10,000,
-    /// alternating builds, 2026-09-25. The result is the tree
-    /// `from_parents` would build from the same arrays, field for field;
-    /// `test_the_level_ordered_constructor_matches_from_parents` pins that,
-    /// and debug builds check the order on every call.
+    /// internal-node heights never decrease with index, so `from_parents`'
+    /// relabelling would be the identity. Skips the sort, relabel and range
+    /// checks (step 5: 42.3 s to 41.4 s at 5,000 cells, 2026-09-25). Debug
+    /// builds check the order.
     ///
     /// ### Params
     ///
@@ -460,8 +437,7 @@ impl Tree {
 
     /// Internal nodes in post-order.
     ///
-    /// By the arena invariant this is simply ascending index order, so it costs
-    /// nothing to produce.
+    /// Ascending index order, by the arena invariant.
     ///
     /// ### Returns
     ///
@@ -473,8 +449,7 @@ impl Tree {
 
     /// Build a balanced binary tree over `n_leaves` leaves.
     ///
-    /// `n_leaves` must be a power of two. Used by tests and fixtures; the
-    /// resulting node numbering satisfies the arena invariant by construction.
+    /// Used by tests and fixtures.
     ///
     /// ### Params
     ///
@@ -493,7 +468,6 @@ impl Tree {
         let n_nodes = 2 * n_leaves - 1;
         let mut parent = vec![NO_NODE; n_nodes];
 
-        // Pair up each level in turn, allocating ancestors upwards.
         let mut level: Vec<u32> = (0..n_leaves as u32).collect();
         let mut next_free = n_leaves as u32;
         while level.len() > 1 {
@@ -513,12 +487,8 @@ impl Tree {
 
     /// Build a ladder (caterpillar) tree over `n_leaves` leaves.
     ///
-    /// Every internal node has one leaf child and one internal child, so the
-    /// tree is maximally deep and every level holds exactly one node, which is
-    /// the deepest shape the arena has to carry and the worst case for anything
-    /// that walks a level at a time. Worth having because the Supplementary
-    /// Information notes that biological trees can be deep and laddery, so it
-    /// bounds what tree shape can cost.
+    /// Every internal node has one leaf child and one internal child, so every
+    /// level holds exactly one node: the worst case for level-wise walks.
     ///
     /// ### Params
     ///
@@ -576,10 +546,7 @@ mod tests {
 
     #[test]
     fn test_the_level_ordered_constructor_matches_from_parents() {
-        // Arrays taken from a tree `from_parents` has already put in arena
-        // order must rebuild into the same tree, field for field, whichever
-        // constructor builds it. Shapes with one level per node, balanced
-        // levels and polytomies.
+        // Ladder, balanced and polytomy shapes.
         let polytomy_parent = vec![6, 6, 6, 7, 7, 7, 8, 8, NO_NODE];
         let fixtures = [
             Tree::ladder(17, 0.3).expect("ladder"),

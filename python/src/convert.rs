@@ -1,9 +1,7 @@
 //! numpy in, numpy out, and the tree across the boundary.
 //!
-//! A tree crosses as three things: a parent array with `-1` for the root, the
-//! branch length above each node, and the leaf count. That is exactly what
-//! [`Tree::from_parents`] takes, so nothing but the root sentinel is
-//! translated.
+//! A tree crosses as a parent array (`-1` for the root), branch lengths and the
+//! leaf count, as [`Tree::from_parents`] takes them.
 
 use bonsai_rs::prelude::*;
 use bonsai_rs::tree::NO_NODE;

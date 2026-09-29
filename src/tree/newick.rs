@@ -1,44 +1,24 @@
 //! Newick serialisation and parsing for [`Tree`].
 //!
-//! The arena stores an unrooted tree in a rooted representation, so the string
-//! is written rooted at [`Tree::root`]. That placement is a display choice and
-//! carries no information: the likelihood is root-independent (SPEC.md section
-//! 2, S14), so a tree written here and read back may come home rooted the same
-//! way but indexed differently, and nothing downstream can tell.
-//!
-//! Both directions are iterative. Biological trees are deep and laddery
-//! ([`Tree::ladder`] exists to exercise exactly that), and a recursive writer or
-//! parser overflows the stack somewhere in the tens of thousands of leaves.
-//!
-//! Labels live outside the arena, which has no label field, so the writer takes
-//! them as a slice indexed by leaf index and the parser hands them back the same
-//! way.
+//! Written rooted at [`Tree::root`]; the placement is a display choice, as the
+//! likelihood is root-independent (SPEC.md section 2, S14). Both directions are
+//! iterative, so deep ladders do not overflow the stack. Labels live outside the
+//! arena: the writer takes them indexed by leaf, the parser returns them the
+//! same way.
 //!
 //! ### Deviations from strict Newick
 //!
-//! * An underscore in an unquoted label stays an underscore. Strict Newick reads
-//!   it as a space, which would mangle cell barcodes such as `AACGT_1`.
+//! * An underscore in an unquoted label stays an underscore (barcodes such as
+//!   `AACGT_1`).
 //! * Internal labels are never written and are discarded on parsing:
-//!   [`Tree::from_parents`] permutes internal indices into level order without
-//!   reporting the permutation, so there is no index to hand them back under.
-//! * Negative branch lengths are rejected. They are diffusion times here
-//!   (SPEC.md section 1, `t[i]`), and a negative one is nonsense the arena would
-//!   happily carry into the likelihood.
-//! * A lone leaf is refused by the writer. The arena holds one and
-//!   [`crate::tree::cluster`] has a use for it, but the Newick for it is a bare
-//!   label, which this parser and every other one reject; writing something
-//!   nothing can read back is worse than refusing.
-//!
-//! ### Empty labels, and the trailing comma
-//!
-//! Strict Newick permits an empty label, so `"(a,b,);"` is a legal
-//! **three**-leaf tree whose third leaf is unnamed, and `"(,,,);"` is a legal
-//! four-leaf one. This parser follows the standard and reads them that way.
-//! The cost is that a trailing-comma typo is a silently wrong topology rather
-//! than an error, and nothing can distinguish the two; the alternative, banning
-//! empty labels, would reject valid files that carry their names elsewhere.
-//! Noted rather than fixed, and pinned by
-//! `test_a_trailing_comma_is_an_unnamed_leaf`.
+//!   [`Tree::from_parents`] permutes internal indices without reporting it.
+//! * Negative branch lengths are rejected; they are diffusion times (SPEC.md
+//!   section 1, `t[i]`).
+//! * A lone leaf is refused by the writer, as its Newick form (a bare label) is
+//!   rejected by this and every other parser.
+//! * Empty labels are legal, so `"(a,b,);"` is a three-leaf tree with an unnamed
+//!   leaf and a trailing-comma typo is not an error. Pinned by
+//!   `test_a_trailing_comma_is_an_unnamed_leaf`.
 
 use std::fmt::Write as _;
 
@@ -49,109 +29,30 @@ use crate::tree::{NO_NODE, Tree};
 // Constants //
 ///////////////
 
-/// Significant decimal digits an IEEE-754 binary64 needs to survive a text round
-/// trip. The significand is 53 bits, so 17 digits (C's `DBL_DECIMAL_DIG`) are
-/// necessary and sufficient; 16 loses roughly half of all values. Rust's
-/// `Display` and `LowerExp` without an explicit precision emit the *shortest*
-/// decimal that reparses to the same bits, which is never longer than this, so
-/// the writer fixes no precision at all and gets exactness for free.
+/// Significant decimal digits a binary64 needs to survive a text round trip.
+/// The writer sets no precision: `Display` emits the shortest decimal that
+/// reparses exactly, never longer than this.
 /// `test_branch_length_needs_seventeen_digits` pins the claim.
 const BRANCH_ROUND_TRIP_DIGITS: usize = 17;
 
 /// Below this magnitude a branch length is written in scientific notation.
-/// Plain decimal for `1e-300` runs to 302 characters; inside the range it stays
-/// under about 25. Cosmetic only, both forms round-trip exactly.
+/// Cosmetic only, both forms round-trip exactly.
 const PLAIN_DECIMAL_MIN: f64 = 1e-6;
 
 /// Above this magnitude a branch length is written in scientific notation. See
-/// [`PLAIN_DECIMAL_MIN`]; the same length argument applies at the top end.
+/// [`PLAIN_DECIMAL_MIN`].
 const PLAIN_DECIMAL_MAX: f64 = 1e15;
 
-/// Branch length assigned to a node whose Newick entry carries no `:length`.
-/// Newick leaves it undefined; zero is the only value that keeps the tree the
-/// same tree, since a zero-length edge does not change the likelihood (SPEC.md
-/// section 9.2).
+/// Branch length of a node with no `:length`; a zero-length edge leaves the
+/// likelihood unchanged (SPEC.md section 9.2).
 const DEFAULT_BRANCH_LENGTH: f64 = 0.0;
 
-/// Largest node count the arena can address. Parent indices are `u32` with
-/// [`NO_NODE`] reserved as the root sentinel, so one value is unavailable.
+/// Largest node count the arena can address (`u32` indices, [`NO_NODE`] reserved).
 const MAX_NODES: usize = NO_NODE as usize;
 
 /////////////
 // Writing //
 /////////////
-
-/// Serialise a tree to Newick, with branch lengths and leaf labels.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `leaf_labels` - One label per leaf, indexed by leaf index
-///
-/// ### Returns
-///
-/// The Newick string, semicolon terminated, or `MalformedTree` if the label
-/// count does not match the leaf count, or if the tree is a lone leaf, which
-/// has no Newick form the reader will take back.
-pub fn write_newick<S: AsRef<str>>(tree: &Tree, leaf_labels: &[S]) -> Result<String, BonsaiErrors> {
-    let n_leaves = tree.n_leaves();
-    // A lone leaf, which the arena holds and Newick has no form for; see the
-    // module docs. Refusing here is what keeps the writer and the reader agreed
-    // on what a tree is.
-    if n_leaves < 2 {
-        return Err(BonsaiErrors::MalformedTree {
-            reason: format!(
-                "a tree of {n_leaves} leaf/leaves has no Newick form; at least two are needed"
-            ),
-        });
-    }
-    if leaf_labels.len() != n_leaves {
-        return Err(BonsaiErrors::MalformedTree {
-            reason: format!(
-                "{} leaf labels supplied for a tree with {n_leaves} leaves",
-                leaf_labels.len()
-            ),
-        });
-    }
-
-    let root = tree.root();
-    let mut out = String::new();
-
-    // Explicit stack of (node, index of the next child to emit). A frame is
-    // revisited once per child, so the traversal costs one pass over the arena
-    // and the stack is bounded by the tree's depth rather than the call stack.
-    let mut stack: Vec<(u32, usize)> = Vec::new();
-    stack.push((root, 0));
-    while !stack.is_empty() {
-        let top = stack.len() - 1;
-        let (node, next) = stack[top];
-        let children = tree.children(node);
-        if next < children.len() {
-            out.push(if next == 0 { '(' } else { ',' });
-            stack[top].1 = next + 1;
-            stack.push((children[next], 0));
-            continue;
-        }
-
-        // Every child is out; close the group, if there was one, and annotate.
-        if children.is_empty() {
-            let label = leaf_labels[node as usize].as_ref();
-            if !label.is_empty() {
-                push_label(&mut out, label);
-            }
-        } else {
-            out.push(')');
-        }
-        if node != root {
-            out.push(':');
-            push_branch_length(&mut out, tree.branch(node));
-        }
-        stack.pop();
-    }
-
-    out.push(';');
-    Ok(out)
-}
 
 /// Append a label, quoting it if it would not survive as a bare token.
 ///
@@ -183,8 +84,6 @@ fn push_label(out: &mut String, label: &str) {
 /// * `length` - The branch length
 fn push_branch_length(out: &mut String, length: f64) {
     let start = out.len();
-    // Writing into a `String` is infallible; the `Result` only exists because
-    // `write!` is generic over `fmt::Write`.
     let magnitude = length.abs();
     if magnitude != 0.0 && !(PLAIN_DECIMAL_MIN..=PLAIN_DECIMAL_MAX).contains(&magnitude) {
         let _ = write!(out, "{length:e}");
@@ -195,137 +94,81 @@ fn push_branch_length(out: &mut String, length: f64) {
         out[start..].parse::<f64>(),
         Ok(length),
         "the shortest decimal did not reparse exactly, so the \
-         {BRANCH_ROUND_TRIP_DIGITS}-digit claim above is wrong"
+         {BRANCH_ROUND_TRIP_DIGITS}-digit claim is wrong"
     );
+}
+
+/// Serialise a tree to Newick, with branch lengths and leaf labels.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `leaf_labels` - One label per leaf, indexed by leaf index
+///
+/// ### Returns
+///
+/// The Newick string, semicolon terminated, or `MalformedTree` if the label
+/// count does not match the leaf count, or if the tree is a lone leaf, which
+/// has no Newick form the reader will take back.
+pub fn write_newick<S: AsRef<str>>(tree: &Tree, leaf_labels: &[S]) -> Result<String, BonsaiErrors> {
+    let n_leaves = tree.n_leaves();
+    if n_leaves < 2 {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!(
+                "a tree of {n_leaves} leaf/leaves has no Newick form; at least two are needed"
+            ),
+        });
+    }
+    if leaf_labels.len() != n_leaves {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!(
+                "{} leaf labels supplied for a tree with {n_leaves} leaves",
+                leaf_labels.len()
+            ),
+        });
+    }
+
+    let root = tree.root();
+    let mut out = String::new();
+
+    // Explicit stack of (node, index of the next child to emit).
+    let mut stack: Vec<(u32, usize)> = Vec::new();
+    stack.push((root, 0));
+    while !stack.is_empty() {
+        let top = stack.len() - 1;
+        let (node, next) = stack[top];
+        let children = tree.children(node);
+        if next < children.len() {
+            out.push(if next == 0 { '(' } else { ',' });
+            stack[top].1 = next + 1;
+            stack.push((children[next], 0));
+            continue;
+        }
+
+        if children.is_empty() {
+            let label = leaf_labels[node as usize].as_ref();
+            if !label.is_empty() {
+                push_label(&mut out, label);
+            }
+        } else {
+            out.push(')');
+        }
+        if node != root {
+            out.push(':');
+            push_branch_length(&mut out, tree.branch(node));
+        }
+        stack.pop();
+    }
+
+    out.push(';');
+    Ok(out)
 }
 
 /////////////
 // Reading //
 /////////////
 
-/// Parse a Newick string into a tree and its leaf labels.
-///
-/// Handles nested parentheses, polytomies, arbitrary whitespace including
-/// newlines, `'...'` quoted labels, `[...]` comments, decimal and scientific
-/// branch lengths, and an absent branch length on the root.
-///
-/// Node indices are assigned in a second pass so that the arena invariant holds:
-/// leaves take `0..n_leaves` in the order they appear in the string, and
-/// internal nodes follow sorted by height above the leaves, which is enough for
-/// every parent index to exceed its children's. [`Tree::from_parents`] then
-/// relabels the internal nodes into level order itself, so the indices a caller
-/// sees are not the ones assigned here.
-///
-/// ### Params
-///
-/// * `text` - The Newick string
-///
-/// ### Returns
-///
-/// The tree and one label per leaf indexed by leaf index, or `MalformedTree`
-/// describing what is wrong with the string. Never panics on bad input.
-pub fn parse_newick(text: &str) -> Result<(Tree, Vec<String>), BonsaiErrors> {
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-
-    let mut raw = RawNodes::default();
-    // Internal nodes whose closing parenthesis has not been seen yet.
-    let mut open: Vec<u32> = Vec::new();
-    // The subtree most recently completed; the last one is the root.
-    let mut completed: Option<u32> = None;
-    // Alternates: a subtree is expected, or one of `,`, `)`, `;` is.
-    let mut expect_subtree = true;
-
-    loop {
-        skip_trivia(bytes, &mut i)?;
-        if i >= bytes.len() {
-            return Err(BonsaiErrors::MalformedTree {
-                reason: if raw.parent.is_empty() {
-                    "empty input, expected a Newick string".to_string()
-                } else {
-                    "input ends without a ';'".to_string()
-                },
-            });
-        }
-
-        if expect_subtree {
-            let parent = open.last().copied();
-            if bytes[i] == b'(' {
-                i += 1;
-                let node = raw.push(parent)?;
-                open.push(node);
-                continue;
-            }
-            // Anything else opens a leaf. Its label may legitimately be empty,
-            // in which case the delimiter that follows closes it immediately.
-            let node = raw.push(parent)?;
-            raw.label[node as usize] = read_label(text, bytes, &mut i)?;
-            raw.branch[node as usize] = read_branch_length(text, bytes, &mut i)?;
-            completed = Some(node);
-            expect_subtree = false;
-            continue;
-        }
-
-        match bytes[i] {
-            b',' => {
-                if open.is_empty() {
-                    return Err(BonsaiErrors::MalformedTree {
-                        reason: format!("',' at byte {i} is outside any parenthesised group"),
-                    });
-                }
-                i += 1;
-                expect_subtree = true;
-            }
-            b')' => {
-                let Some(node) = open.pop() else {
-                    return Err(BonsaiErrors::MalformedTree {
-                        reason: format!("unbalanced ')' at byte {i}"),
-                    });
-                };
-                i += 1;
-                raw.label[node as usize] = read_label(text, bytes, &mut i)?;
-                raw.branch[node as usize] = read_branch_length(text, bytes, &mut i)?;
-                completed = Some(node);
-            }
-            b';' => {
-                i += 1;
-                break;
-            }
-            other => {
-                return Err(BonsaiErrors::MalformedTree {
-                    reason: format!(
-                        "unexpected '{}' at byte {i}, expected ',', ')' or ';'",
-                        other as char
-                    ),
-                });
-            }
-        }
-    }
-
-    if !open.is_empty() {
-        return Err(BonsaiErrors::MalformedTree {
-            reason: format!("{} '(' left unclosed at the ';'", open.len()),
-        });
-    }
-    skip_trivia(bytes, &mut i)?;
-    if i < bytes.len() {
-        return Err(BonsaiErrors::MalformedTree {
-            reason: format!("{} bytes of trailing junk after the ';'", bytes.len() - i),
-        });
-    }
-    let Some(root) = completed else {
-        return Err(BonsaiErrors::MalformedTree {
-            reason: "empty input, expected a Newick string".to_string(),
-        });
-    };
-
-    assemble(raw, root)
-}
-
-/// Nodes as the parser meets them, before indices are assigned.
-///
-/// Parallel vectors in creation order, which is the order the string mentions
-/// each node's opening token.
+/// Nodes as the parser meets them, as parallel vectors in creation order.
 #[derive(Default)]
 struct RawNodes {
     /// Parent of each node, `None` for the root.
@@ -390,9 +233,7 @@ fn assemble(raw: RawNodes, root: u32) -> Result<(Tree, Vec<String>), BonsaiError
         });
     }
 
-    // Height above the leaves, settled by a queue rather than a traversal so
-    // that a 100k-deep ladder costs no stack. A node is ready once every child
-    // has reported in, which for a tree happens exactly once per node.
+    // Height above the leaves, by queue rather than recursion.
     let mut height = vec![0u32; n_nodes];
     let mut pending = raw.n_children.clone();
     let mut ready = leaves.clone();
@@ -407,9 +248,8 @@ fn assemble(raw: RawNodes, root: u32) -> Result<(Tree, Vec<String>), BonsaiError
         }
     }
 
-    // Leaves first in string order, then internal nodes by height. A parent is
-    // strictly taller than its children, so this alone satisfies the arena's
-    // "parents have larger indices" rule; `from_parents` sorts the rest out.
+    // Leaves in string order, then internal nodes by height: parents index above
+    // children; `from_parents` does the rest.
     let mut internal: Vec<u32> = (0..n_nodes as u32)
         .filter(|&n| raw.n_children[n as usize] > 0)
         .collect();
@@ -427,8 +267,6 @@ fn assemble(raw: RawNodes, root: u32) -> Result<(Tree, Vec<String>), BonsaiError
         parent[new] = raw.parent[old].map_or(NO_NODE, |p| new_index[p as usize]);
         branch[new] = raw.branch[old];
     }
-    // The parser can only ever build one root, but a caller reading this wants
-    // the invariant stated rather than inferred.
     debug_assert_eq!(parent[new_index[root as usize] as usize], NO_NODE);
 
     let mut labels: Vec<String> = raw.label;
@@ -443,9 +281,8 @@ fn assemble(raw: RawNodes, root: u32) -> Result<(Tree, Vec<String>), BonsaiError
 
 /// Whether a byte ends an unquoted label.
 ///
-/// The Newick punctuation plus whitespace. `[` is included because it opens a
-/// comment, and `'` because a quote may only open a label, never sit inside a
-/// bare one.
+/// Newick punctuation and whitespace; `[` opens a comment and `'` may only open
+/// a label.
 ///
 /// ### Params
 ///
@@ -453,9 +290,8 @@ fn assemble(raw: RawNodes, root: u32) -> Result<(Tree, Vec<String>), BonsaiError
 ///
 /// ### Returns
 ///
-/// `true` if the byte cannot be part of a bare label. Multi-byte UTF-8 is safe
-/// to test byte-wise: every continuation byte is `>= 0x80` and none of these
-/// delimiters are.
+/// `true` if the byte cannot be part of a bare label. Byte-wise testing is safe
+/// for UTF-8.
 fn is_label_terminator(byte: u8) -> bool {
     byte.is_ascii_whitespace()
         || matches!(byte, b'(' | b')' | b'[' | b']' | b',' | b':' | b';' | b'\'')
@@ -463,7 +299,7 @@ fn is_label_terminator(byte: u8) -> bool {
 
 /// Advance the cursor past whitespace and `[...]` comments.
 ///
-/// Comments do not nest in Newick, so the first `]` closes one.
+/// Comments do not nest.
 ///
 /// ### Params
 ///
@@ -524,7 +360,7 @@ fn read_label(text: &str, bytes: &[u8], i: &mut usize) -> Result<String, BonsaiE
                     reason: format!("quoted label opened at byte {opened} is never closed"),
                 });
             }
-            // A doubled quote is an escaped one, a lone quote closes the label.
+            // A doubled quote is an escaped one.
             if bytes.get(*i + 1) == Some(&b'\'') {
                 label.push('\'');
                 *i += 2;
@@ -588,6 +424,120 @@ fn read_branch_length(text: &str, bytes: &[u8], i: &mut usize) -> Result<f64, Bo
     Ok(length)
 }
 
+/// Parse a Newick string into a tree and its leaf labels.
+///
+/// Handles nested parentheses, polytomies, arbitrary whitespace including
+/// newlines, `'...'` quoted labels, `[...]` comments, decimal and scientific
+/// branch lengths, and an absent branch length on the root.
+///
+/// Leaves take `0..n_leaves` in string order; internal indices are those of
+/// [`Tree::from_parents`], not the parse order.
+///
+/// ### Params
+///
+/// * `text` - The Newick string
+///
+/// ### Returns
+///
+/// The tree and one label per leaf indexed by leaf index, or `MalformedTree`
+/// describing what is wrong with the string. Never panics on bad input.
+pub fn parse_newick(text: &str) -> Result<(Tree, Vec<String>), BonsaiErrors> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+
+    let mut raw = RawNodes::default();
+    // Internal nodes still open.
+    let mut open: Vec<u32> = Vec::new();
+    // Most recently completed subtree; the last is the root.
+    let mut completed: Option<u32> = None;
+    // Either a subtree is expected, or one of `,`, `)`, `;`.
+    let mut expect_subtree = true;
+
+    loop {
+        skip_trivia(bytes, &mut i)?;
+        if i >= bytes.len() {
+            return Err(BonsaiErrors::MalformedTree {
+                reason: if raw.parent.is_empty() {
+                    "empty input, expected a Newick string".to_string()
+                } else {
+                    "input ends without a ';'".to_string()
+                },
+            });
+        }
+
+        if expect_subtree {
+            let parent = open.last().copied();
+            if bytes[i] == b'(' {
+                i += 1;
+                let node = raw.push(parent)?;
+                open.push(node);
+                continue;
+            }
+            // Anything else opens a leaf; its label may be empty.
+            let node = raw.push(parent)?;
+            raw.label[node as usize] = read_label(text, bytes, &mut i)?;
+            raw.branch[node as usize] = read_branch_length(text, bytes, &mut i)?;
+            completed = Some(node);
+            expect_subtree = false;
+            continue;
+        }
+
+        match bytes[i] {
+            b',' => {
+                if open.is_empty() {
+                    return Err(BonsaiErrors::MalformedTree {
+                        reason: format!("',' at byte {i} is outside any parenthesised group"),
+                    });
+                }
+                i += 1;
+                expect_subtree = true;
+            }
+            b')' => {
+                let Some(node) = open.pop() else {
+                    return Err(BonsaiErrors::MalformedTree {
+                        reason: format!("unbalanced ')' at byte {i}"),
+                    });
+                };
+                i += 1;
+                raw.label[node as usize] = read_label(text, bytes, &mut i)?;
+                raw.branch[node as usize] = read_branch_length(text, bytes, &mut i)?;
+                completed = Some(node);
+            }
+            b';' => {
+                i += 1;
+                break;
+            }
+            other => {
+                return Err(BonsaiErrors::MalformedTree {
+                    reason: format!(
+                        "unexpected '{}' at byte {i}, expected ',', ')' or ';'",
+                        other as char
+                    ),
+                });
+            }
+        }
+    }
+
+    if !open.is_empty() {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!("{} '(' left unclosed at the ';'", open.len()),
+        });
+    }
+    skip_trivia(bytes, &mut i)?;
+    if i < bytes.len() {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: format!("{} bytes of trailing junk after the ';'", bytes.len() - i),
+        });
+    }
+    let Some(root) = completed else {
+        return Err(BonsaiErrors::MalformedTree {
+            reason: "empty input, expected a Newick string".to_string(),
+        });
+    };
+
+    assemble(raw, root)
+}
+
 ///////////
 // Tests //
 ///////////
@@ -596,16 +546,10 @@ fn read_branch_length(text: &str, bytes: &[u8], i: &mut usize) -> Result<f64, Bo
 mod tests {
     use super::*;
 
-    /// Canonical form of a labelled tree: for every node, the sorted labels of
-    /// the leaves below it paired with the exact bits of its upstream branch
-    /// length, the whole list sorted.
-    ///
-    /// Comparing two of these checks the topology as a set of clades, and the
-    /// branch lengths bit for bit. It ignores node indices, sibling order and
-    /// internal labels, which is exactly what `from_parents` is free to permute.
-    /// It does **not** check the root's own branch entry, which Newick has
-    /// nowhere to put, and it assumes leaf labels are unique. Cost is quadratic
-    /// in the leaf count, so it is for small fixtures only.
+    /// Canonical form of a labelled tree: per node, the sorted leaf labels below
+    /// it with the bits of its upstream branch length, sorted. Ignores indices,
+    /// sibling order, internal labels and the root's branch; assumes unique
+    /// labels; quadratic, small fixtures only.
     ///
     /// ### Params
     ///

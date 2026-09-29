@@ -2,29 +2,19 @@
 //!
 //! Given a centre and the star of effective leaves hanging off it, score every
 //! candidate pair with [`crate::model::merge::score_merge`], insert an ancestor
-//! above the pair [`StarSelection`] picks, summarise that ancestor as an effective leaf
-//! (SPEC.md section 4) so the remaining structure is a star again, and repeat.
-//! Stop when the centre has three members left or no pair gives a gain worth
-//! taking.
+//! above the pair [`StarSelection`] picks, summarise it as an effective leaf
+//! (SPEC.md section 4) so the rest is a star again, and repeat. Stops at three
+//! members or when no pair gives a gain worth taking.
 //!
-//! **One routine drives three of the seven search steps.** It is step 2 with
-//! the centre being the root and the members being every leaf, step 3 with the
-//! centre being a polytomy node, and step 6 after an NNI edge deletion. So it
-//! is written over "a set of effective leaves with branch lengths to a common
-//! centre" and knows nothing about where they came from. A centre that has a
-//! parent passes its upstream side in as one more member, which is what makes
-//! stopping at three members mean "the centre is resolved" in every case.
+//! Drives search step 2 (centre is the root, members are every leaf), step 3
+//! (centre is a polytomy node) and step 6 (after an NNI edge deletion). A centre
+//! with a parent passes its upstream side in as one more member, so three
+//! members always means "resolved".
 //!
-//! ### What this module does not do
-//!
-//! Candidate pairs come from a [`CandidatePairs`] provider, and the only one
-//! here is [`AllPairs`]. The `k`-nearest-neighbour restriction of SPEC.md
-//! section 11 lives in [`crate::search::candidates`] and the upper-bound
-//! machinery of section 10 in [`crate::search::bounds`], which wraps either of
-//! the other two. What this module contributes to section 10 is the two seams
-//! it needs: [`Round`] carries enough of the star for a provider to score a
-//! pair itself, and [`CandidatePairs::bounds`] lets one say the pairs are
-//! ordered, at which point the scan walks them and stops early.
+//! Candidate pairs come from a [`CandidatePairs`] provider: [`AllPairs`] here,
+//! the `k`-NN restriction of section 11 in [`crate::search::candidates`], the
+//! upper bounds of section 10 in [`crate::search::bounds`]. [`Round`] and
+//! [`CandidatePairs::bounds`] are the seams those need.
 
 use crate::errors::BonsaiErrors;
 use crate::model::merge::{EffLeaf, MergeParams, MergeScore, MergeScratch, score_merge};
@@ -41,77 +31,40 @@ use std::time::Instant;
 
 /// Number of members at which the centre is resolved and the primitive stops.
 ///
-/// SPEC.md section 9.1. Three members around a centre is a degree-three node,
-/// which is fully resolved in an unrooted tree; a fourth merge would only
-/// insert a node of degree two, which cannot change the likelihood.
+/// SPEC.md section 9.1. A degree-three node is fully resolved in an unrooted
+/// tree; a fourth merge would only insert a degree-two node.
 const MIN_CENTRE_MEMBERS: usize = 3;
 
 /// Default for [`StarParams::min_gain`], in nats.
 ///
-/// A merge whose gain is indistinguishable from zero is not worth making, and
-/// accepting one costs a round of the scan while pretending to have learnt
-/// something. Ours, chosen by measurement. The floor it has to clear: for
-/// members that are exactly identical on zero-length branches, where the true
-/// gain is exactly zero, `score_merge` returns `7.1e-15` at 64 features and
-/// `-3.6e-12` at 32768, both of which are `1.1e-16` per feature. That is one
-/// `f64` rounding of a sum whose magnitude is `O(p)`, which is what it should
-/// be, so the floor scales with the feature count and not with anything else.
-///
-/// At the ten thousand features this crate expects the floor is `1.1e-12`, so
-/// `1e-9` clears it by a factor of 900, just under three orders of magnitude.
-/// At a million features the floor is `1.1e-10` and the headroom is nine.
-/// It still sits far below any gain that carries information, since a real
-/// merge gain is `O(p)` nats. See
+/// Ours. Exactly-zero-gain merges score `7.1e-15` at 64 features and `-3.6e-12`
+/// at 32768, i.e. `1.1e-16` per feature (one `f64` rounding of an `O(p)` sum),
+/// so `1e-9` clears the floor by 900x at ten thousand features. See
 /// `test_the_default_min_gain_clears_the_zero_gain_floor`.
 ///
-/// **This is a merge-score floor and nothing else.** It is correct for a sum
-/// of magnitude `O(p)`, which is what the primitive and
-/// [`crate::search::polytomy`] compare, and for the interchanges, whose gain
-/// is a handful of `O(p)` peels around one edge. It is *not* correct for a
-/// whole-tree loglikelihood of magnitude `O(n p)`;
-/// [`crate::search::spr`] compares those and carries its own scale-relative
-/// floor for them. Any new caller has to work out which of the two quantities
-/// it is comparing before reaching for this constant.
+/// A merge-score floor only, for sums of magnitude `O(p)`. Not valid for a
+/// whole-tree loglikelihood of magnitude `O(n p)`; [`crate::search::spr`]
+/// carries its own scale-relative floor.
 const DEFAULT_MIN_GAIN: f64 = 1e-9;
 
 /// How many bound-ordered pairs [`walk_bounded`] scores before it rechecks the
 /// stopping rule.
 ///
-/// The walk is inherently sequential and the scan inside it is not, so this
-/// trades parallelism against overshoot: a chunk of one is the tightest
-/// possible stop and runs on one thread, a chunk of everything is the full
-/// parallel scan and stops nowhere. Ours, chosen by measurement: pairs scored
-/// grows steadily with the chunk while the wall time is flat above sixteen, so
-/// sixteen is where the overshoot stops paying for itself.
-/// | 256 | 54,666 | 0.350 |
-///
-/// `16` is the knee: it costs the same wall time as `64` and scores nine per
-/// cent fewer pairs, while `4` is too small to fill the pool and pays a third
-/// more time for two per cent fewer pairs. This does not change the answer at
-/// any value: the stopping rule is only ever checked at a chunk boundary, so a
-/// larger chunk scores a superset of what a smaller one scores.
-///
-/// Public because it is the granularity of the only signal the online
-/// ellipsoid sizing of SPEC.md section 10.5 has: a round offering fewer pairs
-/// than this always walks all of them, and reads as "the bounds pruned
-/// nothing" when it means "there was nothing to prune".
+/// Ours, measured: wall time is flat above 16 while pairs scored keeps growing,
+/// and 4 is too small to fill the pool. Does not change the answer at any value.
+/// Public because rounds offering fewer pairs than this always walk all of
+/// them, which the online ellipsoid sizing of SPEC.md section 10.5 must not read
+/// as "the bounds pruned nothing".
 pub const BOUND_WALK_CHUNK: usize = 16;
 
 /// Rounds between exact recomputations of the centre's effective leaf when
 /// [`StarParams::incremental_centre`] is on.
-///
-/// See that field for the drift measurement that fixes it.
 const CENTRE_EXACT_EVERY: usize = 32;
 
 /// Fewest candidate pairs a scan spreads over the thread pool.
 ///
-/// Below this the scan runs on the calling thread. Search step 5 proposes its
-/// candidates in parallel and resolves the four-member star each regraft
-/// leaves behind, six pairs, from inside that loop; a parallel scan there
-/// hands half of six pairs to a worker that is busy with a whole other
-/// proposal, and the caller waits on it. Ours, chosen by measurement: a
-/// parallel scan there costs several times what the sequential one does. A
-/// merge scan over a real star is thousands of pairs and is not affected.
+/// Ours, measured: search step 5 resolves six-pair stars from inside a parallel
+/// loop, where a parallel scan costs several times the sequential one.
 const PAR_PAIRS_MIN: usize = 64;
 
 /// How the primitive picks the pair to merge in a round.
@@ -127,41 +80,24 @@ pub enum StarSelection {
     /// Sample a pair with probability proportional to the likelihood of the
     /// tree the merge would produce.
     ///
-    /// The candidates differ from the resulting tree loglikelihoods by the
-    /// current tree's own loglikelihood, which is common to the round, so a
-    /// softmax over the gains is the same distribution as a softmax over the
-    /// resulting tree loglikelihoods. The round maximum is subtracted before
-    /// exponentiating.
+    /// A softmax over the gains, round maximum subtracted first.
     ///
     /// **Deviation.** The specification samples over every pair; this samples
-    /// over the pairs that clear [`StarParams::min_gain`] and stops when none
-    /// do, so that the primitive's stopping rule is the same in both modes. A
-    /// pair below the floor carries softmax weight `exp(-O(p))` against the
-    /// round's best, so nothing measurable is given up.
+    /// over pairs clearing [`StarParams::min_gain`] and stops when none do, so
+    /// the stopping rule matches greedy mode.
     ///
-    /// **Cost.** Unlike the greedy rule this materialises one score per
-    /// candidate pair rather than reducing them as they are produced, so it
-    /// wants the small stars of an interchange and not a whole-dataset star.
-    ///
-    /// **How random this actually is.** The weights are a softmax over
-    /// quantities whose gaps are `O(p)` nats, so the distribution concentrates
-    /// on the greedy pick as the feature count grows. That is the specification
-    /// taken literally and not a shortcut. Measured through
-    /// [`crate::search::nni::nni_random`], the fraction of seeds that move the
-    /// tree off its starting topology at all falls away by a couple of hundred
-    /// features, so a caller relying on this to escape a local optimum at ten
-    /// thousand features should expect it to behave close to greedy.
+    /// Materialises one score per pair, so it wants the small stars of an
+    /// interchange. Gaps are `O(p)` nats, so at high feature counts it
+    /// concentrates on the greedy pick (measured through
+    /// [`crate::search::nni::nni_random`]: seeds that leave the starting
+    /// topology vanish within a couple of hundred features).
     Weighted {
-        /// Seed of the splitmix64 stream the draws come from.
-        ///
-        /// One draw per round, taken after the pairs have been scored and
-        /// ordered, so the sampled pair does not depend on the thread count.
+        /// Seed of the splitmix64 stream, one draw per round after scoring, so
+        /// the pick does not depend on the thread count.
         seed: u64,
-        /// Temperature of the softmax: the gains are divided by this before
-        /// exponentiating, so `1.0` is the specification's distribution and
-        /// larger values flatten it. See
-        /// [`crate::search::nni::DEFAULT_RANDOM_TEMPERATURE`] for why the
-        /// interchanges run it above one.
+        /// Softmax temperature; `1.0` is the specification's distribution,
+        /// larger flattens it. See
+        /// [`crate::search::nni::DEFAULT_RANDOM_TEMPERATURE`].
         temperature: f64,
     },
 }
@@ -171,54 +107,25 @@ pub enum StarSelection {
 pub struct StarParams {
     /// Smallest loglikelihood gain, in nats, that will be accepted as a merge.
     ///
-    /// Strictly greater than: a merge is taken only when its gain exceeds this.
-    /// Absolute rather than scaled by the feature count, so a caller running at
-    /// an unusually large `p` should raise it; see `DEFAULT_MIN_GAIN`, which
-    /// also says why a caller comparing whole-tree loglikelihoods wants a
-    /// different floor rather than this one.
+    /// Strictly greater than. Absolute, not scaled by the feature count: raise
+    /// it at unusually large `p`; see `DEFAULT_MIN_GAIN`.
     pub min_gain: f64,
     /// Which pair of the round is merged.
     pub selection: StarSelection,
     /// Branch-length solve knobs handed to [`score_merge`].
     pub merge: MergeParams,
-    /// Update the centre's effective leaf by removing the merged pair and
-    /// adding the ancestor, rather than re-accumulating it over every member.
+    /// Update the centre's effective leaf by removing the merged pair and adding
+    /// the ancestor (`O(p)`, the peel of section 8.1 plus the ancestor's
+    /// contribution), rather than re-accumulating over every member (`O(n p)` a
+    /// round).
     ///
-    /// The exact recompute is `O(n p)` a round and so `O(n^2 p)` over a star.
-    /// That is a factor of `k` below the restricted scan of SPEC.md section 11
-    /// and invisible next to it, but once the upper bounds of section 10 cut
-    /// the scan to a handful of pairs a round it is the largest term left. The
-    /// incremental update is `O(p)`: it is the peel of section 8.1 followed by
-    /// the ancestor's own diffusion-corrected contribution, which is exactly
-    /// what changed.
-    ///
-    /// Off by default. Note that the shipped pipeline always composes the
-    /// bounds of section 10 (`bonsai::bonsai_prepared`), so it runs permanently
-    /// in the combination the paragraph above argues for turning this **on**.
-    /// That is deliberate for now: the recompute it would save is not where the
-    /// pipeline's time goes, and the drift below is a real cost. Revisit with a
-    /// measurement, not with this comment.
-    ///
-    /// The question is drift. The update differences
-    /// quantities of similar magnitude, so it loses digits where the exact
-    /// recompute does not, and the error compounds across a whole star. An
-    /// exact recompute every `CENTRE_EXACT_EVERY` rounds caps that.
-    ///
-    /// **Measured, and it is safe.** The worst relative deviation from the
-    /// exact value at any round of a star is `O(1e-14)` in the precision and
-    /// `O(1e-12)` in the mean even with no recompute at all, orders below the
-    /// `1e-16` per feature a merge gain itself rounds to, and the trees come out
-    /// identical on every fixture in this crate. See
-    /// `test_the_incremental_centre_leaf_does_not_drift` for the table and
-    /// `crate::search::bounds`'s
-    /// `test_incremental_centre_matches_the_exact_recompute` for the trees.
-    ///
-    /// It is off by default anyway, and the reason is not the arithmetic. It is
-    /// that this is a silent numerical change to a path every search step
-    /// depends on, and a caller who is not paying the `O(n^2 p)` recompute back
-    /// in saved scan time gains nothing by taking it on. Turn it on with the
-    /// bounds of SPEC.md section 10, where the recompute is the largest term
-    /// left; leave it off without them.
+    /// Off by default. It only pays once the bounds of section 10 cut the scan
+    /// to a handful of pairs, and it is a silent numerical change to a path
+    /// every search step uses. Drift is measured safe (`O(1e-14)` relative in
+    /// the precision, `O(1e-12)` in the mean, identical trees on every fixture;
+    /// see `test_the_incremental_centre_leaf_does_not_drift`), and an exact
+    /// recompute every `CENTRE_EXACT_EVERY` rounds caps it. The shipped pipeline
+    /// composes the bounds but leaves this off; revisit with a measurement.
     pub incremental_centre: bool,
 }
 
@@ -244,18 +151,14 @@ impl Default for StarParams {
 
 /// One round's read-only view of the star, as a candidate provider sees it.
 ///
-/// Both slabs are indexed by *node id*, not by position in `members`, and are
-/// row-major with stride `n_features`. They cover every node created so far,
-/// members and swallowed children alike, which is what lets a provider hold
-/// state keyed by node id across rounds. Precisions are not diffusion
-/// corrected; the correction of SPEC.md section 4 needs `branch`, which is
-/// carried separately.
+/// Both slabs are indexed by *node id*, row-major with stride `n_features`, and
+/// cover every node created so far (members and swallowed children), so a
+/// provider can hold state keyed by node id. Precisions are not diffusion
+/// corrected (section 4); `branch` carries what the correction needs.
 ///
-/// A provider that only picks pairs by geometry, such as
-/// [`crate::search::candidates::KnnCandidates`], reads the first four fields
-/// and nothing else. The rest is what a provider that has to *score* pairs
-/// needs, which is the upper-bound machinery of SPEC.md section 10; see
-/// [`Round::score_pair`].
+/// A geometry-only provider such as [`crate::search::candidates::KnnCandidates`]
+/// reads the first four fields. The rest serve providers that score pairs
+/// (section 10); see [`Round::score_pair`].
 #[derive(Clone, Copy, Debug)]
 pub struct Round<'a, T> {
     /// Node ids of the current star members, ascending.
@@ -274,35 +177,27 @@ pub struct Round<'a, T> {
     pub centre_means: &'a [f64],
     /// The centre's own effective precisions, `W[g,r]`, same length.
     pub centre_precisions: &'a [f64],
-    /// Branch-length solve knobs the scan will use.
-    ///
-    /// A provider that scores pairs itself must pass these through, or its
-    /// scores will not agree with the scan's to the last bit.
+    /// Branch-length solve knobs the scan uses; a provider scoring pairs must
+    /// pass these through to match the scan bit for bit.
     pub merge: MergeParams,
     /// Gain of the merge accepted in the previous round, or negative infinity
     /// in the first round.
     ///
-    /// Every round accepts the best pair it scored, so this is also the largest
-    /// gain seen so far in the round before this one. It is deliberately *not*
-    /// a sound bound on this round's best: the root moves between rounds and a
-    /// later merge can beat an earlier one.
+    /// Not a sound bound on this round's best: the root moves between rounds and
+    /// a later merge can beat an earlier one.
     pub best_gain: f64,
     /// How many pairs the previous round's scan actually scored, or zero in the
     /// first round.
     ///
-    /// The signal the online ellipsoid sizing of SPEC.md section 10.5 reads:
-    /// deep means the bounds were too loose.
+    /// Read by the online ellipsoid sizing of SPEC.md section 10.5.
     pub scored_last_round: usize,
 }
 
 impl<'a, T: BonsaiFloat> Round<'a, T> {
     /// Score one candidate pair exactly as the scan will.
     ///
-    /// For a provider that has to know a pair's true gain, which is the
-    /// upper-bound machinery of SPEC.md section 10 and nothing else. The peel
-    /// of section 8.1 is left in `scratch`, because a caller computing
-    /// derivatives with respect to the centre needs the remainder it was taken
-    /// against.
+    /// For the upper-bound machinery of SPEC.md section 10. The peel of section
+    /// 8.1 is left in `scratch` for callers differentiating against the centre.
     ///
     /// ### Params
     ///
@@ -334,15 +229,9 @@ impl<'a, T: BonsaiFloat> Round<'a, T> {
 
 /// Source of the candidate pairs a round of the scan considers.
 ///
-/// The seam for SPEC.md sections 10 and 11. Scoring every pair is `O(n^2 p)`
-/// per round; restricting to a `k`-nearest-neighbour graph or to the pairs
-/// whose upper bound still beats the incumbent replaces this implementation
-/// without the primitive changing.
-///
-/// Providers are called once per round and notified after every merge, so they
-/// can maintain state incrementally rather than rediscovering what changed.
-/// Both halves are `&mut self` and the primitive calls them from one thread, in
-/// round order, so a provider needs no interior mutability and no locking.
+/// The seam for SPEC.md sections 10 and 11. Called once per round and notified
+/// after every merge, from one thread in round order, so a provider needs no
+/// locking.
 pub trait CandidatePairs<T: BonsaiFloat> {
     /// Fill `out` with the pairs to score this round.
     ///
@@ -364,10 +253,8 @@ pub trait CandidatePairs<T: BonsaiFloat> {
 
     /// Notification that a merge has been accepted.
     ///
-    /// Called after the ancestor has been summarised as an effective leaf and
-    /// put back into the star, so `ancestor` is exactly what later rounds will
-    /// score against. The default does nothing, which is right for any provider
-    /// that keeps no state between rounds.
+    /// Called after the ancestor is summarised and put back into the star. The
+    /// default does nothing.
     ///
     /// ### Params
     ///
@@ -380,14 +267,11 @@ pub trait CandidatePairs<T: BonsaiFloat> {
     /// Upper bounds on the gains of the pairs the last [`CandidatePairs::candidates`]
     /// call emitted, in that order.
     ///
-    /// SPEC.md section 10.4. When this returns `Some`, the greedy scan walks
-    /// the pairs from the top and stops as soon as the best true gain it has
-    /// seen exceeds the next pair's bound: every pair below that point has a
-    /// true gain no larger, so the winner is already known. The slice must be
-    /// the same length as `out` was left, and **must be non-increasing**, or
-    /// the walk stops early on a pair that was not the best.
-    ///
-    /// `None`, the default, scores every emitted pair.
+    /// SPEC.md section 10.4. When `Some`, the greedy scan walks the pairs in
+    /// order and stops once the best true gain exceeds the next bound. The slice
+    /// must match `out` in length and **must be non-increasing**, or the walk
+    /// stops on a pair that was not the best. `None`, the default, scores every
+    /// pair.
     ///
     /// ### Returns
     ///
@@ -399,7 +283,7 @@ pub trait CandidatePairs<T: BonsaiFloat> {
 
 /// Every pair of the current members.
 ///
-/// The exhaustive provider, and the one the primitive defaults to.
+/// The exhaustive provider, the primitive's default.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllPairs;
 
@@ -436,10 +320,9 @@ impl<T: BonsaiFloat> CandidatePairs<T> for AllPairs {
 /// The star handed to the primitive: effective leaves and their branches to a
 /// common centre.
 ///
-/// Means and precisions are row-major `[member][feature]`, matching the layout
-/// of [`crate::model::likelihood::NodeState`]. Precisions are *not* diffusion
-/// corrected: the branch to the centre is carried separately in `branch`, and
-/// the correction of SPEC.md section 4 is applied where it is needed.
+/// Means and precisions are row-major `[member][feature]`, as in
+/// [`crate::model::likelihood::NodeState`]. Precisions are not diffusion
+/// corrected (SPEC.md section 4); `branch` carries the correction's input.
 #[derive(Clone, Copy, Debug)]
 pub struct Star<'a, T> {
     /// Effective means, `[member][feature]`, row-major.
@@ -475,10 +358,8 @@ pub struct StarMerge {
 
 /// What the primitive built.
 ///
-/// Node ids run `0..n_members` for the members that were handed in and
-/// `n_members..` for the ancestors that were created, in creation order. That
-/// numbering already satisfies the arena invariant: an ancestor's children are
-/// always created before it, so every parent index exceeds its children's.
+/// Node ids run `0..n_members` for the input members and `n_members..` for the
+/// ancestors, in creation order, so every parent index exceeds its children's.
 #[derive(Clone, Debug)]
 pub struct StarResult<T> {
     /// Number of members the star started with.
@@ -503,9 +384,8 @@ pub struct StarResult<T> {
 
 /// The best pair found in one round of the scan.
 ///
-/// Ordered by gain, then by the pair's node ids ascending. That total order is
-/// what makes the reduction independent of how rayon happened to split the
-/// work: two candidates can only tie on the gain, never on the ids.
+/// Ordered by gain, then by node ids ascending: a total order, so the reduction
+/// does not depend on how rayon splits the work.
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
     /// Loglikelihood gain of the merge.
@@ -557,10 +437,8 @@ impl Candidate {
     }
 }
 
-/// One round's read-only view of everything the pair scan reads.
-///
-/// The arrays grow as ancestors are created, so this is rebuilt each round
-/// rather than held across the whole run.
+/// One round's read-only view of everything the pair scan reads, rebuilt each
+/// round as the arrays grow.
 #[derive(Clone, Copy, Debug)]
 struct Working<'a, T> {
     /// Effective means of every node created so far, row-major.
@@ -580,14 +458,11 @@ struct Working<'a, T> {
 /// The centre's own effective leaf, over the members currently attached to it.
 ///
 /// SPEC.md section 4 over the whole star. The mean accumulates as a running
-/// weighted average rather than as a ratio of sums, for the same conditioning
-/// reason as in [`crate::utils::kernels::prune_general`]: every partial value
-/// stays inside the convex hull of the member means.
+/// weighted average, as in [`crate::utils::kernels::prune_general`], so partial
+/// values stay in the convex hull of the member means.
 ///
-/// `O(n p)` a round, so `O(n^2 p)` over a star. That is below the pair scan it
-/// sits inside until the upper bounds of SPEC.md section 10 cut the scan to a
-/// handful of pairs, at which point it is the largest term left; see
-/// [`update_centre_leaf`] and [`StarParams::incremental_centre`].
+/// `O(n p)` a round; see [`update_centre_leaf`] and
+/// [`StarParams::incremental_centre`].
 ///
 /// ### Params
 ///
@@ -623,15 +498,13 @@ fn centre_leaf<T: BonsaiFloat>(
 
 /// Move the centre's effective leaf across one merge, in `O(p)`.
 ///
-/// A merge removes two members and adds one, so the centre's effective leaf
-/// changes by two subtractions and one addition rather than by an
-/// `O(n p)` re-accumulation. The subtractions are the peel of SPEC.md section
-/// 8.1 and lose digits for the same reason it does; the caller caps the drift
-/// with a periodic exact recompute. See [`StarParams::incremental_centre`].
+/// Two subtractions and one addition instead of an `O(n p)` re-accumulation.
+/// The subtractions are the peel of SPEC.md section 8.1 and lose digits the same
+/// way; the caller caps drift with a periodic exact recompute. See
+/// [`StarParams::incremental_centre`].
 ///
-/// The two children's branch lengths must still be the ones they had to the
-/// centre, so this is called *before* they are overwritten with the branches to
-/// their new ancestor.
+/// Call *before* the children's branches are overwritten with those to their
+/// new ancestor.
 ///
 /// ### Params
 ///
@@ -678,38 +551,17 @@ fn update_centre_leaf<T: BonsaiFloat>(
 
 /// Peel a pair off the centre's effective leaf to get the rest of the star.
 ///
-/// SPEC.md section 8.1. `O(p)` per pair by subtraction, rather than `O(n p)` by
-/// re-accumulating over the other members, which is the whole reason a merge
-/// scan is affordable.
+/// SPEC.md section 8.1. `O(p)` per pair by subtraction rather than `O(n p)` by
+/// re-accumulating over the other members.
 ///
-/// **Conditioning.** Both lines difference quantities of similar magnitude. If
-/// one member carries most of the centre's precision then `WR` is a small
-/// difference of large numbers and loses significant digits, and the mean is
-/// worse because the subtraction happens in the numerator *and* the small `WR`
-/// then divides it. The accumulation is in `f64` regardless of storage type.
-///
-/// `test_the_peel_loses_the_remainder_when_one_member_dominates` is the fixture
-/// that shows it biting: six members on zero-length branches with one carrying
-/// the whole star's precision and sitting inside the peeled pair, relative
-/// error in the remainder's mean against a re-accumulation:
-///
-/// | dominance | rel err in `MR` | features with `WR <= 0` |
-/// |---|---|---|
-/// | 1e9  | 1.9e-7 | 0 of 8 |
-/// | 1e13 | 4.1e-3 | 0 of 8 |
-/// | 1e15 | 2.5e-1 | 0 of 8 |
-/// | 1e16 | 9.9e1  | 8 of 8 |
-///
-/// The law is `2^-53 * W_centre / W_R`, so it is total loss at `1e16` and a
-/// negative remainder past it. Two things keep it away from a real star: the
-/// diffusion correction caps `wd` at `1/t`, so the range that reaches the
-/// subtraction is bounded by the branch lengths and not by the raw precisions,
-/// and the ordinary late-round case has `W_centre / W_R` of order `n`, which is
-/// `1e-12` at eight thousand members. The band to fear is `1e13` to `1e16`,
-/// where the score is wrong but finite and so competes on equal terms; past it
-/// the pair's own solve fails and the pair is dropped. This is documented
-/// rather than defended: the re-accumulated form is a different cost class, and
-/// the fixtures that reach the band all need zero-length branches throughout.
+/// **Conditioning.** If one member carries most of the centre's precision, `WR`
+/// is a small difference of large numbers and loses digits (the mean worse
+/// still). Relative error in the remainder's mean is about
+/// `2^-53 * W_centre / W_R`: `2.5e-1` at dominance `1e15`, total loss at `1e16`
+/// (`test_the_peel_loses_the_remainder_when_one_member_dominates`). The
+/// diffusion correction caps `wd` at `1/t`, and late-round `W_centre / W_R` is
+/// of order `n`, so real stars stay clear; only zero-length-branch fixtures
+/// reach the band. Accumulation is in `f64` regardless of storage type.
 ///
 /// ### Params
 ///
@@ -738,10 +590,8 @@ fn peel<T: BonsaiFloat>(work: &Working<'_, T>, i: usize, j: usize, m_r: &mut [T]
 
 /// One worker's reusable buffers for the pair scan.
 ///
-/// Allocated once per worker through `map_init` rather than once per pair.
-/// Public because a candidate provider that scores pairs itself, which is the
-/// upper-bound machinery of SPEC.md section 10, wants the same amortisation and
-/// the same peel.
+/// Allocated once per worker through `map_init`. Public for providers that
+/// score pairs themselves (SPEC.md section 10).
 pub struct PairScratch<T> {
     /// Branch-length solve scratch.
     merge: MergeScratch,
@@ -819,10 +669,8 @@ fn score_pair_raw<T: BonsaiFloat>(
 
 /// What one scan found: the best pair, and how many were dropped.
 ///
-/// `dropped` is summed rather than compared, and addition of counts is
-/// associative and commutative, so the reduction stays independent of how rayon
-/// split the work in exactly the way [`Candidate::better`] makes the winner
-/// independent of it.
+/// `dropped` is summed, which is associative and commutative, so the reduction
+/// is independent of how rayon splits the work.
 #[derive(Clone, Copy, Debug)]
 struct Scan {
     /// Best candidate seen, [`Candidate::NONE`] if there was none.
@@ -864,18 +712,10 @@ impl Scan {
 
 /// Score one candidate pair.
 ///
-/// A pair whose gain comes back non-finite becomes [`Candidate::NONE`] rather
-/// than a selectable candidate. That is a numerical pathology in the
-/// branch-length solve for that pair alone, and letting it win would stop the
-/// whole primitive.
-///
-/// **A diverged solve is dropped for the same reason**, and counted so that a
-/// round in which every pair diverged can still be reported rather than
-/// returning an unresolved star. Letting the error out of the scan instead
-/// would stop the whole primitive on one pathological pair, which is the
-/// outcome the paragraph above exists to avoid, and would make the error path
-/// depend on the thread count: `try_reduce` short-circuits, so which of several
-/// failing pairs surfaced would be whichever worker got there first.
+/// A non-finite gain becomes [`Candidate::NONE`], and a diverged solve is
+/// dropped and counted, so one pathological pair cannot stop the primitive.
+/// Propagating the error instead would also make it depend on the thread count,
+/// since `try_reduce` short-circuits on whichever worker fails first.
 ///
 /// ### Params
 ///
@@ -923,10 +763,9 @@ fn score_pair<T: BonsaiFloat>(
 
 /// Recover the error that a round of nothing but diverged pairs swallowed.
 ///
-/// Called only when every pair scored in a round was dropped, and it rescores
-/// the first of them sequentially so the caller is handed the actual solver
-/// error rather than an `Ok` holding an unresolved star. The first pair is a
-/// fixed choice, so the error does not depend on the thread count.
+/// Called when every pair in a round was dropped. Rescores the first pair
+/// sequentially, a fixed choice, so the error is independent of the thread
+/// count.
 ///
 /// ### Params
 ///
@@ -957,10 +796,8 @@ fn diverged_round<T: BonsaiFloat>(
 
 /// Score every candidate pair and return the best.
 ///
-/// Read-only over the working set, so the scan is a parallel map and reduce.
-/// Each worker allocates its scratch and its remainder buffers once through
-/// `map_init` rather than once per pair; the reduction is a total order over
-/// `(gain, node ids)`, so the winner does not depend on the thread count.
+/// Parallel map and reduce over a total order on `(gain, node ids)`, so the
+/// winner does not depend on the thread count.
 ///
 /// ### Params
 ///
@@ -1004,16 +841,13 @@ fn scan_pairs<T: BonsaiFloat>(
 /// upper bound on its pair's gain, so once the best true gain seen exceeds the
 /// next entry every remaining pair is beaten and the walk can stop.
 ///
-/// **The comparison is strict.** With `>=` a pair whose true gain ties the
-/// incumbent could be left unscored, and [`Candidate::better`] breaks ties on
-/// node ids, so the winner would depend on where the walk happened to stop.
-/// Strict `>` scores every pair whose bound reaches the incumbent, which is
-/// every pair that could tie it, and the exhaustive scan's answer is recovered
-/// exactly.
+/// **The comparison is strict.** With `>=` a pair tying the incumbent could go
+/// unscored, and [`Candidate::better`] breaks ties on node ids, so the winner
+/// would depend on where the walk stopped. Strict `>` recovers the exhaustive
+/// answer exactly.
 ///
-/// The list is consumed in chunks so the scan inside a chunk is still parallel.
-/// Chunk boundaries are fixed by index, so the pairs scored and the winner are
-/// the same at any thread count.
+/// Consumed in index-fixed chunks of [`BOUND_WALK_CHUNK`], so each chunk scans in
+/// parallel and the result is the same at any thread count.
 ///
 /// ### Params
 ///
@@ -1050,14 +884,9 @@ fn walk_bounded<T: BonsaiFloat>(
 /// Score every candidate pair and sample one in proportion to the likelihood of
 /// the tree its merge would produce.
 ///
-/// SPEC.md section 9.4. The scores are collected in `pairs` order, which rayon
-/// preserves for an indexed iterator, and the softmax and the cumulative draw
-/// then run sequentially over that fixed order. So the sampled pair is a
-/// function of the seed and the star alone and not of which worker finished
-/// first, which is what a `RAYON_NUM_THREADS` sweep in the tests pins.
-///
-/// Only pairs clearing `min_gain` are eligible, so this has the same stopping
-/// rule as the greedy scan; see [`StarSelection::Weighted`].
+/// SPEC.md section 9.4. Scores are collected in `pairs` order and the softmax
+/// and draw run sequentially, so the pick depends only on the seed and the star.
+/// Only pairs clearing `min_gain` are eligible; see [`StarSelection::Weighted`].
 ///
 /// ### Params
 ///
@@ -1112,9 +941,7 @@ fn sample_pair<T: BonsaiFloat>(
         return Ok(Candidate::NONE);
     }
 
-    // Softmax over loglikelihoods, so the maximum comes off before the
-    // exponential: a round's gains are `O(p)` nats apart and would otherwise
-    // overflow at a few hundred features.
+    // Subtract the maximum: gains are `O(p)` nats apart and would overflow.
     let total: f64 = scored
         .iter()
         .filter(eligible)
@@ -1128,8 +955,7 @@ fn sample_pair<T: BonsaiFloat>(
             return Ok(*c);
         }
     }
-    // The cumulative sum can fall a rounding short of `total`. Nothing was
-    // sampled then, so take the last eligible pair rather than nothing.
+    // The cumulative sum can fall a rounding short of `total`.
     Ok(scored
         .iter()
         .rev()
@@ -1165,9 +991,8 @@ fn push_ancestor<T: BonsaiFloat>(
         let wdk = wk / (1.0 + t_ak * wk);
         let wdl = wl / (1.0 + t_al * wl);
         let wa = wdk + wdl;
-        // Convex combination, so the ancestor's mean is pinned between its two
-        // children's and cannot cancel. It feeds straight back into the next
-        // round, so error here compounds up the tree.
+        // Convex combination: the mean stays between the children's and cannot
+        // cancel, which matters as error compounds up the tree.
         let mk = wide(m[bk + g]);
         let ma = mk + (wide(m[bl + g]) - mk) * (wdl / wa);
         m.push(narrow(ma));
@@ -1202,13 +1027,10 @@ pub fn resolve_star<T: BonsaiFloat>(
 /// Run the star primitive.
 ///
 /// Each round scores the candidate pairs, inserts an ancestor above the one
-/// [`StarSelection`] picks, summarises it as an effective leaf, and puts it back in the star in
-/// place of the two members it swallowed. Stops at `MIN_CENTRE_MEMBERS`
-/// members or when no pair clears [`StarParams::min_gain`].
-///
-/// The branch lengths of members other than the merged pair are untouched: a
-/// merge only optimises the three branches it creates (SPEC.md section 8.4),
-/// and the rest of the tree is reoptimised by search steps 4 and 7.
+/// [`StarSelection`] picks and puts it back in the star in place of the two
+/// members it swallowed. Stops at `MIN_CENTRE_MEMBERS` members or when no pair
+/// clears [`StarParams::min_gain`]. Only the three branches a merge creates are
+/// optimised (SPEC.md section 8.4); the rest is left to search steps 4 and 7.
 ///
 /// ### Params
 ///
@@ -1248,12 +1070,8 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
         });
     }
 
-    // Reject a star the arithmetic cannot score, rather than discovering it one
-    // pair at a time. A non-finite mean or precision makes every candidate gain
-    // non-finite; those map to `Candidate::NONE`, the round finds no best pair,
-    // and the loop exits normally. The caller then gets `Ok` with an unresolved
-    // star and no indication that anything went wrong, which for a single `NaN`
-    // in a large input matrix is the worst possible failure mode.
+    // A non-finite input would otherwise yield `Ok` with an unresolved star:
+    // every gain maps to `Candidate::NONE` and the loop exits normally.
     for (i, &value) in star.means.iter().enumerate() {
         if !wide(value).is_finite() {
             return Err(BonsaiErrors::MalformedTree {
@@ -1344,12 +1162,8 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
             wc: &wc,
             p,
         };
-        // `Candidate::NONE` carries minus infinity, so an empty or entirely
-        // non-finite round falls out of the loop here too.
         let best = match params.selection {
-            // A provider's bounds are ignored under weighted selection, which
-            // needs every pair's score to form the softmax and so has nothing
-            // to prune with.
+            // Weighted selection needs every score, so bounds are ignored.
             StarSelection::Greedy => {
                 let (scan, done) = match candidates.bounds() {
                     Some(bounds) if bounds.len() == pairs.len() => {
@@ -1361,9 +1175,7 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
                     ),
                 };
                 scored_last_round = done;
-                // Every pair the round looked at diverged. Dropping them one by
-                // one is right; coming back with an unresolved star and no
-                // diagnostic is not, so the first pair's error is recovered.
+                // Every scored pair diverged: surface the solver error.
                 if scan.dropped == done && done > 0 {
                     return Err(diverged_round(&work, &members, &pairs, params.merge));
                 }
@@ -1412,9 +1224,8 @@ pub fn resolve_star_with<T: BonsaiFloat, C: CandidatePairs<T>>(
         parent.push(NO_NODE);
         branch.push(best.t_ar);
 
-        // The ancestor's id exceeds every member's, so appending keeps the
-        // membership ascending and the tie-break in `Candidate::better` is a
-        // tie-break on position as well as on id.
+        // The ancestor's id exceeds every member's, so appending keeps
+        // `members` ascending.
         members.retain(|&x| x != best.left && x != best.right);
         members.push(ancestor);
 
@@ -1487,14 +1298,10 @@ pub fn star_tree<T: BonsaiFloat>(
 
 /// Resolve a star into a tree, choosing which candidate pairs are considered.
 ///
-/// The exhaustive scan of [`star_tree`] is `O(n^2)` pairs per round over `O(n)`
-/// rounds, so a whole star is `O(n^3 p)`. That is what
+/// The exhaustive scan of [`star_tree`] is `O(n^3 p)` over a star.
 /// [`crate::search::candidates::KnnCandidates`] and
-/// [`crate::search::bounds::EllipsoidBounds`] exist to avoid, and a caller
-/// building trees of any size wants them: measured end to end, the merge step
-/// is 94 per cent of the pipeline's runtime and scales as `n^2.9` without them.
-///
-/// The two compose, bounds outermost:
+/// [`crate::search::bounds::EllipsoidBounds`] avoid that and compose, bounds
+/// outermost:
 ///
 /// ```ignore
 /// let mut provider = EllipsoidBounds::new(KnnCandidates::new(None));

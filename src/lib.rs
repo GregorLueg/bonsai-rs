@@ -52,3 +52,9 @@ pub mod prelude;
 pub mod search;
 pub mod tree;
 pub mod utils;
+
+/// The `sanity-sc-rs` this crate was built against. Downstream code that feeds
+/// [`ingest::from_sanity_output`] should name Sanity through this, so the
+/// `SanityOutput` it builds is the type the ingest expects.
+#[cfg(feature = "sanity")]
+pub use sanity_sc_rs;

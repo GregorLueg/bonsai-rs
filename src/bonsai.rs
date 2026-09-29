@@ -95,6 +95,12 @@ pub struct BonsaiParams {
     /// degenerate for branch-length optimisation: only the sum of the two
     /// branches below it is identifiable.
     pub reroot: bool,
+    /// Skip the per-node posteriors, leaving `node_means` and `node_sds` empty.
+    ///
+    /// They are `2 * n_nodes * n_features` values, which at 100k cells and a
+    /// few thousand features is gigabytes a caller after the tree alone never
+    /// reads. The search does not depend on them.
+    pub skip_posteriors: bool,
 }
 
 ///////////////
@@ -176,9 +182,11 @@ pub struct BonsaiResult<T> {
     /// survived selection, ascending.
     pub features: Vec<usize>,
     /// Posterior mean position of every node, row-major `[node][retained
-    /// feature]`, in **raw** units.
+    /// feature]`, in **raw** units. Empty under
+    /// [`BonsaiParams::skip_posteriors`].
     pub node_means: Vec<T>,
     /// Posterior standard deviation of every node, same layout, **raw** units.
+    /// Empty under [`BonsaiParams::skip_posteriors`].
     pub node_sds: Vec<T>,
     /// Loglikelihood after each step, in order.
     pub steps: Vec<StepReport>,
@@ -645,11 +653,16 @@ fn refine_from<T: BonsaiFloat>(
         tree = reroot_for_display(&tree)?;
     }
 
-    let started = begin("Posteriors", verbosity);
-    let (node_means, node_sds) = posteriors(&tree, leaves, data)?;
-    if verbosity.normal_verbosity() {
-        println!("  {} nodes ({:.2?})", tree.n_nodes(), started.elapsed());
-    }
+    let (node_means, node_sds) = if params.skip_posteriors {
+        (Vec::new(), Vec::new())
+    } else {
+        let started = begin("Posteriors", verbosity);
+        let out = posteriors(&tree, leaves, data)?;
+        if verbosity.normal_verbosity() {
+            println!("  {} nodes ({:.2?})", tree.n_nodes(), started.elapsed());
+        }
+        out
+    };
     Ok(BonsaiResult {
         tree,
         loglik,
@@ -784,6 +797,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_skip_posteriors_leaves_the_tree_alone() {
+        let (n, p) = (16usize, 64usize);
+        let (means, sds, variances, _) = raw_fixture(n, p, 0.2, 7);
+
+        let full =
+            bonsai(&means, &sds, n, p, Some(&variances), None, Verbosity::Quiet).expect("bonsai");
+        let skipped = bonsai(
+            &means,
+            &sds,
+            n,
+            p,
+            Some(&variances),
+            Some(BonsaiParams {
+                skip_posteriors: true,
+                ..Default::default()
+            }),
+            Verbosity::Quiet,
+        )
+        .expect("bonsai");
+
+        assert!(skipped.node_means.is_empty() && skipped.node_sds.is_empty());
+        assert_eq!(full.loglik, skipped.loglik);
+        assert_eq!(full.tree.branches(), skipped.tree.branches());
+        assert_eq!(
+            robinson_foulds(&full.tree, &skipped.tree).expect("rf"),
+            0,
+            "skipping the posteriors changed the topology"
+        );
     }
 
     #[test]

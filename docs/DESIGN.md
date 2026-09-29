@@ -115,7 +115,8 @@ this at 1, 3 and 8 threads. No `.sum()` on a `ParallelIterator`.
 5. SPR.
 6. NNI, generalised to polytomies.
 7. Global branch lengths again.
-8. Collapse internal zero-length edges left by 4 to 7, reoptimise locally.
+8. Collapse internal zero-length edges left by 4 to 7, reoptimise, collapse any
+   the reoptimise lands on zero.
 
 The order matters in three places the spec doesn't mention:
 

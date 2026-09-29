@@ -618,7 +618,7 @@ fn rebuild(
 /// The collapsed tree and, per node of it, its node in `tree`; or `None` if
 /// there was no zero-length internal edge, or the error the arena rejected the
 /// rebuild with.
-fn collapse_zero_edges(tree: &Tree) -> Result<Option<(Tree, Vec<u32>)>, BonsaiErrors> {
+pub(crate) fn collapse_zero_edges(tree: &Tree) -> Result<Option<(Tree, Vec<u32>)>, BonsaiErrors> {
     let n = tree.n_nodes();
     let n_leaves = tree.n_leaves();
     let root = tree.root();

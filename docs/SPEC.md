@@ -364,7 +364,10 @@ collapses zero-length edges, and it runs before step 4. Section 6 is explicit
 that a branch solve landing on `t = 0` is normal, so every zero-length edge
 steps 4 to 7 create outlives the only pass that would remove one. This crate
 therefore runs the collapse of section 9.2 once more after step 7, followed by
-a branch reoptimisation.
+a branch reoptimisation. That reoptimisation can itself land an internal edge
+on `t = 0` (once on 10,000 Baron cells, 2026-09-29), so a last collapse follows
+it. A zero-length edge puts both ends at the same point, so that collapse
+changes no loglikelihood and needs no further solve.
 
 Measured on Sanity-preprocessed data at 10,000 cells by 2,767 genes: 32
 internal zero-length edges survive step 7, and removing them takes

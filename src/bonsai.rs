@@ -268,6 +268,40 @@ fn star_of(n_leaves: usize) -> Result<Tree, BonsaiErrors> {
     Tree::from_parents(parent, branch, n_leaves)
 }
 
+/// Step 8: collapse the zero-length internal edges steps 4 to 7 leave behind,
+/// resolve what that exposes, reoptimise, and collapse once more.
+///
+/// The reoptimise can itself land an internal edge on exactly `t = 0`, which
+/// SPEC.md section 6 calls normal: one such edge on 10,000 Baron cells,
+/// measured 2026-09-29. The last collapse removes it. A zero-length edge puts
+/// both ends at the same point, so that collapse leaves the loglikelihood and
+/// every other edge's optimum exactly where the solve put them, and no second
+/// solve is needed. Afterwards no internal edge below the root is `0.0`.
+///
+/// ### Params
+///
+/// * `tree` - Tree after step 7; not modified
+/// * `leaves` - Transformed leaf data
+/// * `params` - Pipeline knobs, for the star and branch-length settings
+///
+/// ### Returns
+///
+/// The resolver's report with its tree replaced by the final one, and the
+/// loglikelihood, or the error the resolver, the solve or the arena failed
+/// with.
+pub fn collapse_step<T: BonsaiFloat>(
+    tree: &Tree,
+    leaves: Leaves<'_, T>,
+    params: &BonsaiParams,
+) -> Result<(crate::search::polytomy::PolytomyResult, f64), BonsaiErrors> {
+    let mut resolved = resolve_polytomies(tree, leaves, Some(params.star))?;
+    let loglik = optimise_all(&mut resolved.tree, leaves, params)?;
+    if let Some((collapsed, _)) = crate::search::polytomy::collapse_zero_edges(&resolved.tree)? {
+        resolved.tree = collapsed;
+    }
+    Ok((resolved, loglik))
+}
+
 /// Optimise every branch length in place.
 ///
 /// ### Params
@@ -603,9 +637,8 @@ fn refine_from<T: BonsaiFloat>(
     // separate two cells it has no evidence to separate, and they survive this
     // step by design.
     let started = begin("Step 8: collapse zero-length edges", verbosity);
-    let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
+    let (resolved, loglik) = collapse_step(&tree, leaves, params)?;
     tree = resolved.tree;
-    let loglik = optimise_all(&mut tree, leaves, params)?;
     record("8 collapse", loglik, &mut steps, verbosity, started);
 
     // Rerooting is a display choice and carries no information (S14), so it
@@ -868,6 +901,54 @@ mod tests {
         let means = vec![1.0f64; 4];
         let sds = vec![0.1f64; 4];
         assert!(bonsai(&means, &sds, 1, 4, None, None, Verbosity::Quiet).is_err());
+    }
+
+    #[test]
+    fn test_collapse_step_leaves_no_zero_length_internal_edge() {
+        // ((A,B)X,C)Y,D): A, B and C sit at equal, orthogonal offsets from one
+        // centre, so nothing pairs A with B and the solve puts X on Y. The tree
+        // is binary, so the resolver leaves it alone and the zero is the
+        // reoptimise's own, which is the case the last collapse exists for.
+        let (n, p) = (4usize, 60usize);
+        let mut m = vec![0.0f64; n * p];
+        for g in 0..p {
+            m[(g / 20) * p + g] = 1.0;
+            m[3 * p + g] = 8.0;
+        }
+        let w = vec![1.0f64; n * p];
+        let leaves = Leaves {
+            means: &m,
+            precisions: &w,
+            n_features: p,
+        };
+        let tree = Tree::from_parents(
+            vec![4, 4, 5, 6, 5, 6, crate::tree::NO_NODE],
+            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0],
+            n,
+        )
+        .expect("tree");
+        let params = BonsaiParams::default();
+        let zero_internal = |t: &Tree| {
+            (t.n_leaves()..t.n_nodes())
+                .filter(|&i| i as u32 != t.root() && t.branch(i as u32) == 0.0)
+                .count()
+        };
+
+        // The fixture has to hit the case, or the assertion below is vacuous.
+        let mut unfixed = resolve_polytomies(&tree, leaves, Some(params.star))
+            .expect("resolve")
+            .tree;
+        optimise_all(&mut unfixed, leaves, &params).expect("optimise");
+        assert!(zero_internal(&unfixed) > 0, "the fixture made no zero edge");
+
+        let (out, loglik) = collapse_step(&tree, leaves, &params).expect("collapse step");
+        assert_eq!(zero_internal(&out.tree), 0);
+        assert_eq!(out.tree.n_leaves(), n);
+        assert_relative_eq!(
+            tree_loglik(&out.tree, leaves).expect("loglik"),
+            loglik,
+            max_relative = 1e-12
+        );
     }
 
     use approx::assert_relative_eq;

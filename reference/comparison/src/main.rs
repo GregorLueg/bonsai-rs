@@ -729,6 +729,7 @@ fn ours(dir: &Path) -> Fallible<()> {
             },
             Some(params.star),
             &mut candidates,
+            bonsai_rs::utils::verbosity::Verbosity::Quiet,
         )?;
         let secs = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
@@ -834,7 +835,7 @@ fn refine_steps(
 
     // Step 5.
     let t0 = Instant::now();
-    let spr_result = spr(&tree, leaves, Some(params.spr))?;
+    let spr_result = spr(&tree, leaves, Some(params.spr), bonsai_rs::utils::verbosity::Verbosity::Quiet)?;
     tree = spr_result.tree;
     let secs = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
@@ -849,7 +850,7 @@ fn refine_steps(
 
     // Step 6.
     let t0 = Instant::now();
-    let nni_result = nni(&tree, leaves, Some(params.nni))?;
+    let nni_result = nni(&tree, leaves, Some(params.nni), bonsai_rs::utils::verbosity::Verbosity::Quiet)?;
     tree = nni_result.tree;
     let secs = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
@@ -867,18 +868,15 @@ fn refine_steps(
     let loglik = optimise_branch_lengths(&mut tree, &mut state, Some(params.branch))?;
     record("7 branch", t0.elapsed().as_secs_f64(), loglik, 0.0);
 
-    // Step 8, the crate's deviation: collapse the internal zero-length edges
-    // steps 4 to 7 leave behind, then reoptimise. Step 3 is the only other
-    // collapse and it runs before step 4, so nothing else removes these.
+    // Step 8, the crate's deviation, through the crate's own function so the
+    // sequence cannot drift from `refine_from`.
     let t0 = Instant::now();
-    let resolved = resolve_polytomies(&tree, leaves, Some(params.star))?;
+    let (resolved, loglik) = bonsai_rs::bonsai::collapse_step(&tree, leaves, params)?;
     println!(
         "polytomy: {} polytomies, {} resolved, {} sweeps",
         resolved.n_polytomies, resolved.n_resolved, resolved.sweeps
     );
     tree = resolved.tree;
-    let mut state = NodeState::new(tree.n_nodes(), p, leaves.means, leaves.precisions)?;
-    let loglik = optimise_branch_lengths(&mut tree, &mut state, Some(params.branch))?;
     record("8 collapse", t0.elapsed().as_secs_f64(), loglik, 0.0);
 
     Ok(Refined {

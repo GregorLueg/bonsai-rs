@@ -4,7 +4,9 @@ pub use crate::bonsai::{BonsaiParams, BonsaiResult, StartTree, bonsai, bonsai_pr
 pub use crate::errors::BonsaiErrors;
 #[cfg(feature = "sanity")]
 pub use crate::ingest::from_sanity_output;
-pub use crate::ingest::{IngestParams, PreparedData, SanityLikelihood, from_sanity, prepare};
+pub use crate::ingest::{
+    IngestParams, PreparedData, SanityLikelihood, from_sanity, prepare, sanity_gene_passes,
+};
 pub use crate::search::nni::{NniParams, NniSearch};
 pub use crate::search::spr::{SprParams, SprSearch};
 pub use crate::tree::Tree;

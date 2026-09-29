@@ -804,6 +804,74 @@ pub fn from_sanity<T: BonsaiFloat>(
     })
 }
 
+/// Whether one Sanity gene survives [`from_sanity`] then [`prepare`].
+///
+/// Both of the ingest's gene filters depend on that gene's posteriors alone:
+/// the S5 conversion drops a gene if any cell's amplification `v / (v - eps^2)`
+/// exceeds `params.max_sanity_amplification`, and selection drops it if its
+/// signal-to-noise ratio `S[g]` (S6) is below `params.min_signal_to_noise`. So
+/// the decision can be taken gene by gene while Sanity runs, which is what
+/// `sanity_select` and `sanity_gpu_select` are for: only the genes that pass
+/// are ever stored.
+///
+/// Takes `f64` because the Sanity predicates see the posteriors before they
+/// are narrowed. [`from_sanity`] later scores the stored values again, so a gene
+/// right at a threshold can still be dropped there; nothing rejected here can
+/// reach the tree.
+///
+/// Two passes over the cells and no allocation: the first forms the
+/// precision-weighted mean the score is centred on, the second the score.
+///
+/// ### Params
+///
+/// * `log_fold_changes` - Sanity's `xstar` for this gene, one per cell
+/// * `error_bars` - Sanity's `eps` for this gene, one per cell
+/// * `variance` - Sanity's `v[g]` for this gene
+/// * `params` - The ingest knobs the later [`from_sanity`] and [`prepare`] use
+///
+/// ### Returns
+///
+/// `true` if the gene would be retained.
+pub fn sanity_gene_passes(
+    log_fold_changes: &[f64],
+    error_bars: &[f64],
+    variance: f64,
+    params: &IngestParams,
+) -> bool {
+    let v = variance;
+    if !(v > 0.0 && v.is_finite()) || log_fold_changes.is_empty() {
+        return false;
+    }
+    let floor = v / params.max_sanity_amplification;
+
+    // pass one: the S5 conversion per cell, its conditioning check, and the
+    // weighted mean of `feature_mean`
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for (&x, &eps) in log_fold_changes.iter().zip(error_bars) {
+        let e2 = eps * eps;
+        if v - e2 < floor {
+            return false;
+        }
+        let amp = v / (v - e2);
+        let r = 1.0 / (v + e2 * amp);
+        num += x * amp * r;
+        den += r;
+    }
+    let mbar = num / den;
+
+    // pass two: `signal_to_noise` on the converted values
+    let mut acc = 0.0f64;
+    for (&x, &eps) in log_fold_changes.iter().zip(error_bars) {
+        let e2 = eps * eps;
+        let amp = v / (v - e2);
+        let sig2 = e2 * amp;
+        let d = x * amp - mbar;
+        acc += v * d * d / ((v + sig2) * sig2);
+    }
+    let s = acc / log_fold_changes.len() as f64;
+    s.is_finite() && s >= params.min_signal_to_noise
+}
+
 /// [`from_sanity`] straight from a `sanity-sc-rs` run.
 ///
 /// Takes `log_fold_changes` as `xstar`, **not** the log transcription quotients
@@ -1459,6 +1527,93 @@ mod sanity_tests {
             robinson_foulds(&res.tree, &sim.tree).unwrap(),
             distance_recovery(&res.tree, &sim.truth, p, MAX_PAIRS, 0),
         )
+    }
+
+    #[test]
+    fn test_sanity_gene_passes_matches_the_ingest() {
+        let (_, counts, totals) = simulated_counts();
+        let out = sanity::<f64>(&counts, &totals, None).unwrap();
+        let n = out.n_cells;
+
+        for min_signal_to_noise in [DEFAULT_MIN_SIGNAL_TO_NOISE, 5.0, 20.0] {
+            let params = IngestParams {
+                min_signal_to_noise,
+                ..IngestParams::default()
+            };
+            let lik = from_sanity_output(&out, Some(params)).unwrap();
+            let prepared = prepare(
+                &lik.means,
+                &lik.sds,
+                n,
+                lik.features.len(),
+                Some(&lik.variances),
+                Some(params),
+            );
+            let expected: Vec<usize> = match prepared {
+                Ok(p) => p.features.iter().map(|&f| lik.features[f]).collect(),
+                Err(BonsaiErrors::NoFeaturesRetained { .. }) => Vec::new(),
+                Err(e) => panic!("{e}"),
+            };
+
+            let passing: Vec<usize> = (0..out.n_genes)
+                .filter(|&g| {
+                    sanity_gene_passes(
+                        &out.log_fold_changes[g * n..(g + 1) * n],
+                        &out.error_bars[g * n..(g + 1) * n],
+                        out.variance[g],
+                        &params,
+                    )
+                })
+                .collect();
+
+            assert_eq!(passing, expected, "threshold {min_signal_to_noise}");
+            if min_signal_to_noise == 5.0 {
+                assert!(
+                    !passing.is_empty() && passing.len() < out.n_genes,
+                    "the middle threshold should keep some genes and drop others"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_sanity_select_with_the_ingest_predicate_keeps_the_same_genes() {
+        let (_, counts, totals) = simulated_counts();
+        let params = IngestParams {
+            min_signal_to_noise: 5.0,
+            ..IngestParams::default()
+        };
+        let full = sanity::<f64>(&counts, &totals, None).unwrap();
+        let picked = sanity_sc_rs::sanity_select::<f64, _>(&counts, &totals, None, |g| {
+            sanity_gene_passes(g.log_fold_changes, g.error_bars, g.variance, &params)
+        })
+        .unwrap();
+
+        let a = from_sanity_output(&full, Some(params)).unwrap();
+        let b = from_sanity_output(&picked, Some(params)).unwrap();
+        let pa = prepare(
+            &a.means,
+            &a.sds,
+            a.n_cells,
+            a.features.len(),
+            Some(&a.variances),
+            Some(params),
+        )
+        .unwrap();
+        let pb = prepare(
+            &b.means,
+            &b.sds,
+            b.n_cells,
+            b.features.len(),
+            Some(&b.variances),
+            Some(params),
+        )
+        .unwrap();
+        let genes_a: Vec<usize> = pa.features.iter().map(|&f| a.features[f]).collect();
+        let genes_b: Vec<usize> = pb.features.iter().map(|&f| b.features[f]).collect();
+        assert_eq!(genes_a, genes_b);
+        assert_eq!(pa.transformed_means, pb.transformed_means);
+        assert_eq!(picked.n_genes, genes_b.len());
     }
 
     #[test]

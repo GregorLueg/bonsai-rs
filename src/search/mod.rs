@@ -35,9 +35,9 @@ pub struct Leaves<'a, T> {
     pub n_features: usize,
 }
 
-//////////////////////
-// Settled trees    //
-//////////////////////
+///////////////////
+// Settled trees //
+///////////////////
 
 /// Loglikelihood of a tree, from the leaf data alone.
 ///

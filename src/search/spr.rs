@@ -5,7 +5,8 @@
 //! this module is mostly the plumbing between them: the subtree is summarised
 //! as an effective leaf by the pruning recursion of SPEC.md section 4, its new
 //! home is found by the beam search of [`place`] (SPEC.md section 7.2), and the
-//! polytomy the attachment creates is resolved by [`crate::search::polytomy::splice_star`] (SPEC.md
+//! polytomy the attachment creates is resolved by
+//! [`crate::search::polytomy::splice_star`] (SPEC.md
 //! sections 7.3 and 9.2).
 //!
 //! ### Detaching leaves a degree-two node behind
@@ -121,9 +122,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-////////////////
-// Parameters //
-////////////////
+////////////
+// Consts //
+////////////
 
 /// Default for [`SprParams::max_rounds`].
 ///
@@ -160,18 +161,6 @@ const DEFAULT_MAX_ROUNDS: usize = 100;
 /// `min_relative_gain * max(|L|, LOGLIK_SCALE_FLOOR)`, the floor there to stop
 /// the test collapsing when the loglikelihood passes through zero (SPEC.md
 /// section 3.2 leaves it defined only up to an additive constant).
-///
-/// `1e-12` is the tolerance `test_the_incremental_loglik_matches_a_fresh_prune`
-/// already pins the proposal's score to, which is the right number by
-/// construction: a candidate is accepted on an incrementally assembled figure,
-/// and there is no sense in accepting a gain smaller than the disagreement
-/// between that figure and the fresh prune it stands in for. Against the
-/// observed noise it is 200x of headroom (`1.1e-5` against `5.6e-8` at 10k)
-/// and against a real move it is six orders of margin, since accepted SPR
-/// gains at 10k average about 15 nats and the smallest measured on any rung of
-/// the subsample ladder was `2e-5`. At 512 cells the floor is `5e-7`, at 5,000
-/// `5.6e-6`; below about 1,000 cells `StarParams::min_gain` is the binding one
-/// and nothing changes.
 const DEFAULT_MIN_RELATIVE_GAIN: f64 = 1e-12;
 
 /// Fewest candidates a sweep proposes in parallel before deciding any of them.
@@ -197,48 +186,25 @@ const PROPOSAL_CHUNK_MIN: usize = 8;
 const PROPOSAL_CHUNK_MAX: usize = 256;
 
 /// Default for [`SprApprox::recheck`].
-///
-/// Measured 2026-09-26. Without it, 47 to 48 per cent of all proposals at 10k
-/// and 25k cells were discarded after an earlier acceptance in their chunk and
-/// proposed again. Full search, off against on:
-///
-/// | data | loglik | Robinson-Foulds | recovery | seconds |
-/// |---|---|---|---|---|
-/// | synthetic 8k, noise 0.4 | identical | 0, 0 | 0.945, 0.945 | 7, 7 |
-/// | synthetic 8k, noise 1.6 | -8,766,997.2, -8,766,997.9 | 4,512, 4,538 | 0.831, 0.831 | 54, 42 |
-/// | Baron 5k | -5,557,978, -5,557,888 | 1,288, 1,301 | 0.666, 0.667 | 64, 52 |
-/// | Baron 10k | -11,252,721, -11,253,773 | 2,624, 2,612 | 0.476, 0.386 | 178, 140 |
-/// | Baron 25k | -28,630,458, -28,629,166 | 6,048, 6,061 | 0.539, 0.553 | 482, 453 |
-///
-/// Every loglikelihood inside the spread SPR's candidate order alone gives
-/// (`docs/PERFORMANCE.md`, "How much one real-data run says"). The 10k
-/// recovery is the lower of the two basins that section records for 10k, where
-/// random orders also land at 0.40; one run, so a coin flip rather than a
-/// measured cost.
 const DEFAULT_RECHECK: bool = true;
 
 /// Default for [`SprApprox::revisit_radius`].
-///
-/// Measured 2026-09-24, steps 5 to 8 from the same step-4 tree, scored against
-/// the generating tree. Synthetic: balanced, random-branch and unbalanced
-/// shapes at noise 0.4, 1.0 and 1.6, 4,096 cells by 1,000 features. At radius
-/// five the loglikelihood stayed within 1 nat of the full search on all nine and
-/// Robinson-Foulds within 8 splits of 2,000 to 2,400 at noise 1.6, and step 5
-/// ran 1.4 to 2.7 times faster. Sanity-preprocessed, 512 to 10,000 cells:
-///
-/// | cells | radius | steps 5-8 | loglik | Robinson-Foulds |
-/// |---|---|---|---|---|
-/// | 5,000 | 0 | 132.7 s | -5,557,974.99 | 1,293 |
-/// | 5,000 | 5 | 84.8 s | -5,557,978.08 | 1,288 |
-/// | 10,000 | 0 | 461.0 s | -11,253,188.26 | 2,632 |
-/// | 10,000 | 3 | 406.2 s | -11,253,459.03 | 2,644 |
-/// | 10,000 | 5 | 257.8 s | -11,252,720.99 | 2,624 |
-///
-/// Both 512-cell panels come back identical at radius three and five. Three
-/// is too tight at 10,000: step 5 stops early and step 6 inherits the work,
-/// 106 s to 273 s. Five is the smallest radius that held on every dataset.
-/// Timings were taken at a load average of 7 to 16.
 const DEFAULT_REVISIT_RADIUS: usize = 5;
+
+/// Scale of the fixed-point loglikelihood totals SPR accepts on, `2^64`.
+///
+/// A candidate used to be scored by an `f64` sum over its arena, whose bits
+/// depend on the order the arena lists the nodes in, and a splice renumbers
+/// that order globally. Truncating every term onto a grid of `2^-64` nats and
+/// summing integers makes the total a function of the terms alone, so a move
+/// can be scored as the current total minus the terms it removes plus the
+/// terms it forms. The grid is `5e-20` nats, far below the `f64` rounding of
+/// any term, and an `i128` holds totals up to `9e18` nats.
+const FIXED_SCALE: f64 = 18_446_744_073_709_551_616.0;
+
+////////////////
+// PruneOrder //
+////////////////
 
 /// Which subtree the sweep considers next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,16 +215,14 @@ pub enum PruneOrder {
     /// The paper's default, and the reasoning in SPEC.md section 9.3 is
     /// sound: a long upstream branch means the subtree sits far from its
     /// parent, so it is the one the current topology is least sure of.
-    ///
-    /// **It holds up, mildly.** Measured against a random order: both reach a
-    /// Robinson-Foulds distance of zero from the generating tree on every
-    /// fixture, so the ordering does not decide whether the search arrives. What
-    /// it decides is how cheaply and how high, and the margin grows with the
-    /// tree while being lost in the noise on a small one.
     LongestBranch,
     /// A uniform shuffle of the eligible subtrees, from [`SprParams::seed`].
     Random,
 }
+
+///////////////
+// SprApprox //
+///////////////
 
 /// Knobs of the approximate search, each an approximation that changes the
 /// answer and carries its measurement on its default.
@@ -353,6 +317,10 @@ impl SprSearch {
     }
 }
 
+///////////////
+// SprParams //
+///////////////
+
 /// Tuning knobs for search step 5.
 #[derive(Clone, Copy, Debug)]
 pub struct SprParams {
@@ -432,17 +400,6 @@ fn acceptance_floor(params: &SprParams, best: f64) -> f64 {
         .max(params.min_relative_gain * best.abs().max(LOGLIK_SCALE_FLOOR))
 }
 
-/// Scale of the fixed-point loglikelihood totals SPR accepts on, `2^64`.
-///
-/// A candidate used to be scored by an `f64` sum over its arena, whose bits
-/// depend on the order the arena lists the nodes in, and a splice renumbers
-/// that order globally. Truncating every term onto a grid of `2^-64` nats and
-/// summing integers makes the total a function of the terms alone, so a move
-/// can be scored as the current total minus the terms it removes plus the
-/// terms it forms. The grid is `5e-20` nats, far below the `f64` rounding of
-/// any term, and an `i128` holds totals up to `9e18` nats.
-const FIXED_SCALE: f64 = 18_446_744_073_709_551_616.0;
-
 /// One loglikelihood term on the [`FIXED_SCALE`] grid.
 ///
 /// ### Params
@@ -500,9 +457,9 @@ pub struct SprResult {
     pub rounds: usize,
 }
 
-///////////////////////
-// Arena rebuilding  //
-///////////////////////
+//////////////////////
+// Arena rebuilding //
+//////////////////////
 
 /// Renumber a parent array into the arena invariant and build the tree.
 ///
@@ -629,25 +586,6 @@ pub(crate) fn assemble(
 // Pruning //
 /////////////
 
-/// Whether a node may be pruned.
-///
-/// ### Params
-///
-/// * `tree` - The tree
-/// * `x` - Node that would be detached, together with everything below it
-///
-/// ### Returns
-///
-/// False for the root, which the arena needs, and for a child of a root that
-/// has only two children, which would leave the root with one child and no
-/// suppression that could fix it. True otherwise, leaves included.
-fn can_prune(tree: &Tree, x: u32) -> bool {
-    match tree.parent(x) {
-        None => false,
-        Some(par) => tree.parent(par).is_some() || tree.children(par).len() > 2,
-    }
-}
-
 /// A detached subtree and the tree left behind.
 ///
 /// The remaining tree is a real arena with its own leaf numbering, because
@@ -672,6 +610,25 @@ struct Pruned {
     /// Root of the remaining tree in the original index space, which the
     /// suppression of a degree-two root moves.
     root: u32,
+}
+
+/// Whether a node may be pruned.
+///
+/// ### Params
+///
+/// * `tree` - The tree
+/// * `x` - Node that would be detached, together with everything below it
+///
+/// ### Returns
+///
+/// False for the root, which the arena needs, and for a child of a root that
+/// has only two children, which would leave the root with one child and no
+/// suppression that could fix it. True otherwise, leaves included.
+fn can_prune(tree: &Tree, x: u32) -> bool {
+    match tree.parent(x) {
+        None => false,
+        Some(par) => tree.parent(par).is_some() || tree.children(par).len() > 2,
+    }
 }
 
 /// Detach `x` and everything below it, suppressing the degree-two node that
@@ -1060,37 +1017,6 @@ pub(crate) type Row<T> = (Box<[T]>, Box<[T]>);
 /// 127 and 18 of 511), and the resolution that follows reads a handful of rows
 /// at one node. So the rows are computed on demand and remembered, and the ones
 /// nobody asks for are never formed.
-///
-/// ### Why on-demand is the same arithmetic and not an approximation of it
-///
-/// **Down rows.** Cutting a subtree out and hanging it back somewhere else
-/// leaves most subtrees alone, and a node whose subtree did not change keeps
-/// the down row it had bit for bit, because [`NodeState::prune`] would walk the
-/// same children in the same order with the same branch lengths and the kernels
-/// are deterministic. `inherited` marks those and points them at the rows of
-/// the tree the move started from; the rest are the ancestors of the cut and of
-/// the attachment, `O(depth)` of them, and are recomputed here bottom-up
-/// through the same kernels [`NodeState::prune`] dispatches to.
-///
-/// The test deciding which is which compares the children one for one and in
-/// order, so a node the arena renumbered into a different child order fails it
-/// and is recomputed. That is the conservative direction, and it is what makes
-/// this safe on the regrafted tree, whose attachment raises its ancestors'
-/// heights and so can reorder them among their siblings.
-///
-/// **Up rows.** [`crate::model::global::UpState::sweep`] writes a node's
-/// children from the node's own up row, working down from the root, so the up
-/// row at one node depends only on the chain of nodes above it. Filling that
-/// chain and nothing else gives the same numbers as sweeping the whole arena,
-/// which is why this is a different traversal of the same recursion rather
-/// than a different recursion.
-/// The chain is filled from the top down and not by recursing, so a ladder does
-/// not put its depth on the stack.
-///
-/// `test_the_lazy_rows_match_a_full_settle` pins every row of both against a
-/// full [`NodeState::prune`], a full [`crate::model::global::UpState::sweep`]
-/// and a collapse of every node, bit for bit, at every node of both trees a
-/// proposal builds. That is the gate this is allowed through on.
 pub(crate) struct LazyRows<'a, T> {
     /// The tree the rows describe.
     tree: &'a Tree,
@@ -1253,8 +1179,9 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     /// the row was inherited and off the recomputed row where it was not.
     /// Summed in fixed point, so the total does not depend on the order the
     /// arena happens to put the nodes in; [`crate::search::masked::score_move`]
-    /// relies on that to reach the same total from the changed terms alone. It agrees with `prune`'s `f64` sum to rounding
-    /// and not to the bit; `test_the_incremental_loglik_matches_a_fresh_prune`
+    /// relies on that to reach the same total from the changed terms alone. It
+    /// agrees with `prune`'s `f64` sum to rounding and not to the bit;
+    /// `test_the_incremental_loglik_matches_a_fresh_prune`
     /// pins how close.
     ///
     /// ### Returns
@@ -1394,10 +1321,10 @@ impl<'a, T: BonsaiFloat> LazyRows<'a, T> {
     /// [`NodeState::prune`] leaves in place, and everything outside that
     /// subtree, which the up sweep leaves sitting at the node's *parent* and
     /// which therefore has to be diffused down the branch above the node
-    /// before the two can be combined. The root has no up part at all, so its row is
-    /// its down row untouched, and that is guarded on the root rather than on a
-    /// zero up precision because the root's own branch entry is not part of the
-    /// tree and is allowed to hold anything at all, a NaN included.
+    /// before the two can be combined. The root has no up part at all, so its
+    /// row is its down row untouched, and that is guarded on the root rather
+    /// than on a zero up precision because the root's own branch entry is not
+    /// part of the tree and is allowed to hold anything at all, a NaN included.
     ///
     /// ### Params
     ///
@@ -1639,6 +1566,79 @@ fn read_down<'r, T: BonsaiFloat>(rows: &'r LazyRows<'_, T>, node: u32) -> (&'r [
 // One move //
 //////////////
 
+/// A candidate move, proposed and scored but not yet decided.
+struct Proposal<T> {
+    /// The tree the move produces.
+    tree: Tree,
+    /// Per node of `tree`, the node of the tree the move started from whose
+    /// leaf set it shares, or [`NO_NODE`]; leaves map to themselves.
+    to_old: Vec<u32>,
+    /// The subtree that was pruned, as a node of the tree the move started
+    /// from.
+    pruned: u32,
+    /// Loglikelihood of `tree` as a [`fixed`] total, from
+    /// [`LazyRows::score`]; what acceptance compares.
+    score: i128,
+    /// Where the subtree was attached, as a node of the tree the move started
+    /// from.
+    target: u32,
+    /// Length of the new branch.
+    branch: f64,
+    /// The rows `tree` has that the tree the move started from does not.
+    fresh: Fresh<T>,
+}
+
+/// A scored move the sweep has yet to decide on.
+///
+/// Scored by the views wherever they could, in which case nothing was built
+/// and the tree is assembled only if the move is accepted.
+struct Candidate<T> {
+    /// The subtree to prune, as a node of the tree it was scored on.
+    pruned: u32,
+    /// Where to attach it, same ids; read by the debug cross-check only.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    target: u32,
+    /// Length of the new branch.
+    branch: f64,
+    /// [`fixed`] total of the tree the move produces.
+    score: i128,
+    /// Leaf word of the pruned subtree; with the next two, what
+    /// [`SprApprox::recheck`] re-applies to a tree that has moved since.
+    pruned_word: u64,
+    /// Leaf word of the attachment point.
+    target_word: u64,
+    /// The built move, in the arena's ids, when the built path scored it.
+    built: Option<Proposal<T>>,
+    /// The views the move was scored on, kept for the candidate the sweep
+    /// will accept if it accepts any; [`apply_move`] consumes them.
+    data: Option<Box<MoveData<T>>>,
+}
+
+impl<T> Candidate<T> {
+    /// A candidate from a move the built path scored.
+    ///
+    /// ### Params
+    ///
+    /// * `built` - The proposal
+    /// * `word` - Leaf words of the tree it was proposed on
+    ///
+    /// ### Returns
+    ///
+    /// The candidate, carrying the proposal.
+    fn from_built(built: Proposal<T>, word: &[u64]) -> Self {
+        Self {
+            pruned: built.pruned,
+            target: built.target,
+            branch: built.branch,
+            score: built.score,
+            pruned_word: word[built.pruned as usize],
+            target_word: word[built.target as usize],
+            built: Some(built),
+            data: None,
+        }
+    }
+}
+
 /// Hang a detached subtree back onto the remaining tree below `target`.
 ///
 /// Attaching below an internal node is one more child. Attaching below a leaf
@@ -1729,79 +1729,6 @@ fn regraft_cut(
     Ok((tree, centre, to_old))
 }
 
-/// A candidate move, proposed and scored but not yet decided.
-struct Proposal<T> {
-    /// The tree the move produces.
-    tree: Tree,
-    /// Per node of `tree`, the node of the tree the move started from whose
-    /// leaf set it shares, or [`NO_NODE`]; leaves map to themselves.
-    to_old: Vec<u32>,
-    /// The subtree that was pruned, as a node of the tree the move started
-    /// from.
-    pruned: u32,
-    /// Loglikelihood of `tree` as a [`fixed`] total, from
-    /// [`LazyRows::score`]; what acceptance compares.
-    score: i128,
-    /// Where the subtree was attached, as a node of the tree the move started
-    /// from.
-    target: u32,
-    /// Length of the new branch.
-    branch: f64,
-    /// The rows `tree` has that the tree the move started from does not.
-    fresh: Fresh<T>,
-}
-
-/// A scored move the sweep has yet to decide on.
-///
-/// Scored by the views wherever they could, in which case nothing was built
-/// and the tree is assembled only if the move is accepted.
-struct Candidate<T> {
-    /// The subtree to prune, as a node of the tree it was scored on.
-    pruned: u32,
-    /// Where to attach it, same ids; read by the debug cross-check only.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    target: u32,
-    /// Length of the new branch.
-    branch: f64,
-    /// [`fixed`] total of the tree the move produces.
-    score: i128,
-    /// Leaf word of the pruned subtree; with the next two, what
-    /// [`SprApprox::recheck`] re-applies to a tree that has moved since.
-    pruned_word: u64,
-    /// Leaf word of the attachment point.
-    target_word: u64,
-    /// The built move, in the arena's ids, when the built path scored it.
-    built: Option<Proposal<T>>,
-    /// The views the move was scored on, kept for the candidate the sweep
-    /// will accept if it accepts any; [`apply_move`] consumes them.
-    data: Option<Box<MoveData<T>>>,
-}
-
-impl<T> Candidate<T> {
-    /// A candidate from a move the built path scored.
-    ///
-    /// ### Params
-    ///
-    /// * `built` - The proposal
-    /// * `word` - Leaf words of the tree it was proposed on
-    ///
-    /// ### Returns
-    ///
-    /// The candidate, carrying the proposal.
-    fn from_built(built: Proposal<T>, word: &[u64]) -> Self {
-        Self {
-            pruned: built.pruned,
-            target: built.target,
-            branch: built.branch,
-            score: built.score,
-            pruned_word: word[built.pruned as usize],
-            target_word: word[built.target as usize],
-            built: Some(built),
-            data: None,
-        }
-    }
-}
-
 /// Index a tree's [`leaf_words`] by word.
 ///
 /// ### Params
@@ -1834,13 +1761,13 @@ fn word_index(word: &[u64]) -> FxHashMap<u64, u32> {
 /// arena or a row of the tree it starts from, which is what
 /// [`crate::search::spr::LazyRows`] is for: the subtree is summarised by its
 /// own down row, which pruning does not touch, and the two trees the move
-/// builds are settled only at the nodes their own rows are asked for. The attachment
-/// is followed by the polytomy resolution SPEC.md section 7.3 asks for, at the
-/// attachment point and nowhere else: pruning only ever lowers a node's degree
-/// and the ancestors a resolution creates are binary, so the attachment point
-/// is the only node whose degree the move raised. That resolution reads six
-/// rows and used to be handed them by settling the whole attached tree; see
-/// [`lazy_centre_star`] for where they come from instead.
+/// builds are settled only at the nodes their own rows are asked for. The
+/// attachment is followed by the polytomy resolution SPEC.md section 7.3 asks
+/// for, at the attachment point and nowhere else: pruning only ever lowers a
+/// node's degree and the ancestors a resolution creates are binary, so the
+/// attachment point is the only node whose degree the move raised. That
+/// resolution reads six rows and used to be handed them by settling the whole
+/// attached tree; see [`lazy_centre_star`] for where they come from instead.
 ///
 /// ### Params
 ///
@@ -1905,27 +1832,11 @@ fn propose<T: BonsaiFloat>(
         placed_branch,
         tree.n_leaves(),
     )?;
-    // A placement carried over from an earlier tree (`SprApprox::recheck`)
-    // can name a node this cut removes: the pruned subtree's parent, now of
-    // degree two, or a root the cut replaced. The subtree then hangs off
-    // nothing and drops out of the arena, so the move does not apply here.
+
     if centre == NO_NODE || attached.n_leaves() != tree.n_leaves() {
         return Ok(None);
     }
 
-    // Settling the attached tree was the single most expensive thing a proposal
-    // did, and the only thing it fed was this resolution. Neither is needed:
-    // whether there is a resolution to do is a question about the centre's
-    // degree, which the arena answers on its own, and the handful of rows it
-    // reads if there is are the ones the regraft left alone plus the centre's
-    // own ancestors.
-    //
-    // Most proposals put the subtree back where it came from and change no
-    // split, and they are known to before the candidate is spliced: the
-    // resolution only adds one split per ancestor it creates, so the
-    // candidate's fingerprint is the attached tree's plus those. Measured at
-    // 10k cells, 76 per cent of proposals end here, and splicing each of them
-    // was an arena rebuild and a relabel for nothing.
     let members = attached.children(centre).len() + usize::from(attached.parent(centre).is_some());
     let attached_word = leaf_words(&attached);
     let attached_below = leaves_below(&attached);

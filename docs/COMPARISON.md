@@ -93,7 +93,7 @@ recovery are what it's for.
 ## Counts to tree
 
 Raw UMIs to finished tree on **one node**: ten-core M1 Max, 64 GB, each run
-alone. The Rust route is 0.2.0, 2026-09-29; the original route is from
+alone. The Rust route is 0.2.2 with `sanity-sc-rs` 0.3.0, 2026-09-30; the original route is from
 2026-09-25. The published implementation can run MPI across nodes; nothing here
 speaks to a cluster.
 
@@ -109,36 +109,36 @@ Sanity, seconds:
 
 | cells | original | Rust, CPU | Rust, GPU |
 |---|---|---|---|
-| 512 | 71.9 | 31.0 | 0.5 |
-| 512 s32 | 72.1 | 30.6 | 0.4 |
-| 5,000 | 766.9 | 286.0 | 3.6 |
-| 10,000 | 1,604.7 | 560.2 | 6.8 |
+| 512 | 71.9 | 4.6 | 0.7 |
+| 512 s32 | 72.1 | 4.4 | 0.5 |
+| 5,000 | 766.9 | 28.1 | 2.0 |
+| 10,000 | 1,604.7 | 56.4 | 3.5 |
 
 Bonsai, seconds:
 
 | cells | published, 1 core | published, 10 ranks | Rust, exact search | Rust, approximate search |
 |---|---|---|---|---|
-| 512 | 371.7 | 170.2 | 4.4 | 2.1 |
-| 512 s32 | 371.0 | | 4.9 | 2.4 |
-| 5,000 | 4,868 | 3,208.6 | 86.7 | 29.5 |
-| 10,000 | 16,062 | 9,439.3 | 417.2 | 71.8 |
+| 512 | 371.7 | 170.2 | 4.2 | 1.9 |
+| 512 s32 | 371.0 | | 4.5 | 2.2 |
+| 5,000 | 4,868 | 3,208.6 | 100.7 | 29.7 |
+| 10,000 | 16,062 | 9,439.3 | 469.9 | 73.2 |
 
 Exact is SPR and NNI as the paper specifies them; approximate is the default
 (see the README). Rust search times are on CPU-Sanity input. On GPU-Sanity
-input, exact took 82.2 s and 406.7 s at 5,000 and 10,000, approximate 28.8 s
-and 75.5 s. Published single-core times at 5,000 and 10,000 are the harness's,
+input, exact took 100.2 s and 438.4 s at 5,000 and 10,000, approximate 27.9 s
+and 71.0 s. Published single-core times at 5,000 and 10,000 are the harness's,
 reproduced within half a per cent on 2026-09-14; the rest are reruns. The
 original route also spends 2.0, 0.8, 29.7 and 66.5 s on gene selection, and the
-Rust route 0.1 to 2.0 s on the S5 conversion, both included below.
+Rust route 0.1 to 1.7 s on the S5 conversion, both included below.
 
 End to end, seconds:
 
 | cells | original, 1 core | original, 10 ranks | Rust CPU + exact | Rust GPU + approximate | speed-up over the original on 1 core / 10 ranks |
 |---|---|---|---|---|---|
-| 512 | 445.6 | 244.1 | 35.5 | 2.7 | 166x / 91x |
-| 512 s32 | 443.9 | | 35.5 | 2.7 | 162x / |
-| 5,000 | 5,664.2 | 4,005.2 | 373.9 | 33.4 | 170x / 120x |
-| 10,000 | 17,733.2 | 11,110.5 | 979.5 | 83.9 | 211x / 132x |
+| 512 | 445.6 | 244.1 | 8.8 | 2.7 | 164x / 90x |
+| 512 s32 | 443.9 | | 8.9 | 2.9 | 156x / |
+| 5,000 | 5,664.2 | 4,005.2 | 129.6 | 31.0 | 183x / 129x |
+| 10,000 | 17,733.2 | 11,110.5 | 527.9 | 76.2 | 233x / 146x |
 
 Quality against the generating tree. Recovery here uses all 17,499 genes' true
 positions, not the selected genes of the headline table:
@@ -146,9 +146,9 @@ positions, not the selected genes of the headline table:
 | cells | original, 1 core | original, 10 ranks | Rust CPU + exact | Rust GPU + approximate |
 |---|---|---|---|---|
 | 512 | RF 146, 0.492 | RF 141, 0.496 | RF 137, 0.632 | RF 138, 0.631 |
-| 512 s32 | RF 240, 0.165 | | RF 241, 0.233 | RF 243, 0.222 |
-| 5,000 | RF 1,937, 0.352 | RF 2,016, 0.261 | RF 1,278, 0.573 | RF 1,292, 0.449 |
-| 10,000 | RF 5,149, 0.162 | RF 5,151, 0.226 | RF 2,636, 0.353 | RF 2,669, 0.265 |
+| 512 s32 | RF 240, 0.165 | | RF 241, 0.233 | RF 225, 0.232 |
+| 5,000 | RF 1,937, 0.352 | RF 2,016, 0.261 | RF 1,278, 0.570 | RF 1,285, 0.571 |
+| 10,000 | RF 5,149, 0.162 | RF 5,151, 0.226 | RF 2,634, 0.354 | RF 2,624, 0.392 |
 
 Published memory, peak RSS summed over processes: 543 MB, 2,965 MB, 5,686 MB at
 512, 5,000, 10,000 on one core; 3,009 MB, 10,033 MB, 18,737 MB with 10 ranks.
@@ -158,10 +158,10 @@ against 1,937 at 5,000, 5,151 against 5,149 at 10,000.
 
 Two cautions. Differences between the Rust Sanity paths and search modes sit
 inside the run-to-run spread ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)).
-GPU input with approximate search is lowest at 5,000 and 10,000, 0.449 and
-0.265, but the same GPU input with exact search gives 0.570 and 0.384, and CPU
-input with approximate search 0.571 and 0.354. That's a basin, not the GPU
-making worse trees. The gaps to the published trees, over 600 splits from 5,000
+Across the four Sanity and search pairings recovery spans 0.401 to 0.571 at
+5,000 and 0.354 to 0.392 at 10,000, and the lowest is GPU input with exact
+search at 5,000 but CPU input with exact search at 10,000. That's a basin, not
+one Sanity path making worse trees. The gaps to the published trees, over 600 splits from 5,000
 up, are far outside it.
 
 Same trees drawn as in [What the trees look like](#what-the-trees-look-like):
@@ -171,9 +171,9 @@ pairs for every tree.
 | cells | GPU + approximate | CPU + exact | reference, 1 core | reference, 10 ranks |
 |---|---|---|---|---|
 | 512 | 13, 0.744 | 13, 0.745 | 15, 0.638 | 14, 0.643 |
-| 512 s32 | 18, 0.364 | 17, 0.374 | 19, 0.311 | |
-| 5,000 | 23, 0.591 | 24, 0.674 | 29, 0.500 | 36, 0.402 |
-| 10,000 | 25, 0.360 | 24, 0.444 | 40, 0.258 | 58, 0.323 |
+| 512 s32 | 17, 0.372 | 17, 0.374 | 19, 0.311 | |
+| 5,000 | 21, 0.673 | 23, 0.672 | 29, 0.500 | 36, 0.402 |
+| 10,000 | 23, 0.478 | 23, 0.444 | 40, 0.258 | 58, 0.323 |
 
 ![radial layouts at 10,000 cells, counts to tree](figures/n10000_e2e_tree_layout.png)
 

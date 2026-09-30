@@ -24,7 +24,7 @@ bonsai-rs = { path = "..", features = ["sanity"] }
 cubecl = { version = "0.10.0", features = ["wgpu"], optional = true }
 numpy = "0.29"
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
-sanity-sc-rs = "0.2.1"
+sanity-sc-rs = "0.3.0"
 
 [profile.release]
 lto = "thin"

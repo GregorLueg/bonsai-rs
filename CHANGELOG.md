@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2
+
+**Features**
+
+- Version bump of `sanity-sc-rs` to `"0.3.0"` with substantially improved
+  speeds.
+
 ## 0.2.1
 
 **Features**

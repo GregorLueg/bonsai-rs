@@ -52,6 +52,7 @@ TREE_SETS: dict[str, list[tuple[str, str]]] = {
     "e2e": [
         ("bonsai-rs, GPU Sanity + approximate", "ours_e2e_gpu_approx.nwk"),
         ("bonsai-rs, CPU Sanity + exact", "ours_e2e_cpu_exact.nwk"),
+        ("reference, backbone 2,048", "theirs_backbone_n2048_g10.nwk"),
         ("reference, 1 core", "theirs.nwk"),
         ("reference, 10 MPI ranks", "theirs_mpi10.nwk"),
     ],

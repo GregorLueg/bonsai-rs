@@ -93,17 +93,27 @@ recovery are what it's for.
 ## Counts to tree
 
 Raw UMIs to finished tree on **one node**: ten-core M1 Max, 64 GB, each run
-alone. The Rust route is 0.2.2 with `sanity-sc-rs` 0.3.0, 2026-09-30; the original route is from
-2026-09-25. The published implementation can run MPI across nodes; nothing here
-speaks to a cluster.
+alone. The Rust route is 0.2.2 with `sanity-sc-rs` 0.3.0, 2026-09-30; the
+original route is from 2026-09-25, its backbone runs from 2026-09-26. The
+published implementation can run MPI across nodes; nothing here speaks to a
+cluster.
 
 Data: the harness's simulated Baron counts, 17,499 genes. Original route: the
 Sanity binary (10 threads, `-v_m MAP`), the harness's selection at `S >= 1`,
-then published Bonsai on one core and under MPI with 10 ranks. Rust route,
-driven through the Python bindings: genes with no counts dropped (the Sanity
-binary drops them itself), `sanity-sc-rs` on CPU or GPU in `f32`, the S5
-conversion, `bonsai()` at defaults (also `S >= 1`). Rust Sanity's default
-`marginalise` variance rule does more work per gene than `MAP`.
+then published Bonsai. Rust route, driven through the Python bindings: genes
+with no counts dropped (the Sanity binary drops them itself), `sanity-sc-rs` on
+CPU or GPU in `f32`, the S5 conversion, `bonsai()` at defaults (also `S >= 1`).
+Rust Sanity's default `marginalise` variance rule does more work per gene than
+`MAP`.
+
+Each search is paired with its counterpart. **Exact** is SPR and NNI as the
+paper specifies them: ours against the published standard run, on one core and
+under MPI with 10 ranks. **Approximate** is our default (see the README) against
+the published backbone mode, its fastest, with `n_initial_cells` 2,048 and
+`growth_factor_guide` 10, one process. Its default of 10,000 initial cells
+needs more cells than these sets have, so it's untested at the setting it
+ships with. At 512 the backbone (128 initial cells) took 758 s, twice its
+standard run, so it has no row there. Whether it combines with MPI wasn't run.
 
 Sanity, seconds:
 
@@ -116,64 +126,77 @@ Sanity, seconds:
 
 Bonsai, seconds:
 
-| cells | published, 1 core | published, 10 ranks | Rust, exact search | Rust, approximate search |
-|---|---|---|---|---|
-| 512 | 371.7 | 170.2 | 4.2 | 1.9 |
-| 512 s32 | 371.0 | | 4.5 | 2.2 |
-| 5,000 | 4,868 | 3,208.6 | 100.7 | 29.7 |
-| 10,000 | 16,062 | 9,439.3 | 469.9 | 73.2 |
-
-Exact is SPR and NNI as the paper specifies them; approximate is the default
-(see the README). Rust search times are on CPU-Sanity input. On GPU-Sanity
-input, exact took 100.2 s and 438.4 s at 5,000 and 10,000, approximate 27.9 s
-and 71.0 s. Published single-core times at 5,000 and 10,000 are the harness's,
-reproduced within half a per cent on 2026-09-14; the rest are reruns. The
-original route also spends 2.0, 0.8, 29.7 and 66.5 s on gene selection, and the
-Rust route 0.1 to 1.7 s on the S5 conversion, both included below.
-
-End to end, seconds:
-
-| cells | original, 1 core | original, 10 ranks | Rust CPU + exact | Rust GPU + approximate | speed-up over the original on 1 core / 10 ranks |
+| cells | published, 1 core | published, 10 ranks | Rust, exact | published, backbone | Rust, approximate |
 |---|---|---|---|---|---|
-| 512 | 445.6 | 244.1 | 8.8 | 2.7 | 164x / 90x |
-| 512 s32 | 443.9 | | 8.9 | 2.9 | 156x / |
-| 5,000 | 5,664.2 | 4,005.2 | 129.6 | 31.0 | 183x / 129x |
-| 10,000 | 17,733.2 | 11,110.5 | 527.9 | 76.2 | 233x / 146x |
+| 512 | 371.7 | 170.2 | 4.2 | | 1.9 |
+| 512 s32 | 371.0 | | 4.5 | | 2.2 |
+| 5,000 | 4,868 | 3,208.6 | 100.7 | 2,514.0 | 29.7 |
+| 10,000 | 16,062 | 9,439.3 | 469.9 | 3,528.7 | 73.2 |
+
+Rust search times are on CPU-Sanity input. On GPU-Sanity input, exact took
+100.2 s and 438.4 s at 5,000 and 10,000, approximate 27.9 s and 71.0 s.
+Published single-core times at 5,000 and 10,000 are the harness's, reproduced
+within half a per cent on 2026-09-14; the rest are reruns. The backbone with
+1,000 initial cells took 1,794.3 s and 3,594.3 s, with worse trees at both
+sizes (RF 1,959 and 4,191). The original route also spends 2.0, 0.8, 29.7 and
+66.5 s on gene selection, and the Rust route 0.1 to 1.7 s on the S5
+conversion, both included below.
+
+End to end, exact, seconds:
+
+| cells | original, 1 core | original, 10 ranks | Rust CPU + exact | speed-up on 1 core / 10 ranks |
+|---|---|---|---|---|
+| 512 | 445.6 | 244.1 | 8.8 | 50x / 28x |
+| 512 s32 | 443.9 | | 8.9 | 50x / |
+| 5,000 | 5,664.2 | 4,005.2 | 129.6 | 44x / 31x |
+| 10,000 | 17,733.2 | 11,110.5 | 527.9 | 34x / 21x |
+
+End to end, approximate, seconds:
+
+| cells | original, backbone | Rust CPU + approximate | Rust GPU + approximate | speed-up, CPU / GPU |
+|---|---|---|---|---|
+| 5,000 | 3,310.6 | 58.5 | 31.0 | 57x / 107x |
+| 10,000 | 5,199.9 | 131.2 | 76.2 | 40x / 68x |
+
+The original route is CPU only, so the CPU columns are the like-for-like
+reading; GPU is what a Rust user gets with an adapter.
 
 Quality against the generating tree. Recovery here uses all 17,499 genes' true
 positions, not the selected genes of the headline table:
 
-| cells | original, 1 core | original, 10 ranks | Rust CPU + exact | Rust GPU + approximate |
-|---|---|---|---|---|
-| 512 | RF 146, 0.492 | RF 141, 0.496 | RF 137, 0.632 | RF 138, 0.631 |
-| 512 s32 | RF 240, 0.165 | | RF 241, 0.233 | RF 225, 0.232 |
-| 5,000 | RF 1,937, 0.352 | RF 2,016, 0.261 | RF 1,278, 0.570 | RF 1,285, 0.571 |
-| 10,000 | RF 5,149, 0.162 | RF 5,151, 0.226 | RF 2,634, 0.354 | RF 2,624, 0.392 |
+| cells | original, 1 core | original, 10 ranks | Rust CPU + exact | original, backbone | Rust GPU + approximate |
+|---|---|---|---|---|---|
+| 512 | RF 146, 0.492 | RF 141, 0.496 | RF 137, 0.632 | | RF 138, 0.631 |
+| 512 s32 | RF 240, 0.165 | | RF 241, 0.233 | | RF 225, 0.232 |
+| 5,000 | RF 1,937, 0.352 | RF 2,016, 0.261 | RF 1,278, 0.570 | RF 1,899, 0.456 | RF 1,285, 0.571 |
+| 10,000 | RF 5,149, 0.162 | RF 5,151, 0.226 | RF 2,634, 0.354 | RF 3,946, 0.252 | RF 2,624, 0.392 |
 
 Published memory, peak RSS summed over processes: 543 MB, 2,965 MB, 5,686 MB at
-512, 5,000, 10,000 on one core; 3,009 MB, 10,033 MB, 18,737 MB with 10 ranks.
-That's 5.5, 3.4 and 3.3x the memory for 2.2, 1.5 and 1.7x the speed, one Python
-process per rank. MPI also changes its answer: RF 141 against 146 at 512, 2,016
-against 1,937 at 5,000, 5,151 against 5,149 at 10,000.
+512, 5,000, 10,000 on one core; 3,009 MB, 10,033 MB, 18,737 MB with 10 ranks;
+2,809 MB and 5,418 MB for the backbone at 5,000 and 10,000. MPI costs 5.5, 3.4
+and 3.3x the memory for 2.2, 1.5 and 1.7x the speed, one Python process per
+rank. It also changes the answer: RF 141 against 146 at 512, 2,016 against
+1,937 at 5,000, 5,151 against 5,149 at 10,000. The backbone is the best of the
+published routes at both sizes, and at 10,000 by 1,200 splits.
 
 Two cautions. Differences between the Rust Sanity paths and search modes sit
 inside the run-to-run spread ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)).
 Across the four Sanity and search pairings recovery spans 0.401 to 0.571 at
 5,000 and 0.354 to 0.392 at 10,000, and the lowest is GPU input with exact
 search at 5,000 but CPU input with exact search at 10,000. That's a basin, not
-one Sanity path making worse trees. The gaps to the published trees, over 600 splits from 5,000
-up, are far outside it.
+one Sanity path making worse trees. The gaps to the published trees, over 600
+splits from 5,000 up, the backbone included, are far outside it.
 
 Same trees drawn as in [What the trees look like](#what-the-trees-look-like):
 clade fragments (ideal ten) and recovery on the selected genes, same 20,000
 pairs for every tree.
 
-| cells | GPU + approximate | CPU + exact | reference, 1 core | reference, 10 ranks |
-|---|---|---|---|---|
-| 512 | 13, 0.744 | 13, 0.745 | 15, 0.638 | 14, 0.643 |
-| 512 s32 | 17, 0.372 | 17, 0.374 | 19, 0.311 | |
-| 5,000 | 21, 0.673 | 23, 0.672 | 29, 0.500 | 36, 0.402 |
-| 10,000 | 23, 0.478 | 23, 0.444 | 40, 0.258 | 58, 0.323 |
+| cells | GPU + approximate | CPU + exact | reference, backbone | reference, 1 core | reference, 10 ranks |
+|---|---|---|---|---|---|
+| 512 | 13, 0.744 | 13, 0.745 | | 15, 0.638 | 14, 0.643 |
+| 512 s32 | 17, 0.372 | 17, 0.374 | | 19, 0.311 | |
+| 5,000 | 21, 0.673 | 23, 0.672 | 24, 0.589 | 29, 0.500 | 36, 0.402 |
+| 10,000 | 23, 0.478 | 23, 0.444 | 33, 0.348 | 40, 0.258 | 58, 0.323 |
 
 ![radial layouts at 10,000 cells, counts to tree](figures/n10000_e2e_tree_layout.png)
 

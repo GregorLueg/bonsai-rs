@@ -1,5 +1,12 @@
 # News
 
+## 0.2.2
+
+Vendors `bonsai-rs` 0.2.2 and `sanity-sc-rs` 0.3.0.
+
+- Takes in the massive speed improvements that the new version of Sanity is
+  offering.
+
 ## 0.2.1
 
 Vendors `bonsai-rs` 0.2.1 and `sanity-sc-rs` 0.2.1.

@@ -93,12 +93,11 @@ The `gpu` feature runs Sanity through CubeCL/wgpu; the output goes into
 `from_sanity_output` unchanged:
 
 ```rust
-use cubecl::Runtime;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use cubecl::wgpu::WgpuDevice;
 use bonsai_rs::sanity_sc_rs::gpu::sanity_gpu;
 
-let client = WgpuRuntime::client(&WgpuDevice::default());
-let post = sanity_gpu::<f32, WgpuRuntime>(&counts, &cell_totals, None, &client)?;
+let client = cubecl::Device::from(WgpuDevice::default()).client();
+let post = sanity_gpu::<f32>(&counts, &cell_totals, None, &client)?;
 let lik = from_sanity_output(&post, None)?;
 ```
 

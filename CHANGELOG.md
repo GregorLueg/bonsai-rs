@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+**Breaking**
+
+- cubecl 0.11 through the re-exported `sanity-sc-rs`: `sanity_gpu` and
+  `sanity_gpu_select` lose their runtime generic and take cubecl's `&Client`.
+  Build it with `cubecl::Device::from(WgpuDevice::default()).client()`, then
+  `sanity_gpu::<f32>(&counts, &cell_totals, None, &client)`.
+
+**Dependencies**
+
+- `sanity-sc-rs` 0.4.0, `cubecl` 0.11.0, `ann-search-rs` 0.11.0 (faer 0.24).
+- Above 4,096 cells the linkage start's NN-Descent graph now comes back exact,
+  so trees at that size differ from 0.2.2. At 5,000 cells the difference sits
+  inside the run-to-run spread of the search; see
+  [comparison](docs/COMPARISON.md#counts-to-tree).
+
 ## 0.2.2
 
 **Features**

@@ -20,24 +20,24 @@ both. `512 s32` is the same 512 cells at another seed with a harder gene panel.
 
 | cells | genes | method | seconds | Robinson-Foulds | distance recovery | loglikelihood, as given | loglikelihood, refit |
 |---|---|---|---|---|---|---|---|
-| 512 | 2,382 | bonsai-rs | 2.9 | 136 | 0.652 | -527,187 | -527,187 |
+| 512 | 2,382 | bonsai-rs | 2.4 | 136 | 0.652 | -527,187 | -527,187 |
 | 512 | 2,382 | published | 386 | 146 | 0.633 | -527,255 | -527,248 |
 | 512 | 2,382 | truth | | 0 | 0.733 | | -528,223 |
-| 512 s32 | 2,302 | bonsai-rs | 3.4 | 222 | 0.319 | -513,568 | -513,568 |
+| 512 s32 | 2,302 | bonsai-rs | 2.8 | 222 | 0.319 | -513,568 | -513,568 |
 | 512 s32 | 2,302 | published | 368 | 240 | 0.303 | -513,553 | -513,536 |
 | 512 s32 | 2,302 | truth | | 0 | 0.500 | | -515,853 |
-| 5,000 | 2,701 | bonsai-rs | 32 | 1,287 | 0.666 | -5,557,911 | -5,557,911 |
+| 5,000 | 2,701 | bonsai-rs | 32 | 1,304 | 0.543 | -5,558,390 | -5,558,390 |
 | 5,000 | 2,701 | published | 4,868 | 1,937 | 0.496 | -5,563,770 | -5,561,535 |
 | 5,000 | 2,701 | published, backbone 2,048 | 2,514 | 1,899 | 0.578 | -5,571,002 | -5,565,342 |
 | 5,000 | 2,701 | published, backbone 1,000 | 1,794 | 1,959 | 0.569 | -5,572,684 | -5,566,018 |
 | 5,000 | 2,701 | truth | | 0 | 0.679 | | -5,571,449 |
-| 10,000 | 2,767 | bonsai-rs | 72 | 2,618 | 0.409 | -11,253,736 | -11,253,736 |
+| 10,000 | 2,767 | bonsai-rs | 83 | 2,575 | 0.539 | -11,253,540 | -11,253,540 |
 | 10,000 | 2,767 | published | 16,062 | 5,149 | 0.281 | -11,280,721 | -11,274,900 |
 | 10,000 | 2,767 | published, backbone 2,048 | 3,529 | 3,946 | 0.368 | -11,280,324 | -11,264,651 |
 | 10,000 | 2,767 | published, backbone 1,000 | 3,594 | 4,191 | 0.347 | -11,284,311 | -11,268,274 |
 | 10,000 | 2,767 | truth | | 0 | 0.461 | | -11,282,910 |
 
-bonsai-rs is `BonsaiParams::default()` in 0.2.0, 2026-09-27, ten threads. Published is
+bonsai-rs is `BonsaiParams::default()` in 0.3.0, 2026-10-13, ten threads. Published is
 its standard run on one core; the published backbone is its backbone-based mode
 with `n_initial_cells` 2,048 or 1,000 and `growth_factor_guide` 10, one
 process. Its default of 10,000 initial cells needs more cells than these sets
@@ -69,25 +69,27 @@ recovery are what it's for.
 - **512 is a tie.** 136 splits against 146, recovery 0.652 against 0.633, 61
   nats ahead after the refit. The replicate flips it: 222 against 240 and 0.319
   against 0.303, but 32 nats behind.
-- **From 5,000 bonsai-rs pulls ahead**, and at 10,000 by a lot: 2,618 against
-  5,149 splits, 21,000 nats after the refit, and 220 times faster.
+- **From 5,000 bonsai-rs pulls ahead**, and at 10,000 by a lot: 2,575 against
+  5,149 splits, 21,000 nats after the refit, and 190 times faster.
 - **The refit matters for the published trees.** It recovers 2,200 nats at 5,000
   and 5,800 at 10,000; 15,700 for the 10,000 backbone. The as-given column
-  overstates bonsai-rs's lead by 62 per cent at 5,000 and 28 at 10,000.
+  overstates bonsai-rs's lead by 71 per cent at 5,000 and 27 at 10,000.
 - **The published backbone pays off in the published implementation**: 2 to 4.5
   times faster than its standard run, and at 10,000 better on splits and on the
-  refit loglikelihood. It is still 50 to 80 times slower than bonsai-rs's
-  standard run at 5,000 and 10,000, and behind it on every column.
-- **The two trees differ from each other** by 26, 110, 1,498 and 4,235 splits.
+  refit loglikelihood. It is still 40 to 80 times slower than bonsai-rs's
+  standard run at 5,000 and 10,000, and behind it on every column but one: at
+  5,000 both backbone runs edge recovery, 0.578 and 0.569 against 0.543. That
+  run of ours sits in the poorer of two basins; see the last bullet.
+- **The two trees differ from each other** by 26, 110, 1,463 and 4,288 splits.
   Equal scores against the truth don't mean the same tree.
 - **The published implementation is deterministic.** A 2026-09-14 rerun gave
   byte-identical Newick at all four sizes. Wall times moved under half a per
   cent where the first run had an idle machine, 30 per cent at 512 and 8 at
   10,000 where it hadn't.
-- **Results differ with SPR's subtree order.** At 10,000 cells recovery lands
-  anywhere from 0.36 to 0.49 across orders
+- **Results differ with SPR's subtree order.** Recovery lands anywhere from
+  0.54 to 0.67 at 5,000 cells and 0.36 to 0.54 at 10,000 across orders
   ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)).
-  Some orders pass the truth's 0.461. That's possible because the truth's branch
+  Some orders pass the truth's 0.461, the default among them. That's possible because the truth's branch
   lengths are expected displacements and ours are fitted to what was realised.
 
 ## Counts to tree
@@ -210,8 +212,8 @@ pairs for every tree.
 
 ## What the trees look like
 
-Measured on the 0.2.0 trees of the [headline table](#speed-and-quality),
-2026-09-29.
+Measured on the 0.3.0 trees of the [headline table](#speed-and-quality),
+2026-10-13.
 
 ![radial layouts at 10,000 cells](figures/n10000_tree_layout.png)
 
@@ -227,11 +229,11 @@ neither Robinson-Foulds nor the loglikelihood does.
 |---|---|---|
 | 512 | 15 | 15 |
 | 512 s32 | **16** | 19 |
-| 5,000 | **21** | 29 |
-| 10,000 | **26** | 40 |
+| 5,000 | **23** | 29 |
+| 10,000 | **22** | 40 |
 
 A tie at 512, then bonsai-rs wins, including on the replicate where it's behind
-on the loglikelihood. The gap grows to fourteen fragments at 10,000.
+on the loglikelihood. The gap grows to eighteen fragments at 10,000.
 
 ![distance recovery at 10,000 cells](figures/n10000_distance_recovery.png)
 
@@ -248,8 +250,8 @@ correlation gap is a wider spread everywhere, not a few stray pairs.
 |---|---|---|---|
 | bonsai-rs 512 | 0 | 0 | 2 |
 | bonsai-rs 512 s32 | 9 | 0 | 3 |
-| bonsai-rs 5,000 | 51 | 0 | 18 |
-| bonsai-rs 10,000 | 119 | 0 | 35 |
+| bonsai-rs 5,000 | 48 | 0 | 18 |
+| bonsai-rs 10,000 | 130 | 0 | 37 |
 | published 512 | 0 | 0 | 3 |
 | published 512 s32 | 5 | 0 | 7 |
 | published 5,000 | 40 | 0 | 107 |
@@ -260,18 +262,17 @@ Two different things; don't conflate them.
 **Zero-length leaf edges** are a SPEC 6 boundary optimum: no evidence separating
 the cell from its parent. Intended, and about input noise, not topology. The
 generating tree has none. These cells are noisier: median of each cell's mean
-SD 1.35 against 1.14 at 10,000, and 31 per cent of them in the noisiest decile.
+SD 1.34 against 1.14 at 10,000, and 31 per cent of them in the noisiest decile.
 
 **Zero-length internal edges and polytomies** come from SPR and NNI splices. At
-10,000 there are 72 internal ones after step 5, 57 after step 6 and 31 after
-step 7. Step 8 collapses them, and collapses once more after its closing branch
-solve, which can land an edge on exactly zero again (it did once here). So none
-survive at any size. Leaf edges step 8 leaves alone by design.
+10,000 there are 66 internal ones after step 5 and 58 after step 6. Step 8
+collapses them, and collapses once more after its closing branch solve, which
+can land an edge on exactly zero again. None survive at any size. Leaf edges step 8 leaves alone by design.
 
 So the difference is in the leaf edges and in how much tree sits under a
 multifurcation: 34.9 per cent degenerate leaves at 10,000 for the published
-tree against 3.7, a largest multifurcation of 513 leaves against 187, and 335
-polytomies against 35.
+tree against 3.4, a largest multifurcation of 513 leaves against 71, and 335
+polytomies against 37.
 
 ## Fans and ladders
 
@@ -283,34 +284,35 @@ The reference draws a **fan**: the whole group as siblings off one node. At
 10,000 cells, 335 multifurcations, the largest 513 leaves.
 
 bonsai-rs draws a **ladder**: an order anyway, each cell on its own small,
-non-zero branch. 35 multifurcations, the largest 187.
+non-zero branch. 37 multifurcations, the largest 71.
 
 In a radial layout, radius is the sum of branch lengths above a leaf. A fan adds
-nothing and lands as a blob. A ladder adds up (28 hops, median radius 0.958
+nothing and lands as a blob. A ladder adds up (37 hops, median radius 1.086
 against the tree's typical 0.627) inside one thin angular slice. Long and thin
 is a spike. The reference's picture is tidier because it flattened those cells,
 not because it placed them better.
 
-**The ladder is more faithful, most of all exactly where a fan looks
-defensible.** Pearson correlation of true squared distance with path distance
+**The ladder is more faithful exactly where a fan looks defensible.** Pearson correlation of true squared distance with path distance
 at 10,000 cells (`faithfulness.py` in the harness). The subset rows use every
 pair; the first samples 200,000, which is why it isn't the headline table's
-0.409.
+0.539.
 
 | pairs drawn from | cells | in bonsai-rs's tree | in the reference's tree |
 |---|---|---|---|
-| all cells | 10,000 | 0.412 | 0.278 |
-| the cells bonsai-rs strings into its longest ladder | 250 | 0.850 | 0.811 |
-| the cells the reference fans into its largest multifurcation | 513 | 0.109 | 0.004 |
+| all cells | 10,000 | 0.540 | 0.278 |
+| the cells bonsai-rs strings into its longest ladder | 250 | 0.359 | 0.359 |
+| the cells the reference fans into its largest multifurcation | 513 | 0.141 | 0.004 |
 
 - **A multifurcation isn't declining to answer.** It claims every member is
   equidistant from every other, and carries no distance information: 0.004 is
-  zero. The ladder still gets 0.109 on the same cells.
-- **The ladder's order isn't noise.** 0.850 on the spike's 250 cells, above its
-  own whole-tree 0.412 and the reference's 0.811 there. An arbitrary order would
-  score near zero, like the fan.
-- **So the spike is a feature** for anyone reading distances off the picture.
-  Flattening it would force a fan where the branch solve found positive optima.
+  zero. The ladder still gets 0.141 on the same cells.
+- **The spike itself is no better than the reference.** 0.359 on its 250 cells
+  in both trees, well below bonsai-rs's whole-tree 0.540. On the 0.2.0 tree it
+  was 0.850 against 0.811: that spike was one true clade drawn long, this one
+  mixes clades ([the arm](#the-arm)). Read it as cells the search couldn't
+  place, not as structure.
+- **Flattening it still wouldn't help.** It would force a fan where the branch
+  solve found positive optima, and a fan scores zero.
 
 Limits: path distance saturates at large true distances in both trees, and at
 10,000 cells the generating tree only scores 0.461, so there's little global
@@ -319,20 +321,22 @@ headroom either way.
 ## The arm
 
 The spike, taken as the 2.5 per cent of cells furthest from the root: 250 at
-10,000, 125 at 5,000. Median 28 hops against 17 at 10,000 and 28 against 15 at
-5,000; radius 0.958 against 0.627 and 1.045 against 0.609.
+10,000, 125 at 5,000. Median 37 hops against 17 at 10,000 and 22 against 15 at
+5,000; radius 1.086 against 0.627 and 0.797 against 0.604.
 
-- **At 10,000 it's mostly one true clade**: 231 of its 250 cells sit in one of
-  the generating tree's ten top-level clades. At 5,000 it isn't: it spans all
-  ten, none holding more than 34 of 125. So at 5,000 the spike groups cells the
-  truth doesn't; at 10,000 it's one clade drawn long.
-- **The reference half agrees.** 128 of the 250 sit in one reference clade of
-  393 leaves at 10,000; 77 of 125 in one of 114 at 5,000.
-- **Zero-length leaf edges** gather in it at 5,000 (35 of 51) but not at 10,000
-  (1 of 119). 82 cells have a zero-length leaf edge in both trees at 10,000.
-- **Not the noisiest cells.** Median of each cell's mean SD 1.12 against 1.14 at
-  10,000 and 1.15 against 1.12 at 5,000; 12.8 and 12.0 per cent in the noisiest
-  decile against 9.9.
+- **It isn't one true clade at either size.** Of the generating tree's ten
+  top-level clades it spans seven at 10,000, the largest holding 117 of 250, and
+  nine at 5,000, the largest 44 of 125. So the spike groups cells the truth
+  doesn't. The 0.2.0 tree's spike at 10,000 was different: 231 of 250 in one
+  clade.
+- **The reference half agrees at 10,000.** 139 of the 250 sit in one reference
+  subtree of 212 leaves. At 5,000 it doesn't: the smallest reference subtree
+  holding half the arm has 1,937 leaves.
+- **Zero-length leaf edges** gather in it at 10,000 (45 of 130) but not at 5,000
+  (0 of 48). 82 cells have a zero-length leaf edge in both trees at 10,000.
+- **A little noisier than the rest.** Median of each cell's mean SD 1.19 against
+  1.14 at 10,000 and 1.15 against 1.12 at 5,000; 11.2 and 15.2 per cent in the
+  noisiest decile against 10.0 and 9.9.
 
 ## Honest rendering
 
@@ -344,7 +348,7 @@ glitch, and seven times as many of the published tree's leaves are affected.
 The same goes the other way for the spike. It's ugly and someone will ask to
 collapse it. That would replace measured positive branch lengths with a
 multifurcation, which carries no distance information. Tidying the picture would
-delete the part that's true.
+swap measured branch lengths for a structure that scores zero.
 
 ## Reproducing
 

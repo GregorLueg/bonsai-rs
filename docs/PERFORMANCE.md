@@ -6,33 +6,33 @@ this file started 2026-09-12, so rows dated then were measured on or before it.
 
 ## Now
 
-`BonsaiParams::default()` in 0.2.0 on Sanity-preprocessed Baron, 2026-09-27:
+`BonsaiParams::default()` in 0.3.0 on Sanity-preprocessed Baron, 2026-10-13:
 
 | step | 512 | 5,000 | 10,000 | 25,000 | share at 25,000 |
 |---|---|---|---|---|---|
-| 1-2 linkage | 0.06 s | 1.6 s | 5.9 s | 26.1 s | 13% |
-| 3 polytomy | 0.01 s | 0.05 s | 0.1 s | 0.3 s | 0% |
-| 4 branch | 0.3 s | 2.9 s | 7.3 s | 15.7 s | 8% |
-| 5 SPR | 1.9 s | 20.0 s | 45.8 s | 125.0 s | 60% |
-| 6 NNI | 0.2 s | 2.2 s | 4.7 s | 19.3 s | 9% |
-| 7 branch | 0.3 s | 3.3 s | 5.9 s | 9.6 s | 5% |
-| 8 collapse | 0.02 s | 1.7 s | 2.7 s | 12.2 s | 6% |
-| total | 2.9 s | 31.7 s | 72.4 s | 208.3 s | |
+| 1-2 linkage | 0.03 s | 0.9 s | 3.1 s | 12.0 s | 7% |
+| 3 polytomy | 0.01 s | 0.06 s | 0.1 s | 0.2 s | 0% |
+| 4 branch | 0.3 s | 3.8 s | 9.7 s | 12.9 s | 7% |
+| 5 SPR | 1.6 s | 20.5 s | 54.1 s | 124.7 s | 69% |
+| 6 NNI | 0.2 s | 2.2 s | 4.9 s | 14.2 s | 8% |
+| 7 branch | 0.3 s | 2.7 s | 7.6 s | 9.7 s | 5% |
+| 8 collapse | 0.02 s | 1.7 s | 3.8 s | 8.0 s | 4% |
+| total | 2.4 s | 31.8 s | 83.2 s | 181.8 s | |
 
 0.1.1 took 203 s at 10,000 and 1,029 s at 25,000 on the same data and the same
-day. From 10,000 to 25,000 cells: total `n^1.15`, SPR `n^1.10`, NNI `n^1.54`,
-linkage `n^1.63`, step 8 `n^1.64`. Two points over two gene panels, so a slope,
-not a law. On the synthetic 65,536 by 1,000 set the full search takes 226 s,
-SPR 148 s of it.
+day as 0.2.0. 0.2.0 took 72.4 s and 208.3 s, 2026-09-27; its linkage took 5.9 s
+and 26.1 s, half that now, with the neighbour graph from `ann-search-rs` 0.11. From 10,000 to 25,000 cells: total `n^0.85`, SPR
+`n^0.91`, NNI `n^1.15`, linkage `n^1.49`, step 8 `n^0.83`. Two points over two gene panels, so a slope,
+not a law. On the synthetic 65,536 by 1,000 set the full search takes 215 s,
+SPR 148 s of it (226 s on 0.2.0).
 
-- SPR is still three fifths of the run, but close to linear: it runs on a live
+- SPR is over two thirds of the run at 25,000, but close to linear: it runs on a live
   tree with stable ids and builds nothing to score a move
   ([design](DESIGN.md#search-topology)).
-- The steepest steps are now the linkage, NNI and step 8. NNI's per-move
-  bookkeeping is gone and its full edge scans are the untimed suspect; step 8's
-  polytomy loop still rebuilds the arena per resolution.
-- The branch solves (4, 7 and 8) are under a fifth of the run since the
-  prune and up sweep went level-parallel.
+- The steepest steps are now the linkage and NNI. NNI's per-move bookkeeping is
+  gone and its full edge scans are the untimed suspect.
+- The branch solves (4, 7 and 8) are a sixth of the run at 25,000 and a quarter
+  at 10,000 since the prune and up sweep went level-parallel.
 - SPR's thread utilisation has not been re-measured since the live tree; before
   it, a sampled profile at 25,000 showed about half the thread time idle at the
   chunk barrier.
@@ -71,8 +71,8 @@ Counts to tree end to end is in [comparison](COMPARISON.md).
 12. **Time on an idle machine, alternating against a kept baseline.** On
     2026-09-24 load wandered 2 to 27 and the same step 6 measured 98 s and
     156 s. Quality survives load; timings don't.
-13. **One real-data run is one draw.** Equally valid searches spread 460 nats at
-    5,000 and 1,700 at 10,000; see
+13. **One real-data run is one draw.** Equally valid searches spread about
+    1,000 nats at both 5,000 and 10,000; see
     [How much one real-data run says](#how-much-one-real-data-run-says). Trust an
     approximation that reproduces the exact tree; treat a few hundred nats as
     noise unless it repeats across sizes.
@@ -198,27 +198,28 @@ took step 6 from 69 s to 41 s at 131,072 cells.
 ### How much one real-data run says
 
 Not much. Runs differing only in SPR's subtree order are equally valid and
-spread widely. 0.2.0 defaults, 2026-09-27:
+spread widely. 0.3.0 defaults, 2026-10-13:
 
 | cells | SPR order | loglikelihood | Robinson-Foulds | recovery |
 |---|---|---|---|---|
-| 5,000 | longest branch, the default | -5,557,911 | 1,287 | 0.666 |
-| 5,000 | random, seed 1 | -5,558,197 | 1,267 | 0.582 |
-| 5,000 | random, seed 2 | -5,558,859 | 1,249 | 0.551 |
-| 5,000 | random, seed 3 | -5,558,174 | 1,266 | 0.624 |
-| 10,000 | longest branch, the default | -11,253,736 | 2,618 | 0.409 |
-| 10,000 | random, seed 1 | -11,255,000 | 2,699 | 0.361 |
-| 10,000 | random, seed 2 | -11,254,555 | 2,559 | 0.488 |
-| 10,000 | random, seed 3 | -11,254,226 | 2,622 | 0.385 |
-| 10,000 | random, seed 4 | -11,253,220 | 2,613 | 0.469 |
-| 10,000 | random, seed 5 | -11,253,079 | 2,660 | 0.391 |
-| 10,000 | random, seed 6 | -11,254,244 | 2,623 | 0.376 |
-| 10,000 | random, seed 7 | -11,253,997 | 2,621 | 0.386 |
-| 10,000 | random, seed 8 | -11,253,669 | 2,636 | 0.472 |
+| 5,000 | longest branch, the default | -5,558,390 | 1,304 | 0.543 |
+| 5,000 | random, seed 1 | -5,558,876 | 1,262 | 0.551 |
+| 5,000 | random, seed 2 | -5,558,237 | 1,306 | 0.668 |
+| 5,000 | random, seed 3 | -5,557,890 | 1,313 | 0.670 |
+| 10,000 | longest branch, the default | -11,253,540 | 2,575 | 0.539 |
+| 10,000 | random, seed 1 | -11,253,899 | 2,672 | 0.364 |
+| 10,000 | random, seed 2 | -11,253,881 | 2,626 | 0.386 |
+| 10,000 | random, seed 3 | -11,253,919 | 2,635 | 0.396 |
+| 10,000 | random, seed 4 | -11,254,484 | 2,545 | 0.465 |
+| 10,000 | random, seed 5 | -11,253,978 | 2,687 | 0.380 |
+| 10,000 | random, seed 6 | -11,253,441 | 2,667 | 0.362 |
+| 10,000 | random, seed 7 | -11,254,170 | 2,635 | 0.374 |
+| 10,000 | random, seed 8 | -11,254,096 | 2,621 | 0.381 |
 
-About 950 nats and recovery 0.55 to 0.67 at 5,000; 1,900 nats and 0.36 to 0.49
-at 10,000. The same seeds with `SprApprox::recheck` off stay inside that: 940
-nats and 0.57 to 0.67 at 5,000, 1,700 nats and 0.37 to 0.49 at 10,000. A few
+About 990 nats and recovery 0.54 to 0.67 at 5,000; 1,040 nats and 0.36 to 0.54
+at 10,000. On 0.2.0 the same seeds spread 950 nats and 0.55 to 0.67, and 1,900
+nats and 0.36 to 0.49; with `SprApprox::recheck` off they stayed inside that,
+940 nats and 0.57 to 0.67, 1,700 nats and 0.37 to 0.49. A few
 hundred nats on one run is noise. An approximation is only proven harmless when
 it reproduces the exact result outright, as lazy NNI does. The revisit radius
 does on the 512-cell and low-noise sets; at 5,000 and 10,000 it lands 3 nats
@@ -227,11 +228,12 @@ other way: the loose branch tolerance's 1,281-nat, 0.38-recovery loss at 10,000
 looks like a bad basin, not a measured cost.
 
 **The loglikelihood doesn't pick the better tree.** At 5,000 it roughly does:
-the best loglikelihood has the best recovery, the worst the worst. At 10,000 it
-doesn't: seed 5 has the best loglikelihood and recovery 0.391, seed 2 the
-second worst and 0.488. Best-of-several by loglikelihood is cheap but buys
-likelihood, not recovery. The specified longest-branch order isn't dominated:
-best loglikelihood of the four at 5,000, fourth of nine at 10,000.
+the best loglikelihood has the best recovery, the worst nearly the worst. At
+10,000 it doesn't: seed 6 has the best loglikelihood and the worst recovery,
+0.362; seed 4 the worst loglikelihood and the second best, 0.465. Best-of-several
+by loglikelihood is cheap but buys likelihood, not recovery. The specified
+longest-branch order isn't dominated: third loglikelihood of the four at 5,000,
+second of nine at 10,000.
 
 ### Splice pairs through the regrafted subtree
 

@@ -93,7 +93,7 @@ recovery are what it's for.
 ## Counts to tree
 
 Raw UMIs to finished tree on **one node**: ten-core M1 Max, 64 GB, each run
-alone. The Rust route is 0.2.2 with `sanity-sc-rs` 0.4.0 and `ann-search-rs`
+alone. The Rust route is 0.3.0 with `sanity-sc-rs` 0.4.0 and `ann-search-rs`
 0.11.0, 2026-10-13; the
 original route is from 2026-09-25, its backbone runs from 2026-09-26. The
 published implementation can run MPI across nodes; nothing here speaks to a

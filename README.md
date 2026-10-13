@@ -65,7 +65,7 @@ and adds `ingest::from_sanity_output`: transpose to `[cell][gene]`, undo the
 prior shrinkage (S5), drop and report ill-conditioned genes.
 
 ```toml
-bonsai-rs = { version = "0.2", features = ["sanity"] }
+bonsai-rs = { version = "0.3", features = ["sanity"] }
 ```
 
 Name Sanity through the re-export, `bonsai_rs::sanity_sc_rs`, so its types are

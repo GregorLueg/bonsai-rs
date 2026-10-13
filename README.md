@@ -65,7 +65,7 @@ and adds `ingest::from_sanity_output`: transpose to `[cell][gene]`, undo the
 prior shrinkage (S5), drop and report ill-conditioned genes.
 
 ```toml
-bonsai-rs = { version = "0.2", features = ["sanity"] }
+bonsai-rs = { version = "0.3", features = ["sanity"] }
 ```
 
 Name Sanity through the re-export, `bonsai_rs::sanity_sc_rs`, so its types are
@@ -93,12 +93,11 @@ The `gpu` feature runs Sanity through CubeCL/wgpu; the output goes into
 `from_sanity_output` unchanged:
 
 ```rust
-use cubecl::Runtime;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use cubecl::wgpu::WgpuDevice;
 use bonsai_rs::sanity_sc_rs::gpu::sanity_gpu;
 
-let client = WgpuRuntime::client(&WgpuDevice::default());
-let post = sanity_gpu::<f32, WgpuRuntime>(&counts, &cell_totals, None, &client)?;
+let client = cubecl::Device::from(WgpuDevice::default()).client();
+let post = sanity_gpu::<f32>(&counts, &cell_totals, None, &client)?;
 let lik = from_sanity_output(&post, None)?;
 ```
 
@@ -122,7 +121,7 @@ let post = sanity_select::<f32, _>(&counts, &cell_totals, None, |g| {
 across genes but the cell totals, so the counts can also be fed in chunks of
 genes and the survivors concatenated: the same result, with memory bounded by a
 chunk. On 10,000 cells with all 16,974 genes as candidates that kept 2,751, in
-8 s on an M1 Max GPU against 570 s on its ten CPU cores.
+2.7 s on an M1 Max GPU against 55 s on its ten CPU cores (2026-10-13).
 
 It reads Sanity's log fold changes, not the log transcription quotients: S5
 inverts a zero-mean prior. On 64 simulated cells by 300 genes, fold changes give
@@ -156,22 +155,25 @@ same input, same scorer:
 
 | cells | genes | | seconds | Robinson-Foulds | distance recovery |
 |---|---|---|---|---|---|
-| 512 | 2,382 | bonsai-rs | 2.9 | 136 | 0.652 |
+| 512 | 2,382 | bonsai-rs | 2.4 | 136 | 0.652 |
 | 512 | 2,382 | published | 386 | 146 | 0.633 |
-| 5,000 | 2,701 | bonsai-rs | 32 | 1,287 | 0.666 |
+| 5,000 | 2,701 | bonsai-rs | 32 | 1,304 | 0.543 |
 | 5,000 | 2,701 | published | 4,868 | 1,937 | 0.496 |
 | 5,000 | 2,701 | published, backbone 2,048 | 2,514 | 1,899 | 0.578 |
 | 5,000 | 2,701 | published, backbone 1,000 | 1,794 | 1,959 | 0.569 |
-| 10,000 | 2,767 | bonsai-rs | 72 | 2,618 | 0.409 |
+| 10,000 | 2,767 | bonsai-rs | 83 | 2,575 | 0.539 |
 | 10,000 | 2,767 | published | 16,062 | 5,149 | 0.281 |
 | 10,000 | 2,767 | published, backbone 2,048 | 3,529 | 3,946 | 0.368 |
 | 10,000 | 2,767 | published, backbone 1,000 | 3,594 | 4,191 | 0.347 |
 
 The published backbone mode is its fast route for large data: built on a
-subset of 2,048 or 1,000 cells, the rest placed onto it. bonsai-rs is 50 to 80
-times faster than that at 5,000 and 10,000 cells, 150 and 220 times faster than
-the published standard run, and closer to the truth on both metrics. At 512
-it's a tie. Results differ with the order SPR visits subtrees in. Timings aren't like for like (ten threads against one process);
+subset of 2,048 or 1,000 cells, the rest placed onto it. bonsai-rs is 40 to 80
+times faster than that at 5,000 and 10,000 cells, 150 and 190 times faster than
+the published standard run, and 600 to 2,600 splits closer to the true tree.
+Distance recovery is ahead at 10,000. At 5,000 this run landed in the poorer of
+two basins and the backbone edges it, 0.578 against 0.543. At 512 it's a tie.
+Results differ with the order SPR visits subtrees in. Timings aren't like for
+like (ten threads against one process). bonsai-rs rows are 0.3.0, 2026-10-13;
 [comparison](docs/COMPARISON.md) has the caveats and the loglikelihoods.
 
 ### Exact or approximate search
@@ -186,13 +188,13 @@ every edge. The default skips that:
 - **NNI** caches each edge's gain and rescores only near the last move. Same
   finished tree as exact on all thirteen datasets measured.
 
-Full search on the headline data above, 2026-09-27:
+Full search on the headline data above, 0.3.0, 2026-10-13:
 
 | cells | exact | approximate | loglikelihood, exact / approximate | Robinson-Foulds | recovery |
 |---|---|---|---|---|---|
-| 512 | 4.9 s | 2.9 s | -527,187 / -527,187 | 136 / 136 | 0.656 / 0.652 |
-| 5,000 | 107 s | 32 s | -5,558,395 / -5,557,911 | 1,324 / 1,287 | 0.538 / 0.666 |
-| 10,000 | 533 s | 72 s | -11,252,144 / -11,253,736 | 2,622 / 2,618 | 0.480 / 0.409 |
+| 512 | 5.4 s | 2.4 s | -527,187 / -527,187 | 136 / 136 | 0.656 / 0.652 |
+| 5,000 | 86 s | 32 s | -5,557,728 / -5,558,390 | 1,306 / 1,304 | 0.670 / 0.543 |
+| 10,000 | 488 s | 83 s | -11,253,411 / -11,253,540 | 2,643 / 2,575 | 0.360 / 0.539 |
 
 One run each. SPR's subtree order alone moves results by more than these gaps
 ([performance](docs/PERFORMANCE.md#how-much-one-real-data-run-says)).

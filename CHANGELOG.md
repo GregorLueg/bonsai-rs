@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0
+
+**Breaking**
+
+- cubecl 0.11 through the re-exported `sanity-sc-rs`: `sanity_gpu` and
+  `sanity_gpu_select` lose their runtime generic and take cubecl's `&Client`.
+  Build it with `cubecl::Device::from(WgpuDevice::default()).client()`, then
+  `sanity_gpu::<f32>(&counts, &cell_totals, None, &client)`.
+
+**Dependencies**
+
+- `sanity-sc-rs` 0.4.0, `cubecl` 0.11.0, `ann-search-rs` 0.11.0 (faer 0.24).
+- Above 4,096 cells the linkage start's NN-Descent graph now comes back exact,
+  so trees at that size differ from 0.2.2. At 5,000 cells the difference sits
+  inside the run-to-run spread of the search; see
+  [comparison](docs/COMPARISON.md#counts-to-tree).
+- The linkage start takes half the time: 5.9 s to 3.1 s at 10,000 cells, 26.1 s
+  to 12.0 s at 25,000. The full search on Sanity-preprocessed Baron went from
+  208 s to 182 s at 25,000, but 72 s to 83 s at 10,000, mostly SPR (46 s to
+  54 s) on a different tree.
+- The new 10,000-cell default tree has better recovery (0.409 to 0.539) and
+  fewer clade fragments (26 to 22), but its long spike now mixes seven true
+  clades and scores no better than the published tree on those cells. At
+  5,000 the default landed in the poorer basin (recovery 0.666 to 0.543).
+  [Comparison](docs/COMPARISON.md) and [performance](docs/PERFORMANCE.md) are
+  rerun on 0.3.0.
+
 ## 0.2.2
 
 **Features**

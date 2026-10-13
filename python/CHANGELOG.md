@@ -1,5 +1,14 @@
 # News
 
+## 0.3.0
+
+Vendors `bonsai-rs` 0.3.0 and `sanity-sc-rs` 0.4.0, on cubecl 0.11.
+
+- No change to the Python API. `gpu=True` goes through cubecl 0.11's client.
+- Above 4,096 cells the starting tree's neighbour graph comes back exact, so
+  trees at that size differ from 0.2.2, inside the search's run-to-run spread;
+  see the core crate's changelog.
+
 ## 0.2.2
 
 Vendors `bonsai-rs` 0.2.2 and `sanity-sc-rs` 0.3.0.

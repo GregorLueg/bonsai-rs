@@ -1516,15 +1516,14 @@ mod sanity_tests {
     #[cfg(feature = "gpu-tests")]
     #[test]
     fn test_counts_through_gpu_sanity_recover_the_tree() {
-        use cubecl::Runtime;
-        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        use cubecl::wgpu::WgpuDevice;
         use sanity_sc_rs::gpu::sanity_gpu;
 
         // The device path is f32 throughout; the tree it hands on has to be as
         // good as the CPU run's, not bit-equal to it.
         let (sim, counts, totals) = simulated_counts();
-        let client = WgpuRuntime::client(&WgpuDevice::default());
-        let out = sanity_gpu::<f64, WgpuRuntime>(&counts, &totals, None, &client).unwrap();
+        let client = cubecl::Device::from(WgpuDevice::default()).client();
+        let out = sanity_gpu::<f64>(&counts, &totals, None, &client).unwrap();
         let (rf, recovery) = score(&sim, &out);
         assert!(rf <= 6);
         assert!(recovery > 0.8);

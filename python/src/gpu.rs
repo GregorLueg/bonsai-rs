@@ -27,13 +27,12 @@ use crate::error::{BErr, BonsaiError};
 /// `true` if a client came back, `false` if the attempt panicked.
 #[cfg(feature = "gpu")]
 fn probe() -> bool {
-    use cubecl::Runtime;
-    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use cubecl::wgpu::WgpuDevice;
 
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let ok = std::panic::catch_unwind(|| {
-        let _ = WgpuRuntime::client(&WgpuDevice::default());
+        let _ = cubecl::Device::from(WgpuDevice::default()).client();
     })
     .is_ok();
     std::panic::set_hook(hook);
@@ -114,11 +113,10 @@ pub(crate) fn run_sanity<T: SanityFloat>(
 ) -> Result<SanityOutput<T>, BErr> {
     #[cfg(feature = "gpu")]
     if gpu {
-        use cubecl::Runtime;
-        use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+        use cubecl::wgpu::WgpuDevice;
 
-        let client = WgpuRuntime::client(&WgpuDevice::default());
-        return Ok(sanity_sc_rs::gpu::sanity_gpu::<T, WgpuRuntime>(
+        let client = cubecl::Device::from(WgpuDevice::default()).client();
+        return Ok(sanity_sc_rs::gpu::sanity_gpu::<T>(
             counts,
             totals,
             Some(sp),

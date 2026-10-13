@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 bonsai-rs = { path = "../..", features = ["sanity"] }
-sanity-sc-rs = "0.1.0"
+sanity-sc-rs = "0.4.0"
 
 [[bin]]
 name = "harness"

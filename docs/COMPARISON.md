@@ -93,7 +93,8 @@ recovery are what it's for.
 ## Counts to tree
 
 Raw UMIs to finished tree on **one node**: ten-core M1 Max, 64 GB, each run
-alone. The Rust route is 0.2.2 with `sanity-sc-rs` 0.3.0, 2026-09-30; the
+alone. The Rust route is 0.2.2 with `sanity-sc-rs` 0.4.0 and `ann-search-rs`
+0.11.0, 2026-10-13; the
 original route is from 2026-09-25, its backbone runs from 2026-09-26. The
 published implementation can run MPI across nodes; nothing here speaks to a
 cluster.
@@ -119,10 +120,10 @@ Sanity, seconds:
 
 | cells | original | Rust, CPU | Rust, GPU |
 |---|---|---|---|
-| 512 | 71.9 | 4.6 | 0.7 |
-| 512 s32 | 72.1 | 4.4 | 0.5 |
-| 5,000 | 766.9 | 28.1 | 2.0 |
-| 10,000 | 1,604.7 | 56.4 | 3.5 |
+| 512 | 71.9 | 4.6 | 0.8 |
+| 512 s32 | 72.1 | 4.4 | 0.6 |
+| 5,000 | 766.9 | 29.7 | 1.7 |
+| 10,000 | 1,604.7 | 55.2 | 3.2 |
 
 Bonsai, seconds:
 
@@ -130,33 +131,33 @@ Bonsai, seconds:
 |---|---|---|---|---|---|
 | 512 | 371.7 | 170.2 | 4.2 | | 1.9 |
 | 512 s32 | 371.0 | | 4.5 | | 2.2 |
-| 5,000 | 4,868 | 3,208.6 | 100.7 | 2,514.0 | 29.7 |
-| 10,000 | 16,062 | 9,439.3 | 469.9 | 3,528.7 | 73.2 |
+| 5,000 | 4,868 | 3,208.6 | 94.3 | 2,514.0 | 28.0 |
+| 10,000 | 16,062 | 9,439.3 | 458.7 | 3,528.7 | 75.1 |
 
 Rust search times are on CPU-Sanity input. On GPU-Sanity input, exact took
-100.2 s and 438.4 s at 5,000 and 10,000, approximate 27.9 s and 71.0 s.
+110.2 s and 436.5 s at 5,000 and 10,000, approximate 28.8 s and 78.2 s.
 Published single-core times at 5,000 and 10,000 are the harness's, reproduced
 within half a per cent on 2026-09-14; the rest are reruns. The backbone with
 1,000 initial cells took 1,794.3 s and 3,594.3 s, with worse trees at both
 sizes (RF 1,959 and 4,191). The original route also spends 2.0, 0.8, 29.7 and
-66.5 s on gene selection, and the Rust route 0.1 to 1.7 s on the S5
+66.5 s on gene selection, and the Rust route 0.1 to 1.6 s on the S5
 conversion, both included below.
 
 End to end, exact, seconds:
 
 | cells | original, 1 core | original, 10 ranks | Rust CPU + exact | speed-up on 1 core / 10 ranks |
 |---|---|---|---|---|
-| 512 | 445.6 | 244.1 | 8.8 | 50x / 28x |
-| 512 s32 | 443.9 | | 8.9 | 50x / |
-| 5,000 | 5,664.2 | 4,005.2 | 129.6 | 44x / 31x |
-| 10,000 | 17,733.2 | 11,110.5 | 527.9 | 34x / 21x |
+| 512 | 445.6 | 244.1 | 8.9 | 50x / 27x |
+| 512 s32 | 443.9 | | 9.0 | 49x / |
+| 5,000 | 5,664.2 | 4,005.2 | 124.7 | 45x / 32x |
+| 10,000 | 17,733.2 | 11,110.5 | 515.5 | 34x / 22x |
 
 End to end, approximate, seconds:
 
 | cells | original, backbone | Rust CPU + approximate | Rust GPU + approximate | speed-up, CPU / GPU |
 |---|---|---|---|---|
-| 5,000 | 3,310.6 | 58.5 | 31.0 | 57x / 107x |
-| 10,000 | 5,199.9 | 131.2 | 76.2 | 40x / 68x |
+| 5,000 | 3,310.6 | 58.5 | 31.2 | 57x / 106x |
+| 10,000 | 5,199.9 | 131.9 | 83.0 | 39x / 63x |
 
 The original route is CPU only, so the CPU columns are the like-for-like
 reading; GPU is what a Rust user gets with an adapter.
@@ -166,10 +167,10 @@ positions, not the selected genes of the headline table:
 
 | cells | original, 1 core | original, 10 ranks | Rust CPU + exact | original, backbone | Rust GPU + approximate |
 |---|---|---|---|---|---|
-| 512 | RF 146, 0.492 | RF 141, 0.496 | RF 137, 0.632 | | RF 138, 0.631 |
-| 512 s32 | RF 240, 0.165 | | RF 241, 0.233 | | RF 225, 0.232 |
-| 5,000 | RF 1,937, 0.352 | RF 2,016, 0.261 | RF 1,278, 0.570 | RF 1,899, 0.456 | RF 1,285, 0.571 |
-| 10,000 | RF 5,149, 0.162 | RF 5,151, 0.226 | RF 2,634, 0.354 | RF 3,946, 0.252 | RF 2,624, 0.392 |
+| 512 | RF 146, 0.492 | RF 141, 0.496 | RF 137, 0.632 | | RF 139, 0.632 |
+| 512 s32 | RF 240, 0.165 | | RF 241, 0.233 | | RF 237, 0.224 |
+| 5,000 | RF 1,937, 0.352 | RF 2,016, 0.261 | RF 1,306, 0.406 | RF 1,899, 0.456 | RF 1,279, 0.569 |
+| 10,000 | RF 5,149, 0.162 | RF 5,151, 0.226 | RF 2,642, 0.295 | RF 3,946, 0.252 | RF 2,633, 0.390 |
 
 Published memory, peak RSS summed over processes: 543 MB, 2,965 MB, 5,686 MB at
 512, 5,000, 10,000 on one core; 3,009 MB, 10,033 MB, 18,737 MB with 10 ranks;
@@ -181,10 +182,15 @@ published routes at both sizes, and at 10,000 by 1,200 splits.
 
 Two cautions. Differences between the Rust Sanity paths and search modes sit
 inside the run-to-run spread ([performance](PERFORMANCE.md#how-much-one-real-data-run-says)).
-Across the four Sanity and search pairings recovery spans 0.401 to 0.571 at
-5,000 and 0.354 to 0.392 at 10,000, and the lowest is GPU input with exact
-search at 5,000 but CPU input with exact search at 10,000. That's a basin, not
-one Sanity path making worse trees. The gaps to the published trees, over 600
+Across the four Sanity and search pairings recovery spans 0.395 to 0.571 at
+5,000 and 0.295 to 0.390 at 10,000, lowest with exact search at both sizes.
+That's the search basin, not Sanity and not the neighbour graph. At 5,000, CPU
+Sanity and exact search, we ran the starting tree from `ann-search-rs` 0.9 (an
+approximate kNN graph) and from 0.11 (the exact one) through four random SPR
+orders each. Both split two and two: recovery near 0.41 or near 0.57,
+loglikelihoods over 985 nats. The default order happens to put 0.9 in the good
+basin and 0.11 in the poor one, 0.570 against 0.406. The kNN seed changes
+nothing in either. 10,000 is one run. The gaps to the published trees, over 600
 splits from 5,000 up, the backbone included, are far outside it.
 
 Same trees drawn as in [What the trees look like](#what-the-trees-look-like):
@@ -194,9 +200,9 @@ pairs for every tree.
 | cells | GPU + approximate | CPU + exact | reference, backbone | reference, 1 core | reference, 10 ranks |
 |---|---|---|---|---|---|
 | 512 | 13, 0.744 | 13, 0.745 | | 15, 0.638 | 14, 0.643 |
-| 512 s32 | 17, 0.372 | 17, 0.374 | | 19, 0.311 | |
-| 5,000 | 21, 0.673 | 23, 0.672 | 24, 0.589 | 29, 0.500 | 36, 0.402 |
-| 10,000 | 23, 0.478 | 23, 0.444 | 33, 0.348 | 40, 0.258 | 58, 0.323 |
+| 512 s32 | 17, 0.366 | 17, 0.374 | | 19, 0.311 | |
+| 5,000 | 25, 0.673 | 26, 0.556 | 24, 0.589 | 29, 0.500 | 36, 0.402 |
+| 10,000 | 21, 0.474 | 23, 0.386 | 33, 0.348 | 40, 0.258 | 58, 0.323 |
 
 ![radial layouts at 10,000 cells, counts to tree](figures/n10000_e2e_tree_layout.png)
 

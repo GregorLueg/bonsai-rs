@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-rs"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "ann-search-rs",
  "cubecl",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-rs-py"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "bonsai-rs",
  "cubecl",

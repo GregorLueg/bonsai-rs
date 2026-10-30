@@ -176,12 +176,14 @@ impl KnnCandidates {
         // One more than `k` because the self-query returns each point as one of
         // its own neighbours. The backend clamps to `n` itself.
         let want = self.params.k.saturating_add(1);
-        let index = build_exhaustive_index((self.coords.as_slice(), n, p), ANN_METRIC, Verbosity::Quiet);
-        let (rows, _) = query_exhaustive_self(&index, want, false, Verbosity::Quiet).map_err(|e| {
-            BonsaiErrors::MalformedTree {
-                reason: format!("the {n} by {p} neighbour graph could not be built: {e}"),
-            }
-        })?;
+        let index =
+            build_exhaustive_index((self.coords.as_slice(), n, p), ANN_METRIC, Verbosity::Quiet);
+        let (rows, _) =
+            query_exhaustive_self(&index, want, false, Verbosity::Quiet).map_err(|e| {
+                BonsaiErrors::MalformedTree {
+                    reason: format!("the {n} by {p} neighbour graph could not be built: {e}"),
+                }
+            })?;
 
         self.neighbours.clear();
         self.neighbours.resize(n_nodes, Vec::new());

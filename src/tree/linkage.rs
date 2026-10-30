@@ -37,8 +37,8 @@ use crate::errors::BonsaiErrors;
 use crate::tree::{NO_NODE, Tree};
 use crate::utils::traits::BonsaiFloat;
 use ann_search_rs::{
-    build_exhaustive_index, build_kmknn_index, build_nndescent_index, extract_nndescent_knn,
-    query_exhaustive_self, query_kmknn_self, Verbosity,
+    Verbosity, build_exhaustive_index, build_kmknn_index, build_nndescent_index,
+    extract_nndescent_knn, query_exhaustive_self, query_kmknn_self,
 };
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
@@ -234,10 +234,17 @@ fn build_graph(
             query_exhaustive_self(&index, k + 1, false, Verbosity::Quiet)
         }
         KnnBackend::Kmknn => {
-            let index = build_kmknn_index(matrix, ANN_METRIC, None, None, params.seed, Verbosity::Quiet)
-                .map_err(|e| BonsaiErrors::NeighbourGraph {
-                    reason: e.to_string(),
-                })?;
+            let index = build_kmknn_index(
+                matrix,
+                ANN_METRIC,
+                None,
+                None,
+                params.seed,
+                Verbosity::Quiet,
+            )
+            .map_err(|e| BonsaiErrors::NeighbourGraph {
+                reason: e.to_string(),
+            })?;
             query_kmknn_self(&index, k + 1, false, Verbosity::Quiet)
         }
         KnnBackend::NnDescent => {

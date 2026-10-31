@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+**Dependencies**
+
+- Version bump to `ann-search-rs` 0.12.0.
+
 ## 0.3.0
 
 **Breaking**

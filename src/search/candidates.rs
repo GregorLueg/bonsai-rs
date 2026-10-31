@@ -27,7 +27,7 @@ use crate::errors::BonsaiErrors;
 use crate::model::merge::EffLeaf;
 use crate::search::star::{CandidatePairs, Round, StarMerge};
 use crate::utils::traits::{BonsaiFloat, wide};
-use ann_search_rs::{build_exhaustive_index, query_exhaustive_self};
+use ann_search_rs::{Verbosity, build_exhaustive_index, query_exhaustive_self};
 
 ///////////////
 // Constants //
@@ -176,12 +176,14 @@ impl KnnCandidates {
         // One more than `k` because the self-query returns each point as one of
         // its own neighbours. The backend clamps to `n` itself.
         let want = self.params.k.saturating_add(1);
-        let index = build_exhaustive_index((self.coords.as_slice(), n, p), ANN_METRIC);
-        let (rows, _) = query_exhaustive_self(&index, want, false, false).map_err(|e| {
-            BonsaiErrors::MalformedTree {
-                reason: format!("the {n} by {p} neighbour graph could not be built: {e}"),
-            }
-        })?;
+        let index =
+            build_exhaustive_index((self.coords.as_slice(), n, p), ANN_METRIC, Verbosity::Quiet);
+        let (rows, _) =
+            query_exhaustive_self(&index, want, false, Verbosity::Quiet).map_err(|e| {
+                BonsaiErrors::MalformedTree {
+                    reason: format!("the {n} by {p} neighbour graph could not be built: {e}"),
+                }
+            })?;
 
         self.neighbours.clear();
         self.neighbours.resize(n_nodes, Vec::new());

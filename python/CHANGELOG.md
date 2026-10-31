@@ -1,5 +1,9 @@
 # News
 
+## 0.3.1
+
+Vendors `bonsai-rs` 0.3.1 with new `ann-search-rs`.
+
 ## 0.3.0
 
 Vendors `bonsai-rs` 0.3.0 and `sanity-sc-rs` 0.4.0, on cubecl 0.11.

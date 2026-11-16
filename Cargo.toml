@@ -1,6 +1,6 @@
 [package]
 name = "bonsai-rs"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
@@ -20,7 +20,7 @@ name = "bonsai_rs"
 path = "src/lib.rs"
 
 [dependencies]
-ann-search-rs = { version = "0.12" }
+ann-search-rs = { version = "0.13" }
 num-traits = "0.2.19"
 rayon = "1.11.0"
 rustc-hash = "2.1.1"

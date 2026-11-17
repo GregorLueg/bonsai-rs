@@ -105,6 +105,7 @@ Counts to tree end to end is in [comparison](COMPARISON.md).
 | 2026-09-27 | Prune and up sweep parallel over the nodes of a level | steps 4 and 7 3.4 to 4.1x on five sets (25.5 s to 7.3 s and 19.1 s to 5.9 s at 10,000), identical trees |
 | 2026-09-27 | SPR on a live tree with stable ids, accepted moves applied to the changed paths only | step 5 384.0 s to 151.8 s at 65,536 and 1,244.5 s to 321.7 s at 131,072; SPR 65k to 131k `n^1.08`; identical trees |
 | 2026-09-27 | NNI lazy phase on the live tree, with a gain index and per-round up rows | step 6 69.1 s to 41.2 s at 131,072, flat below 25,000 where the edge scans dominate; identical trees on twelve sets |
+| 2026-11-17 | Linkage `merge_adjacency` rewrites neighbour lists in place instead of re-sorting each one per merge | `linkage_tree` 3.08 to 3.19 s to 1.61 to 1.72 s at 50,000 by 100 (cnv-sc-rs bins, ten threads), identical cell groups; the merge loop is serial and was most of the busy samples |
 
 The big wins all stop materialising things: lazy rows form only what a proposal
 reads, the NNI filter tests the star result instead of building a tree, the slot

@@ -1,5 +1,9 @@
 # News
 
+## 0.3.3
+
+Vendors `bonsai-rs` 0.3.3: a faster Ward linkage start.
+
 ## 0.3.2
 
 Vendors `bonsai-rs` 0.3.2 with `ann-search-rs` 0.13.0. Same trees at the same seed.

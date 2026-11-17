@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3
+
+**Performance**
+
+- Ward linkage start: `merge_adjacency` no longer re-sorts every neighbour's
+  list on each merge.
+
 ## 0.3.2
 
 **Dependencies**

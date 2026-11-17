@@ -2,8 +2,7 @@
 
 ## 0.3.3
 
-Vendors `bonsai-rs` 0.3.3: a faster Ward linkage start (about 1.9x at 50,000
-cells), same trees.
+Vendors `bonsai-rs` 0.3.3: a faster Ward linkage start.
 
 ## 0.3.2
 

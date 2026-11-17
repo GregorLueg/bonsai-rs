@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.3
+
+**Performance**
+
+- Ward linkage start: `merge_adjacency` no longer re-sorts every neighbour's
+  list on each merge. `linkage_tree` at 50,000 cells by 100 features went from
+  3.1 s to 1.65 s on ten threads, with identical trees.
+
 ## 0.3.2
 
 **Dependencies**

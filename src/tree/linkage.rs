@@ -443,23 +443,28 @@ fn merge_slots(centroids: &mut [f32], size: &mut [f64], p: usize, a: usize, b: u
 /// * `a`, `b` - The surviving and the retired slot
 fn merge_adjacency(adjacency: &mut [Vec<u32>], a: usize, b: usize) {
     let theirs = std::mem::take(&mut adjacency[b]);
+    // Lists are unique and their order is never read (`nearest` breaks ties
+    // by slot), so `b` becomes `a`, or goes if `a` is already there.
+    let (a32, b32) = (a as u32, b as u32);
     for &other in &theirs {
+        if other == a32 {
+            continue;
+        }
         let list = &mut adjacency[other as usize];
-        for entry in list.iter_mut() {
-            if *entry == b as u32 {
-                *entry = a as u32;
+        if let Some(i) = list.iter().position(|&x| x == b32) {
+            if list.contains(&a32) {
+                list.swap_remove(i);
+            } else {
+                list[i] = a32;
             }
         }
-        list.sort_unstable();
-        list.dedup();
-        list.retain(|&x| x != other);
     }
 
     let mut merged = std::mem::take(&mut adjacency[a]);
     merged.extend(theirs);
     merged.sort_unstable();
     merged.dedup();
-    merged.retain(|&x| x as usize != a && x as usize != b);
+    merged.retain(|&x| x != a32 && x != b32);
     adjacency[a] = merged;
 }
 

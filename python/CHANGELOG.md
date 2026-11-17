@@ -1,5 +1,9 @@
 # News
 
+## 0.3.2
+
+Vendors `bonsai-rs` 0.3.2 with `ann-search-rs` 0.13.0. Same trees at the same seed.
+
 ## 0.3.1
 
 Vendors `bonsai-rs` 0.3.1 with new `ann-search-rs`.

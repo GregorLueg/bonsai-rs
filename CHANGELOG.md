@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+**Dependencies**
+
+- Version bump to `ann-search-rs` 0.13.0. Same trees at the same seed.
+
 ## 0.3.1
 
 **Dependencies**
